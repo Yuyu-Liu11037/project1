@@ -22,7 +22,7 @@ def _topk_indices(y_prob: np.ndarray, k: int):
 
 def precision_at_k_visit(y_true: np.ndarray, y_prob: np.ndarray, k: int) -> float:
     """
-    Visit-level P@k（粗粒度）：对每个样本 i，计算 |TopK_i ∩ True_i| / k，最后对样本取平均
+    Visit-level P@k(粗粒度)：对每个样本 i, 计算 |TopK_i ∩ True_i| / k, 最后对样本取平均
     """
     topk = _topk_indices(y_prob, k)
     N = y_true.shape[0]

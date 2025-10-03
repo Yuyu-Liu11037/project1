@@ -25,7 +25,6 @@ if __name__ == "__main__":
     mimic4_prediction = mimic4_base.set_task(diag_prediction_mimic4_fn)
     print(f"Total samples: {len(mimic4_prediction.samples)}")
 
-    # 训练一个小模型跑通流程
     model, vocabs, y_itos, test_metrics = train_mlp_on_samples(
         mimic4_prediction.samples,
         task="next",             # 严格“下一次就诊”预测

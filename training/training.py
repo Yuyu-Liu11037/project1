@@ -42,8 +42,17 @@ def train_mlp_on_samples(samples,
         test_metrics: 测试集评估指标
     """
     # 1) 排序 + 组装 (current/next)
+    # print("Samples:")
+    # print(f"{samples[0]}\n")
     by_pid = sort_samples_within_patient(samples)
+    # for i in range(3):
+    #     print(by_pid[i])
+    # print("\n")
     pairs = build_pairs(by_pid, task=task)
+    # for i in range(3):
+    #     print(pairs[i])
+    # print("\n")
+    # exit()
 
     # 2) 患者级划分
     train_pairs, val_pairs, test_pairs = split_by_patient(pairs, seed=seed)
@@ -58,6 +67,8 @@ def train_mlp_on_samples(samples,
     Xte, Yte = prepare_XY(test_pairs,   vocabs, use_current_step=use_current_step)
 
     # 5) 模型与损失（多标签）
+    # input: (batch_size, in_dim), in_dim = 历史诊断码 (ICD)len(diag_stoi) + 历史手术码 (Procedures)len(proc_stoi) + 历史药物码 (ATC-3)len(drug_stoi)
+    # output: (batch_size, out_dim), out_dim = 标签码 (CCS)len(y_stoi),  标签词表的大小
     model = MLP(Xtr.size(1), hidden=hidden, out_dim=Ytr.size(1))
     pw = bce_pos_weight(Ytr)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pw)

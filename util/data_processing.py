@@ -69,7 +69,7 @@ def diag_prediction_mimic4_fn(patient: Patient):
 
 
 def sort_samples_within_patient(samples):
-    """按患者ID分组，并按入院时间排序"""
+    """按患者ID分组, 并按入院时间排序"""
     by_pid = defaultdict(list)
     for s in samples:
         by_pid[s["patient_id"]].append(s)
@@ -170,7 +170,7 @@ def prepare_XY(pairs, vocabs, use_current_step=False):
 
 
 def split_by_patient(pairs, test_size=0.2, val_size=0.1, seed=42):
-    """按患者ID分割数据集，避免数据泄漏"""
+    """按患者ID分割数据集, 避免数据泄漏"""
     pid2pairs = defaultdict(list)
     for s, y in pairs:
         pid2pairs[s["patient_id"]].append((s, y))
