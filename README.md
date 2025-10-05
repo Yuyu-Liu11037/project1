@@ -1,60 +1,109 @@
-# 诊断预测项目
+# Diagnosis Prediction Project
 
-## 项目结构
+## Project Structure
 
 ```
 project1/
-├── diagnosis_prediction.py  # 主程序入口
-├── model/                   # 模型定义目录
+├── diagnosis_prediction.py  # Main program entry point
+├── model/                   # Model definition directory
 │   ├── __init__.py
-│   └── models.py           # MLP模型定义
-├── util/                   # 工具函数目录
+│   └── models.py           # MLP and Transformer model definitions
+├── util/                   # Utility functions directory
 │   ├── __init__.py
-│   └── data_processing.py  # 数据处理和预处理
-├── metrics/                # 评估指标目录
+│   └── data_processing.py  # Data processing and preprocessing
+├── metrics/                # Evaluation metrics directory
 │   ├── __init__.py
-│   └── metrics.py         # 评估指标计算
-├── training/               # 训练函数目录
+│   └── metrics.py         # Evaluation metric calculations
+├── training/               # Training functions directory
 │   ├── __init__.py
-│   └── training.py        # 训练函数
-└── README.md               # 项目说明
+│   └── training.py        # Training functions
+└── README.md               # Project documentation
 ```
 
-## 模块说明
+## Module Description
 
-### 1. `diagnosis_prediction.py` - 主程序
-- 数据加载和预处理
-- 调用训练函数
-- 输出结果
+### 1. `diagnosis_prediction.py` - Main Program
+- Data loading and preprocessing
+- Call training functions
+- Output results
 
-### 2. `model/models.py` - 模型定义
-- `MLP`: 多标签分类的MLP模型
+### 2. `model/models.py` - Model Definitions
+- `MLP`: Multi-label classification MLP model
+- `TransformerModel`: Transformer-based multi-label classification model
+- `create_model`: Model factory function supporting different model types
 
-### 3. `util/data_processing.py` - 数据处理
-- `diag_prediction_mimic4_fn`: MIMIC-IV数据处理函数
-- `sort_samples_within_patient`: 患者内样本排序
-- `build_pairs`: 构建训练对
-- `build_vocab_from_pairs`: 构建词表
-- `vectorize_pair`: 样本向量化
-- `prepare_XY`: 准备训练数据
-- `split_by_patient`: 按患者分割数据集
+### 3. `util/data_processing.py` - Data Processing
+- `diag_prediction_mimic4_fn`: MIMIC-IV data processing function
+- `sort_samples_within_patient`: Sort samples within patients
+- `build_pairs`: Build training pairs
+- `build_vocab_from_pairs`: Build vocabulary
+- `vectorize_pair`: Vectorize samples
+- `prepare_XY`: Prepare training data
+- `split_by_patient`: Split dataset by patient
 
-### 4. `metrics/metrics.py` - 评估指标
+### 4. `metrics/metrics.py` - Evaluation Metrics
 - `precision_at_k_visit`: Visit-level P@k
 - `accuracy_at_k_code`: Code-level Acc@k
-- `recall_at_k_micro`: 微平均召回率
-- `evaluate`: 综合评估函数
+- `recall_at_k_micro`: Micro-average recall
+- `evaluate`: Comprehensive evaluation function
 
-### 5. `training/training.py` - 训练函数
-- `train_mlp_on_samples`: 主要的训练函数
+### 5. `training/training.py` - Training Functions
+- `train_model_on_samples`: Main training function supporting multiple model types
+- `train_mlp_on_samples`: Backward compatible MLP training function
 
-## 使用方法
+## Usage
 
+### Basic Usage
 ```bash
+# Use default MLP model
 python diagnosis_prediction.py
+
+# Use Transformer model
+python diagnosis_prediction.py --model transformer
 ```
 
-## 依赖
+### Command Line Arguments
+
+#### Model Selection
+- `--model`: Model type (`mlp` or `transformer`, default: `mlp`)
+
+#### Training Parameters
+- `--task`: Prediction task (`current` or `next`, default: `next`)
+- `--use_current_step`: Whether to use current step information (default: False)
+- `--hidden`: Hidden layer dimension (default: 512)
+- `--lr`: Learning rate (default: 1e-3)
+- `--wd`: Weight decay (default: 1e-5)
+- `--epochs`: Number of training epochs (default: 10)
+- `--seed`: Random seed (default: 42)
+
+#### Transformer Specific Parameters
+- `--num_heads`: Number of attention heads (default: 8)
+- `--num_layers`: Number of Transformer layers (default: 3)
+- `--dropout`: Dropout rate (default: 0.3)
+
+#### Data Path
+- `--data_path`: MIMIC-IV data path (default: `/data/yuyu/data/MIMIC_IV/hosp`)
+
+### Usage Examples
+
+```bash
+# Train MLP model (default settings)
+python diagnosis_prediction.py
+
+# Train Transformer model
+python diagnosis_prediction.py --model transformer --num_heads 8 --num_layers 3
+
+# Train Transformer model with more epochs
+python diagnosis_prediction.py --model transformer --epochs 20 --lr 5e-4
+
+# Use current step information for prediction
+python diagnosis_prediction.py --model transformer --use_current_step
+
+# View all parameters
+python diagnosis_prediction.py --help
+```
+
+## Dependencies
 
 - torch
 - numpy

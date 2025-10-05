@@ -1,6 +1,6 @@
 """
-数据处理模块
-包含数据预处理、向量化、词表构建等功能
+Data processing module
+Contains data preprocessing, vectorization, vocabulary building functions
 """
 from collections import defaultdict, Counter
 import torch
@@ -14,7 +14,7 @@ mapping = CrossMap("ICD10CM", "CCSCM")
 
 
 def diag_prediction_mimic4_fn(patient: Patient):
-    """MIMIC-IV诊断预测任务的数据处理函数"""
+    """Data processing function for MIMIC-IV diagnosis prediction task"""
     samples = []
     visit_ls = list(patient.visits.keys())
     
@@ -46,7 +46,7 @@ def diag_prediction_mimic4_fn(patient: Patient):
             }
         )
     
-    # exclude: patients with less than 2 visit
+    # exclude: patients with less than 2 visits
     if len(samples) < 2:
         return []
     
@@ -69,13 +69,13 @@ def diag_prediction_mimic4_fn(patient: Patient):
 
 
 def sort_samples_within_patient(samples):
-    """按患者ID分组, 并按入院时间排序"""
+    """Group by patient ID and sort by admission time"""
     by_pid = defaultdict(list)
     for s in samples:
         by_pid[s["patient_id"]].append(s)
     
     for pid in by_pid:
-        # 若 adm_time 是字符串，直接排序即可；如有异常可转 datetime 再排
+        # If adm_time is string, sort directly; if needed, convert to datetime for sorting
         by_pid[pid] = sorted(by_pid[pid], key=lambda x: x["adm_time"][-1])
     
     return by_pid
@@ -83,10 +83,10 @@ def sort_samples_within_patient(samples):
 
 def build_pairs(samples_by_pid, task="current"):
     """
-    构建训练对
-    task="current": 用样本自己的 conditions 做标签
-    task="next":    严格按论文，特征来自第 t 次，标签用第 t+1 次的 conditions
-    返回 pairs: list of (X_sample_dict, y_codes_list)
+    Build training pairs
+    task="current": Use sample's own conditions as labels
+    task="next":    Strictly follow paper, features from time t, labels from time t+1 conditions
+    Returns pairs: list of (X_sample_dict, y_codes_list)
     """
     pairs = []
     for pid, seq in samples_by_pid.items():
@@ -94,7 +94,7 @@ def build_pairs(samples_by_pid, task="current"):
             for s in seq:
                 pairs.append((s, s["conditions"]))
         elif task == "next":
-            # 至少要有 t 和 t+1
+            # Must have at least t and t+1
             for i in range(len(seq) - 1):
                 s_t = seq[i]
                 y_next = seq[i + 1]["conditions"]
@@ -105,17 +105,17 @@ def build_pairs(samples_by_pid, task="current"):
 
 
 def build_vocab_from_pairs(pairs):
-    """从训练对构建词表"""
+    """Build vocabulary from training pairs"""
     diag_c, proc_c, drug_c, y_c = Counter(), Counter(), Counter(), Counter()
     
     for s, y in pairs:
-        for visit_codes in s["cond_hist"]:   # 历史 ICD 诊断（最后一步为空，已防泄漏）
+        for visit_codes in s["cond_hist"]:   # Historical ICD diagnoses (last step is empty to prevent leakage)
             diag_c.update(visit_codes)
-        for visit_codes in s["procedures"]:  # 每步是一个手术码列表
+        for visit_codes in s["procedures"]:  # Each step is a procedure code list
             proc_c.update(visit_codes)
-        for visit_codes in s["drugs"]:       # 每步是一个 ATC3 列表
+        for visit_codes in s["drugs"]:       # Each step is an ATC3 list
             drug_c.update(visit_codes)
-        y_c.update(y)                        # 标签（CCS）
+        y_c.update(y)                        # Labels (CCS)
     
     def mk_vocab(cnt):
         itos = [c for c, _ in cnt.most_common()]
@@ -126,7 +126,7 @@ def build_vocab_from_pairs(pairs):
 
 
 def multihot_from_sequence(seq_of_lists, stoi):
-    """将序列转换为multi-hot向量"""
+    """Convert sequence to multi-hot vector"""
     x = torch.zeros(len(stoi), dtype=torch.float32)
     for codes in seq_of_lists:
         for c in codes:
@@ -136,10 +136,10 @@ def multihot_from_sequence(seq_of_lists, stoi):
 
 
 def vectorize_pair(s, y_codes, vocabs, use_current_step=False):
-    """将样本对向量化"""
+    """Vectorize sample pair"""
     diag_stoi, proc_stoi, drug_stoi, y_stoi = vocabs
     
-    # 入院预测(admission-time)：不看当前步的 proc/drug；出院预测(discharge-time)可看
+    # Admission prediction: don't look at current step's proc/drug; discharge prediction can look
     if use_current_step:
         proc_hist = s["procedures"]
         drug_hist = s["drugs"]
@@ -147,7 +147,7 @@ def vectorize_pair(s, y_codes, vocabs, use_current_step=False):
         proc_hist = s["procedures"][:-1] if len(s["procedures"])>0 else []
         drug_hist = s["drugs"][:-1] if len(s["drugs"])>0 else []
 
-    x_diag = multihot_from_sequence(s["cond_hist"], diag_stoi)  # 历史 ICD（当前步已置空）
+    x_diag = multihot_from_sequence(s["cond_hist"], diag_stoi)  # Historical ICD (current step is empty)
     x_proc = multihot_from_sequence(proc_hist, proc_stoi)
     x_drug = multihot_from_sequence(drug_hist, drug_stoi)
     X = torch.cat([x_diag, x_proc, x_drug], dim=0)
@@ -160,7 +160,7 @@ def vectorize_pair(s, y_codes, vocabs, use_current_step=False):
 
 
 def prepare_XY(pairs, vocabs, use_current_step=False):
-    """准备训练数据X和Y"""
+    """Prepare training data X and Y"""
     Xs, Ys = [], []
     for s, y_codes in pairs:
         X, y = vectorize_pair(s, y_codes, vocabs, use_current_step=use_current_step)
@@ -170,7 +170,7 @@ def prepare_XY(pairs, vocabs, use_current_step=False):
 
 
 def split_by_patient(pairs, test_size=0.2, val_size=0.1, seed=42):
-    """按患者ID分割数据集, 避免数据泄漏"""
+    """Split dataset by patient ID to avoid data leakage"""
     pid2pairs = defaultdict(list)
     for s, y in pairs:
         pid2pairs[s["patient_id"]].append((s, y))
