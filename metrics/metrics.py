@@ -22,21 +22,22 @@ def _topk_indices(y_prob: np.ndarray, k: int):
 
 def precision_at_k_visit(y_true: np.ndarray, y_prob: np.ndarray, k: int) -> float:
     """
-    Visit-level P@k (coarse-grained): For each sample i, calculate |TopK_i ∩ True_i| / k, then average over samples
+    For each visit t: P@k(t) = hits_t / min(k, |Y_t|), then average over samples
     """
-    topk = _topk_indices(y_prob, k)
+    topk = _topk_indices(y_prob, k)  # shape: [N, k]
     N = y_true.shape[0]
     precs = []
-    
+
     for i in range(N):
         true_idx = np.where(y_true[i] > 0.5)[0]
-        if true_idx.size == 0:
-            # If this visit has no true labels, this sample contributes 0 to P@k (common practice)
-            precs.append(0.0)
+        m = true_idx.size
+        if m == 0:
+            precs.append(0.0) 
             continue
         hit = len(set(topk[i].tolist()) & set(true_idx.tolist()))
-        precs.append(hit / float(k))
-    
+        denom = float(min(k, m))
+        precs.append(hit / denom)
+
     return float(np.mean(precs)) if len(precs) > 0 else 0.0
 
 
@@ -68,7 +69,7 @@ def recall_at_k_micro(y_true: np.ndarray, y_prob: np.ndarray, k: int) -> float:
 
 
 @torch.no_grad()
-def evaluate(model, X, Y, ks=(10, 20)):
+def evaluate(model, X, Y, ks=(10, 20, 30)):
     """
     Return metrics consistent with the paper:
     - Visit-level P@k
