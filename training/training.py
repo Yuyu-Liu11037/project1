@@ -348,10 +348,10 @@ def train_model_on_samples(samples,
     vocabs = (diag_stoi, proc_stoi, drug_stoi, y_stoi)
 
     # 4) Vectorization
-    Xtr, Ytr = prepare_XY(train_pairs, vocabs, use_current_step=use_current_step)
-    print(f"\nTrain data shape: {Xtr.shape}")
+    Xtr, Ytr = prepare_XY(train_pairs, vocabs, use_current_step=use_current_step)   # X = torch.cat([x_diag, x_proc, x_drug], dim=0)
+    print(f"\nTrain data shape: {Xtr.shape}")   # 100% [34972, 19733]
     print(f"\nTrain data: {Xtr[10]}")
-    print(f"\nTrain label shape: {Ytr.shape}")
+    print(f"\nTrain label shape: {Ytr.shape}")   # 100% [34972, 274]
     print(f"\nTrain label: {Ytr[10]}")
     Xva, Yva = prepare_XY(val_pairs,   vocabs, use_current_step=use_current_step)
     Xte, Yte = prepare_XY(test_pairs,   vocabs, use_current_step=use_current_step)
