@@ -16,7 +16,8 @@ mapping = CrossMap("ICD10CM", "CCSCM")
 def diag_prediction_mimic4_fn(patient: Patient):
     """Data processing function for MIMIC-IV diagnosis prediction task"""
     samples = []
-    visit_ls = list(patient.visits.keys())
+    # Sort visits by encounter time to ensure chronological order
+    visit_ls = sorted(patient.visits.keys(), key=lambda vid: patient.visits[vid].encounter_time)
     
     for i in range(len(visit_ls)):
         visit = patient.visits[visit_ls[i]]

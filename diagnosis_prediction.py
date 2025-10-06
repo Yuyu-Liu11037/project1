@@ -168,7 +168,6 @@ if __name__ == "__main__":
     )
 
     mimic4_prediction = mimic4_base.set_task(diag_prediction_mimic4_fn)
-    print(f"Total samples: {len(mimic4_prediction.samples)}")
 
     # Prepare model parameters
     model_kwargs = {
