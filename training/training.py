@@ -336,7 +336,6 @@ def train_model_on_samples(samples,
     # 没事了，cond_hist字段就是之前所有的visits
     pairs = build_pairs(by_pid, task=task)   # (sample_t, label_t+1)
     print(f"\nPairs: {pairs[10]}")
-    exit()
 
     # 2) Patient-level split
     train_pairs, val_pairs, test_pairs = split_by_patient(pairs, seed=seed)
