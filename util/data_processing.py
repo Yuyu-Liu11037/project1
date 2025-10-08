@@ -188,3 +188,198 @@ def split_by_patient(pairs, test_size=0.2, val_size=0.1, seed=42):
     
     return collect(tr_pids), collect(va_pids), collect(te_pids)
 
+
+def dialysis_prediction_mimic4_fn(patient: Patient):
+    """
+    Data processing function for MIMIC-IV dialysis prediction task for AKI patients
+    Based on the approach from aki.ipynb but adapted for MIMIC-IV structure
+    """
+    samples = []
+    
+    # AKI ICD codes for MIMIC-IV (ICD-9 format)
+    # Based on debug analysis: 5849, 5845, 5848 are the most common AKI codes
+    aki_codes = ["584", "584.5", "584.6", "584.7", "584.8", "584.9", "5849", "5845", "5848"]
+    
+    # Dialysis procedure codes for MIMIC-IV (ICD-9 format)
+    # Based on debug analysis: 3995 is the main dialysis procedure code
+    dialysis_codes_cpt = ['3995', '3996']  # Hemodialysis and peritoneal dialysis
+    dialysis_codes_icd = ['585', '585.1', '585.2', '585.3', '585.4', '585.5', '585.6', '585.9',  # Chronic kidney disease
+                         '586', 'V45.1', 'V45.11', 'V45.12', 'V58.61', 'V58.66', 'V58.67']  # Dialysis-related codes
+    dialysis_codes_hcpcs = ['6909', '0SP909Z']  # Other dialysis-related procedures
+    
+    # Sort visits by encounter time
+    visit_ls = sorted(patient.visits.keys(), key=lambda vid: patient.visits[vid].encounter_time)
+    
+    # Check if patient has AKI diagnosis
+    has_aki = False
+    aki_first_date = None
+    
+    for visit_id in visit_ls:
+        visit = patient.visits[visit_id]
+        conditions = visit.get_code_list(table="diagnoses_icd")
+        
+        # Check for AKI diagnosis
+        for condition in conditions:
+            if condition in aki_codes:
+                has_aki = True
+                if aki_first_date is None:
+                    aki_first_date = visit.encounter_time
+                break
+        
+        if has_aki:
+            break
+    
+    if not has_aki:
+        return []
+    
+    # Check for dialysis procedures after AKI diagnosis
+    has_dialysis = False
+    dialysis_date = None
+    
+    for visit_id in visit_ls:
+        visit = patient.visits[visit_id]
+        
+        # Skip visits before AKI diagnosis
+        if visit.encounter_time < aki_first_date:
+            continue
+            
+        procedures = visit.get_code_list(table="procedures_icd")
+        
+        # Check for dialysis procedures
+        for procedure in procedures:
+            if (procedure in dialysis_codes_cpt or 
+                procedure in dialysis_codes_icd or 
+                procedure in dialysis_codes_hcpcs):
+                has_dialysis = True
+                dialysis_date = visit.encounter_time
+                break
+        
+        if has_dialysis:
+            break
+    
+    # Collect medication data for AKI patients
+    # We'll use all medications from visits around AKI diagnosis
+    medications = []
+    conditions_history = []
+    procedures_history = []
+    visit_times = []
+    
+    for visit_id in visit_ls:
+        visit = patient.visits[visit_id]
+        
+        # Include medications from visits within a reasonable timeframe around AKI
+        # (e.g., 30 days before AKI to 30 days after AKI)
+        time_diff = (visit.encounter_time - aki_first_date).days
+        
+        if -30 <= time_diff <= 30:  # 30 days before and after AKI
+            drugs = visit.get_code_list(table="prescriptions")
+            # Convert to ATC 3 level (first 4 characters)
+            drugs_atc3 = [drug[:4] for drug in drugs if len(drug) >= 4]
+            
+            conditions = visit.get_code_list(table="diagnoses_icd")
+            procedures = visit.get_code_list(table="procedures_icd")
+            
+            medications.extend(drugs_atc3)
+            conditions_history.extend(conditions)
+            procedures_history.extend(procedures)
+            visit_times.append(visit.encounter_time)
+    
+    # Remove duplicates while preserving order
+    medications = list(dict.fromkeys(medications))
+    conditions_history = list(dict.fromkeys(conditions_history))
+    procedures_history = list(dict.fromkeys(procedures_history))
+    
+    if len(medications) == 0:
+        return []
+    
+    # Create sample for dialysis prediction
+    sample = {
+        "patient_id": patient.patient_id,
+        "visit_id": f"{patient.patient_id}_aki_visit",
+        "medications": medications,
+        "conditions": conditions_history,
+        "procedures": procedures_history,
+        "aki_date": aki_first_date.strftime("%Y-%m-%d %H:%M"),
+        "dialysis_date": dialysis_date.strftime("%Y-%m-%d %H:%M") if dialysis_date else "None",
+        "has_dialysis": int(has_dialysis),  # Convert to int for pyhealth compatibility
+        "dialysis_label": int(has_dialysis)
+    }
+    
+    return [sample]
+
+
+def build_dialysis_pairs(samples):
+    """
+    Build training pairs for dialysis prediction
+    Returns pairs: list of (X_sample_dict, y_label)
+    """
+    pairs = []
+    for sample in samples:
+        # Create feature vector from medications, conditions, and procedures
+        features = {
+            "patient_id": sample["patient_id"],
+            "medications": sample["medications"],
+            "conditions": sample["conditions"], 
+            "procedures": sample["procedures"]
+        }
+        label = sample["dialysis_label"]
+        pairs.append((features, label))
+    
+    return pairs
+
+
+def build_dialysis_vocab_from_pairs(pairs):
+    """Build vocabulary from dialysis prediction training pairs"""
+    med_c, cond_c, proc_c = Counter(), Counter(), Counter()
+    
+    for features, label in pairs:
+        med_c.update(features["medications"])
+        cond_c.update(features["conditions"])
+        proc_c.update(features["procedures"])
+    
+    def mk_vocab(cnt):
+        itos = [c for c, _ in cnt.most_common()]
+        stoi = {c: i for i, c in enumerate(itos)}
+        return stoi, itos
+    
+    return mk_vocab(med_c), mk_vocab(cond_c), mk_vocab(proc_c)
+
+
+def vectorize_dialysis_pair(features, label, vocabs):
+    """Vectorize dialysis prediction sample pair"""
+    med_stoi, cond_stoi, proc_stoi = vocabs
+    
+    # Create multi-hot vectors for each modality
+    x_med = torch.zeros(len(med_stoi), dtype=torch.float32)
+    for med in features["medications"]:
+        if med in med_stoi:
+            x_med[med_stoi[med]] = 1.0
+    
+    x_cond = torch.zeros(len(cond_stoi), dtype=torch.float32)
+    for cond in features["conditions"]:
+        if cond in cond_stoi:
+            x_cond[cond_stoi[cond]] = 1.0
+    
+    x_proc = torch.zeros(len(proc_stoi), dtype=torch.float32)
+    for proc in features["procedures"]:
+        if proc in proc_stoi:
+            x_proc[proc_stoi[proc]] = 1.0
+    
+    # Concatenate all features
+    X = torch.cat([x_med, x_cond, x_proc], dim=0)
+    
+    # Binary label
+    y = torch.tensor(label, dtype=torch.float32)
+    
+    return X, y
+
+
+def prepare_dialysis_XY(pairs, vocabs):
+    """Prepare dialysis prediction training data X and Y"""
+    Xs, Ys = [], []
+    for features, label in pairs:
+        X, y = vectorize_dialysis_pair(features, label, vocabs)
+        Xs.append(X)
+        Ys.append(y)
+    return torch.stack(Xs), torch.stack(Ys)
+

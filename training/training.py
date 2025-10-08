@@ -17,7 +17,10 @@ from util.data_processing import (
     build_pairs, 
     build_vocab_from_pairs,
     prepare_XY, 
-    split_by_patient
+    split_by_patient,
+    build_dialysis_pairs,
+    build_dialysis_vocab_from_pairs,
+    prepare_dialysis_XY
 )
 from metrics.metrics import bce_pos_weight, evaluate
 
@@ -509,4 +512,240 @@ def evaluate_batched(model, data_loader, ks=(10, 20, 30), device=None):
         metrics[f"Recall@{k}"] = r_at_k
     
     return metrics
+
+
+def train_dialysis_model_on_samples(samples,
+                                   model_type="mlp",
+                                   hidden=512, lr=1e-3, wd=1e-5,
+                                   epochs=10, seed=42, train_percentage=1.0,
+                                   batch_size=32,
+                                   early_stopping=True,
+                                   patience=10,
+                                   min_delta=0.001,
+                                   monitor_metric='accuracy',
+                                   use_gpu=True, force_cpu=False,
+                                   **model_kwargs):
+    """
+    Train model for dialysis prediction (binary classification)
+    
+    Args:
+        samples: Sample data from dialysis_prediction_mimic4_fn
+        model_type: "mlp" or "transformer", model type
+        hidden: Hidden layer dimension
+        lr: Learning rate
+        wd: Weight decay
+        epochs: Number of training epochs
+        seed: Random seed
+        train_percentage: Percentage of training data to use (0.01-1.0)
+        batch_size: Batch size for training
+        early_stopping: Enable early stopping
+        patience: Number of epochs to wait before stopping
+        min_delta: Minimum change to qualify as improvement
+        monitor_metric: Metric to monitor for early stopping
+        use_gpu: Use GPU if available
+        force_cpu: Force CPU usage
+        **model_kwargs: Model-specific parameters
+    
+    Returns:
+        model: Trained model
+        vocabs: Vocabulary dictionaries
+        test_metrics: Test set evaluation metrics
+    """
+    print(f"\nStarting dialysis prediction training...")
+    print(f"Total samples: {len(samples)}")
+    
+    # Count dialysis vs non-dialysis patients
+    dialysis_count = sum(1 for s in samples if s['dialysis_label'] == 1)
+    non_dialysis_count = len(samples) - dialysis_count
+    print(f"Dialysis patients: {dialysis_count}, Non-dialysis patients: {non_dialysis_count}")
+    
+    # Build pairs for dialysis prediction
+    pairs = build_dialysis_pairs(samples)
+    print(f"Total pairs: {len(pairs)}")
+    
+    # Split by patient ID to avoid data leakage
+    train_pairs, val_pairs, test_pairs = split_dialysis_by_patient(pairs, seed=seed)
+    
+    # Apply few-shot sampling to training data
+    if train_percentage < 1.0:
+        torch.manual_seed(seed)
+        random.seed(seed)
+        original_train_size = len(train_pairs)
+        sample_size = int(original_train_size * train_percentage)
+        train_pairs = random.sample(train_pairs, sample_size)
+        print(f"Few-shot training: Using {len(train_pairs)}/{original_train_size} samples ({train_percentage:.1%})")
+    
+    # Build vocabulary
+    (med_stoi, med_itos), (cond_stoi, cond_itos), (proc_stoi, proc_itos) = build_dialysis_vocab_from_pairs(train_pairs)
+    vocabs = (med_stoi, cond_stoi, proc_stoi)
+    
+    print(f"Vocabulary sizes - Medications: {len(med_stoi)}, Conditions: {len(cond_stoi)}, Procedures: {len(proc_stoi)}")
+    
+    # Vectorize data
+    Xtr, Ytr = prepare_dialysis_XY(train_pairs, vocabs)
+    Xva, Yva = prepare_dialysis_XY(val_pairs, vocabs)
+    Xte, Yte = prepare_dialysis_XY(test_pairs, vocabs)
+    
+    print(f"Train data shape: {Xtr.shape}")
+    print(f"Train labels shape: {Ytr.shape}")
+    print(f"Train labels distribution: {Ytr.sum().item()}/{len(Ytr)} positive")
+    
+    # Create DataLoaders
+    train_dataset = TensorDataset(Xtr, Ytr)
+    val_dataset = TensorDataset(Xva, Yva)
+    test_dataset = TensorDataset(Xte, Yte)
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    
+    # Setup device
+    if force_cpu:
+        device = torch.device('cpu')
+        print("Using device: cpu (forced)")
+    elif use_gpu and torch.cuda.is_available():
+        device = torch.device('cuda')
+        print(f"Using device: {device}")
+    else:
+        device = torch.device('cpu')
+        print(f"Using device: {device} (GPU not available or disabled)")
+    
+    # Create model for binary classification
+    model = create_model(model_type, Xtr.size(1), hidden=hidden, out_dim=1, **model_kwargs)
+    model = model.to(device)
+    
+    # Binary classification loss
+    criterion = nn.BCEWithLogitsLoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    
+    # Training loop with early stopping
+    best_metric = -float('inf')
+    patience_counter = 0
+    best_model_state = None
+    
+    for ep in range(1, epochs + 1):
+        model.train()
+        epoch_loss = 0.0
+        num_batches = 0
+        
+        # Training phase
+        for batch_X, batch_Y in train_loader:
+            batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
+            logits = model(batch_X).squeeze()
+            loss = criterion(logits, batch_Y)
+            
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            
+            epoch_loss += loss.item()
+            num_batches += 1
+        
+        avg_loss = epoch_loss / num_batches
+        
+        # Validation phase - check every epoch for early stopping
+        if ep % 1 == 0:
+            val_metrics = evaluate_dialysis_batched(model, val_loader, device=device)
+            current_metric = val_metrics[monitor_metric]
+            
+            print(f"Epoch {ep}: Loss={avg_loss:.4f}, Val {monitor_metric}={current_metric:.4f}")
+            
+            # Early stopping logic
+            if early_stopping:
+                if current_metric > best_metric + min_delta:
+                    best_metric = current_metric
+                    patience_counter = 0
+                    best_model_state = model.state_dict().copy()
+                    print(f"  → New best {monitor_metric}: {best_metric:.4f}")
+                else:
+                    patience_counter += 1
+                    print(f"  → No improvement for {patience_counter} epochs (best {monitor_metric}: {best_metric:.4f})")
+                
+                if patience_counter >= patience:
+                    model.load_state_dict(best_model_state)
+                    print(f"\nEarly stopping triggered! No improvement in {monitor_metric} for {patience} epochs.")
+                    print(f"Restoring best model from epoch {ep - patience_counter}")
+                    break
+    
+    # Final evaluation on test set
+    test_metrics = evaluate_dialysis_batched(model, test_loader, device=device)
+    
+    print(f"\nFinal test results:")
+    for metric, value in test_metrics.items():
+        print(f"  {metric}: {value:.4f}")
+    
+    return model, vocabs, test_metrics
+
+
+def split_dialysis_by_patient(pairs, test_size=0.2, val_size=0.1, seed=42):
+    """Split dialysis prediction dataset by patient ID to avoid data leakage"""
+    from sklearn.model_selection import train_test_split
+    
+    pid2pairs = defaultdict(list)
+    for features, label in pairs:
+        pid2pairs[features["patient_id"]].append((features, label))
+    
+    pids = list(pid2pairs.keys())
+    tr_pids, te_pids = train_test_split(pids, test_size=test_size, random_state=seed)
+    tr_pids, va_pids = train_test_split(tr_pids, test_size=val_size, random_state=seed)
+    
+    def collect(pid_list):
+        out = []
+        for pid in pid_list:
+            out.extend(pid2pairs[pid])
+        return out
+    
+    return collect(tr_pids), collect(va_pids), collect(te_pids)
+
+
+def evaluate_dialysis_batched(model, data_loader, device):
+    """Evaluate dialysis prediction model on batched data"""
+    model.eval()
+    all_logits = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for batch_X, batch_Y in data_loader:
+            batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
+            logits = model(batch_X).squeeze()
+            
+            all_logits.append(logits.cpu().numpy())
+            all_labels.append(batch_Y.cpu().numpy())
+    
+    # Concatenate all batches
+    logits = np.concatenate(all_logits)
+    labels = np.concatenate(all_labels)
+    
+    # Convert logits to probabilities
+    probs = torch.sigmoid(torch.from_numpy(logits)).numpy()
+    
+    # Calculate binary classification metrics
+    predictions = (probs > 0.5).astype(int)
+    
+    # Accuracy
+    accuracy = np.mean(predictions == labels)
+    
+    # Precision, Recall, F1
+    tp = np.sum((predictions == 1) & (labels == 1))
+    fp = np.sum((predictions == 1) & (labels == 0))
+    fn = np.sum((predictions == 0) & (labels == 1))
+    
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    
+    # AUC
+    from sklearn.metrics import roc_auc_score
+    try:
+        auc = roc_auc_score(labels, probs)
+    except ValueError:
+        auc = 0.5  # Default for single class
+    
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'auc': auc
+    }
 
