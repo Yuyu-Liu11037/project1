@@ -718,6 +718,20 @@ def evaluate_dialysis_batched(model, data_loader, device):
     # Convert logits to probabilities
     probs = torch.sigmoid(torch.from_numpy(logits)).numpy()
     
+    # Debug: Print prediction probability distribution
+    print(f"\n=== Prediction Probability Distribution Debug ===")
+    print(f"Prediction probabilities range: {probs.min():.4f} - {probs.max():.4f}")
+    print(f"Prediction probabilities mean: {probs.mean():.4f}")
+    print(f"Prediction probabilities std: {probs.std():.4f}")
+    print(f"Number of predictions > 0.5: {(probs > 0.5).sum()}")
+    print(f"Number of predictions > 0.3: {(probs > 0.3).sum()}")
+    print(f"Number of predictions > 0.1: {(probs > 0.1).sum()}")
+    
+    # Debug: Print label distribution
+    print(f"True positive rate: {labels.sum() / len(labels):.4f}")
+    print(f"Number of positive samples: {labels.sum()}")
+    print(f"Number of negative samples: {len(labels) - labels.sum()}")
+    
     # Calculate binary classification metrics
     predictions = (probs > 0.5).astype(int)
     
@@ -728,23 +742,32 @@ def evaluate_dialysis_batched(model, data_loader, device):
     tp = np.sum((predictions == 1) & (labels == 1))
     fp = np.sum((predictions == 1) & (labels == 0))
     fn = np.sum((predictions == 0) & (labels == 1))
+    tn = np.sum((predictions == 0) & (labels == 0))
+    
+    print(f"Confusion Matrix:")
+    print(f"  TP: {tp}, FP: {fp}")
+    print(f"  FN: {fn}, TN: {tn}")
     
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
     
-    # AUC
-    from sklearn.metrics import roc_auc_score
+    # AUC and AUPRC
+    from sklearn.metrics import roc_auc_score, average_precision_score
     try:
         auc = roc_auc_score(labels, probs)
     except ValueError:
         auc = 0.5  # Default for single class
+    
+    # Calculate AUPRC (Area Under Precision-Recall Curve)
+    auprc = average_precision_score(labels, probs)
     
     return {
         'accuracy': accuracy,
         'precision': precision,
         'recall': recall,
         'f1': f1,
-        'auc': auc
+        'auc': auc,
+        'auprc': auprc
     }
 

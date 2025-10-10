@@ -301,7 +301,6 @@ def dialysis_prediction_mimic4_fn(patient: Patient):
         "procedures": procedures_history,
         "aki_date": aki_first_date.strftime("%Y-%m-%d %H:%M"),
         "dialysis_date": dialysis_date.strftime("%Y-%m-%d %H:%M") if dialysis_date else "None",
-        "has_dialysis": int(has_dialysis),  # Convert to int for pyhealth compatibility
         "dialysis_label": int(has_dialysis)
     }
     

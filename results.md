@@ -1,3 +1,4 @@
+### MIMIC-IV
 [DONE] MLP model test results: {'P@10': 0.30813953488372087, 'Acc@10': 0.21281510066875609, 'Recall@10': 0.21281510066875609, 'P@20': 0.24540028812512865, 'Acc@20': 0.3389690780262812, 'Recall@20': 0.3389690780262812}
 
 100%:
@@ -35,3 +36,13 @@
   P@30: 0.5636
   Acc@30: 0.5463
   Recall@30: 0.5463
+
+###Trinetx
+[DONE] TRANSFORMER model test results:
+  accuracy: 0.8367
+  precision: 0.7516
+  recall: 0.1664
+  f1: 0.2725
+  auc: 0.7110
+  auprc: 0.4554
+  threshold: 0.5000
