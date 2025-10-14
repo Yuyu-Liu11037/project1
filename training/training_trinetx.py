@@ -241,7 +241,7 @@ def train_single_fold(X_train, Y_train, X_val, Y_val, X_test, Y_test, vocabs, fo
                 batch_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
             else:
                 batch_mask = None
-            outputs = model(batch_X, batch_mask)
+            outputs = model(batch_X, batch_mask) if batch_mask is not None else model(batch_X)
             loss = criterion(outputs.squeeze(), batch_Y)
             loss.backward()
             optimizer.step()
@@ -261,7 +261,7 @@ def train_single_fold(X_train, Y_train, X_val, Y_val, X_test, Y_test, vocabs, fo
                     batch_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
                 else:
                     batch_mask = None
-                outputs = model(batch_X, batch_mask)
+                outputs = model(batch_X, batch_mask) if batch_mask is not None else model(batch_X)
                 loss = criterion(outputs.squeeze(), batch_Y)
                 val_loss += loss.item()
                 
@@ -307,7 +307,7 @@ def train_single_fold(X_train, Y_train, X_val, Y_val, X_test, Y_test, vocabs, fo
                 batch_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
             else:
                 batch_mask = None
-            outputs = model(batch_X, batch_mask)
+            outputs = model(batch_X, batch_mask) if batch_mask is not None else model(batch_X)
             test_preds.append(torch.sigmoid(outputs.squeeze()))
             test_targets.append(batch_Y)
     
@@ -448,7 +448,7 @@ def train_diagnosis_model_on_samples(samples, model_type='mlp', task='next', use
                 batch_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
             else:
                 batch_mask = None
-            outputs = model(batch_X, batch_mask)
+            outputs = model(batch_X, batch_mask) if batch_mask is not None else model(batch_X)
             loss = criterion(outputs.squeeze(), batch_Y)
             loss.backward()
             optimizer.step()
@@ -468,7 +468,7 @@ def train_diagnosis_model_on_samples(samples, model_type='mlp', task='next', use
                     batch_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
                 else:
                     batch_mask = None
-                outputs = model(batch_X, batch_mask)
+                outputs = model(batch_X, batch_mask) if batch_mask is not None else model(batch_X)
                 loss = criterion(outputs.squeeze(), batch_Y)
                 val_loss += loss.item()
                 
@@ -514,7 +514,7 @@ def train_diagnosis_model_on_samples(samples, model_type='mlp', task='next', use
                 batch_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
             else:
                 batch_mask = None
-            outputs = model(batch_X, batch_mask)
+            outputs = model(batch_X, batch_mask) if batch_mask is not None else model(batch_X)
             test_preds.append(torch.sigmoid(outputs.squeeze()))
             test_targets.append(batch_Y)
     
@@ -732,7 +732,7 @@ def train_dialysis_model_on_samples(samples, model_type='mlp', hidden=512, lr=1e
             else:
                 batch_mask = None
             # print(f"Batch X shape: {batch_X.shape}")
-            outputs = model(batch_X, batch_mask)
+            outputs = model(batch_X, batch_mask) if batch_mask is not None else model(batch_X)
             # print(f"Outputs shape: {outputs.shape}")
             loss = criterion(outputs.squeeze(), batch_Y)
             loss.backward()
@@ -753,7 +753,7 @@ def train_dialysis_model_on_samples(samples, model_type='mlp', hidden=512, lr=1e
                     batch_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
                 else:
                     batch_mask = None
-                outputs = model(batch_X, batch_mask)
+                outputs = model(batch_X, batch_mask) if batch_mask is not None else model(batch_X)
                 loss = criterion(outputs.squeeze(), batch_Y)
                 val_loss += loss.item()
                 
@@ -815,7 +815,7 @@ def train_dialysis_model_on_samples(samples, model_type='mlp', hidden=512, lr=1e
                 batch_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
             else:
                 batch_mask = None
-            outputs = model(batch_X, batch_mask)
+            outputs = model(batch_X, batch_mask) if batch_mask is not None else model(batch_X)
             test_preds.append(torch.sigmoid(outputs.squeeze()))
             test_targets.append(batch_Y)
     

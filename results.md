@@ -48,6 +48,10 @@
   threshold: 0.5000
 
 Only conditions:
+Confusion Matrix (threshold 0.5):
+  TP: 203, FP: 126
+  FN: 488, TN: 2944
+
 [DONE] TRANSFORMER model test results:
   accuracy: 0.8367
   precision: 0.6170
@@ -58,9 +62,6 @@ Only conditions:
   threshold: 0.5000
 
 Only conditions, with condition embedding:
-=== Threshold Analysis ===
-Using fixed threshold (0.5): F1 = 0.5681
-
 Confusion Matrix (threshold 0.5):
   TP: 540, FP: 670
   FN: 151, TN: 2400
