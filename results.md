@@ -46,3 +46,30 @@
   auc: 0.7110
   auprc: 0.4554
   threshold: 0.5000
+
+Only conditions:
+[DONE] TRANSFORMER model test results:
+  accuracy: 0.8367
+  precision: 0.6170
+  recall: 0.2938
+  f1: 0.3980
+  auc: 0.6943
+  auprc: 0.4437
+  threshold: 0.5000
+
+Only conditions, with condition embedding:
+=== Threshold Analysis ===
+Using fixed threshold (0.5): F1 = 0.5681
+
+Confusion Matrix (threshold 0.5):
+  TP: 540, FP: 670
+  FN: 151, TN: 2400
+
+[DONE] TRANSFORMER model test results:
+  accuracy: 0.7817
+  precision: 0.4463
+  recall: 0.7815
+  f1: 0.5681
+  auc: 0.8405
+  auprc: 0.5318
+  threshold: 0.5000

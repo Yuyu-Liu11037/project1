@@ -4,6 +4,7 @@ Contains data preprocessing, vectorization, vocabulary building functions for Tr
 """
 from collections import defaultdict, Counter
 import torch
+import torch.nn as nn
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -134,22 +135,22 @@ def process_trinetx_dialysis_patients(data: dict,
     max_window_days: int = 1100
 ):
     """
-    构造与 aki.ipynb 同构的数据处理，并返回样本列表 samples（每个样本是一个字典），字段包含：
+    Construct data processing isomorphic to aki.ipynb and return sample list samples (each sample is a dictionary) with fields:
       - patient_id (str)
       - visit_id (str) = "{patient_id}_aki_visit"
-      - medications (list[str])  # AKI→透析（或人工窗口）期间的药物代码
-      - conditions  (list[str])  # 同窗口内诊断代码
-      - procedures  (list[str])  # 同窗口内程序/处置代码
+      - medications (list[str])  # Medication codes during AKI→dialysis (or artificial window)
+      - conditions  (list[str])  # Diagnosis codes within the same window
+      - procedures  (list[str])  # Procedure/treatment codes within the same window
       - aki_date (str: "YYYY-MM-DD HH:MM")
-      - dialysis_date (str: "YYYY-MM-DD HH:MM" 或 "None")
+      - dialysis_date (str: "YYYY-MM-DD HH:MM" or "None")
       - dialysis_label (int: 1/0)
 
-    依赖的 data 字典需包含：
+    The dependent data dictionary should contain:
       data['patients'], data['encounters'], data['diagnoses'], data['procedures'], data['medications']
-    其中字段至少包括：
-      diagnoses:  patient_id, code_system, code, date(YYYYMMDD或datetime)
-      procedures: patient_id, code_system, code, date(YYYYMMDD或datetime)
-      medications:patient_id, code_system, brand(可为空), code, start_date(YYYYMMDD或datetime)
+    Where fields should include at least:
+      diagnoses:  patient_id, code_system, code, date(YYYYMMDD or datetime)
+      procedures: patient_id, code_system, code, date(YYYYMMDD or datetime)
+      medications:patient_id, code_system, brand(can be empty), code, start_date(YYYYMMDD or datetime)
     """
 
     rng = np.random.default_rng(random_state)
@@ -158,7 +159,7 @@ def process_trinetx_dialysis_patients(data: dict,
     procedures = data['procedures'].copy()
     meds       = data['medications'].copy()
 
-    # ---- 0) 日期列转 datetime（Notebook 使用 '%Y%m%d'） ----
+    # ---- 0) Convert date columns to datetime (Notebook uses '%Y%m%d') ----
     def _to_dt(s):
         return pd.to_datetime(s, format='%Y%m%d', errors='coerce')
 
@@ -169,7 +170,7 @@ def process_trinetx_dialysis_patients(data: dict,
     if 'start_date' in meds and not pd.api.types.is_datetime64_ns_dtype(meds['start_date']):
         meds['start_date'] = _to_dt(meds['start_date'])
 
-    # ---- 1) AKI 患者识别（与 notebook 的 ICD-10-CM 列表同构）----
+    # ---- 1) AKI patient identification (isomorphic to notebook's ICD-10-CM list) ----
     aki_icd10cm_codes = [
         "A98.5","D59.3","K76.7","N00.8","N00.9","N01.3","N04.2","N04.7",
         "N17","N17.0","N17.1","N17.9","N28.9","O90.4","S37.0"
@@ -184,10 +185,10 @@ def process_trinetx_dialysis_patients(data: dict,
     idx = aki_dx.groupby('patient_id')['date'].idxmin()
     aki_first = aki_dx.loc[idx, ['patient_id', 'date']].rename(columns={'date': 'aki_date'})
 
-    # ---- 2) 透析识别（CPT/HCPCS/ICD-10-CM）----
+    # ---- 2) Dialysis identification (CPT/HCPCS/ICD-10-CM) ----
     dialysis_codes_cpt   = ['90935', '1012752', '90999', '90937', '90947', '90945']
     dialysis_codes_hcpcs = ['G0257']
-    dialysis_codes_icd10 = ['I12.0', 'N18.6', 'Z99.2', 'D63.1']  # 与 notebook 保持一致
+    dialysis_codes_icd10 = ['I12.0', 'N18.6', 'Z99.2', 'D63.1']  # Keep consistent with notebook
 
     proc_cpt = procedures[
         (procedures['code_system'] == 'CPT') &
@@ -210,7 +211,7 @@ def process_trinetx_dialysis_patients(data: dict,
     else:
         dialysis_dates = dialysis_all.groupby('patient_id')['date'].min().rename('dialysis_date').to_frame()
 
-    # ---- 3) day_gap = AKI - Dialysis，并限制 [-1100, 0] ----
+    # ---- 3) day_gap = AKI - Dialysis, and limit to [-1100, 0] ----
     merged = aki_first.merge(dialysis_dates, on='patient_id', how='inner')
     if not merged.empty:
         merged['day_gap'] = (merged['aki_date'] - merged['dialysis_date']).dt.days
@@ -218,24 +219,24 @@ def process_trinetx_dialysis_patients(data: dict,
     else:
         dialysis_patients = merged.copy()
 
-    # ---- 4) 计算阴性窗口所需的人工 gap 分布参数 ----
+    # ---- 4) Calculate artificial gap distribution parameters needed for negative windows ----
     if not dialysis_patients.empty:
-        mean_gap = float((-dialysis_patients['day_gap']).mean())  # 阳性 gap 的正值均值
-        std_gap  = float(dialysis_patients['day_gap'].std())      # 用同样的 std（与 notebook 行为一致）
+        mean_gap = float((-dialysis_patients['day_gap']).mean())  # Mean of positive values for positive gaps
+        std_gap  = float(dialysis_patients['day_gap'].std())      # Use the same std (consistent with notebook behavior)
         if not np.isfinite(std_gap) or std_gap <= 0:
             std_gap = 1.0
     else:
-        # notebook 的经验默认值
+        # Empirical default values from notebook
         mean_gap, std_gap = 225.87, 299.61
 
-    # ---- 5) 组装 samples：阳性（有透析）----
+    # ---- 5) Assemble samples: positive (with dialysis) ----
     samples = []
     pos_ids = set()
 
     if not dialysis_patients.empty:
         pos_ids = set(dialysis_patients['patient_id'])
 
-        # 为提升效率，先按患者把诊断/程序/药物分组好
+        # For efficiency, pre-group diagnoses/procedures/medications by patient
         dx_by_pid  = diagnoses.groupby('patient_id')
         pr_by_pid  = procedures.groupby('patient_id')
         med_by_pid = meds.groupby('patient_id')
@@ -245,7 +246,7 @@ def process_trinetx_dialysis_patients(data: dict,
             aki_date = row['aki_date']
             dial_date = row['dialysis_date']
 
-            # 窗口：AKI ≤ date ≤ Dialysis
+            # Window: AKI ≤ date ≤ Dialysis
             # medications
             if pid in med_by_pid.groups:
                 m = med_by_pid.get_group(pid)
@@ -270,7 +271,7 @@ def process_trinetx_dialysis_patients(data: dict,
             else:
                 proc_list = []
 
-            # 跳过完全无药物的样本（与 notebook 的实际训练目标一致）
+            # Skip samples with no medications at all (consistent with notebook's actual training target)
             if len(meds_list) == 0:
                 continue
 
@@ -286,22 +287,22 @@ def process_trinetx_dialysis_patients(data: dict,
             }
             samples.append(sample)
 
-    # ---- 6) 组装 samples：阴性（无透析）----
+    # ---- 6) Assemble samples: negative (no dialysis) ----
     neg_patients = aki_first[~aki_first['patient_id'].isin(pos_ids)]
     if not neg_patients.empty:
-        # 预分组
+        # Pre-grouping
         dx_by_pid  = diagnoses.groupby('patient_id')
         pr_by_pid  = procedures.groupby('patient_id')
         med_by_pid = meds.groupby('patient_id')
 
-        # 为每位阴性患者采样人工 gap，并裁剪到 [0, max_window_days]
+        # Sample artificial gaps for each negative patient and clip to [0, max_window_days]
         gaps = rng.normal(loc=mean_gap, scale=std_gap, size=len(neg_patients))
         gaps = np.clip(gaps, 0, max_window_days)
 
         for (pid, aki_date), gap in zip(neg_patients[['patient_id','aki_date']].itertuples(index=False), gaps):
-            end_date = aki_date + pd.Timedelta(days=gap)  # 保持 datetime64[ns]
+            end_date = aki_date + pd.Timedelta(days=gap)  # Keep datetime64[ns]
 
-            # 窗口：AKI ≤ date ≤ AKI + artificial_gap
+            # Window: AKI ≤ date ≤ AKI + artificial_gap
             # medications
             if pid in med_by_pid.groups:
                 m = med_by_pid.get_group(pid)
@@ -326,7 +327,7 @@ def process_trinetx_dialysis_patients(data: dict,
             else:
                 proc_list = []
 
-            # 阴性也跳过无药物的样本（与 notebook 训练流程同构）
+            # Negative samples also skip those with no medications (isomorphic to notebook training flow)
             if len(meds_list) == 0:
                 continue
 
@@ -558,28 +559,49 @@ def build_dialysis_vocab_from_samples(samples):
     return mk_vocab(med_c), mk_vocab(cond_c), mk_vocab(proc_c)
 
 
-def vectorize_dialysis_sample(sample, vocabs):
+def vectorize_dialysis_sample(sample, vocabs, conditions_embedder=None, max_seq_length=None):
     """Vectorize dialysis prediction sample directly (more efficient than pairs)"""
     med_stoi, cond_stoi, proc_stoi = vocabs
     
-    # Create multi-hot vectors for each modality
-    x_med = torch.zeros(len(med_stoi), dtype=torch.float32)
-    for med in sample["medications"]:
-        if med in med_stoi:
-            x_med[med_stoi[med]] = 1.0
+    # Create multi-hot vectors for medications and procedures
+    # x_med = torch.zeros(len(med_stoi), dtype=torch.float32)
+    # for med in sample["medications"]:
+    #     if med in med_stoi:
+    #         x_med[med_stoi[med]] = 1.0
     
-    x_cond = torch.zeros(len(cond_stoi), dtype=torch.float32)
-    for cond in sample["conditions"]:
-        if cond in cond_stoi:
-            x_cond[cond_stoi[cond]] = 1.0
+    # x_proc = torch.zeros(len(proc_stoi), dtype=torch.float32)
+    # for proc in sample["procedures"]:
+    #     if proc in proc_stoi:
+    #         x_proc[proc_stoi[proc]] = 1.0
     
-    x_proc = torch.zeros(len(proc_stoi), dtype=torch.float32)
-    for proc in sample["procedures"]:
-        if proc in proc_stoi:
-            x_proc[proc_stoi[proc]] = 1.0
+    # Use hyperbolic embedding for conditions if embedder is provided, otherwise multi-hot
+    if conditions_embedder is not None:
+        # Return sequence of embeddings [n, embedding_dim] for transformer
+        x_cond = conditions_embedder.get_embedding_sequences(sample["conditions"])
+        
+        # Apply padding/truncation if max_seq_length is specified
+        if max_seq_length is not None:
+            seq_len = x_cond.size(0)
+            if seq_len > max_seq_length:
+                # Truncate to max length
+                x_cond = x_cond[:max_seq_length]
+            elif seq_len < max_seq_length:
+                # Pad with zeros
+                padding = torch.zeros(max_seq_length - seq_len, x_cond.size(1))
+                x_cond = torch.cat([x_cond, padding], dim=0)
+    else:
+        # Fallback to multi-hot encoding
+        x_cond = torch.zeros(len(cond_stoi), dtype=torch.float32)
+        for cond in sample["conditions"]:
+            if cond in cond_stoi:
+                x_cond[cond_stoi[cond]] = 1.0
     
     # Concatenate all features
-    X = torch.cat([x_med, x_cond, x_proc], dim=0)
+    # X = torch.cat([x_med, x_cond, x_proc], dim=0)
+    X = x_cond
+    # print(len(x_med), len(x_cond), len(x_proc))
+    # 28862 22465 14552: without hyperbolic embedding
+    # [n, 20]: with hyperbolic embedding (sequences)
     
     # Binary label
     y = torch.tensor(sample["dialysis_label"], dtype=torch.float32)
@@ -587,11 +609,92 @@ def vectorize_dialysis_sample(sample, vocabs):
     return X, y
 
 
-def prepare_dialysis_XY_from_samples(samples, vocabs):
+def analyze_condition_sequence_lengths(samples):
+    """
+    Analyze the distribution of condition sequence lengths in samples
+    
+    Args:
+        samples: List of sample dictionaries
+        
+    Returns:
+        Dictionary with statistics about sequence lengths
+    """
+    lengths = [len(sample["conditions"]) for sample in samples]
+    
+    stats = {
+        'min_length': min(lengths),
+        'max_length': max(lengths),
+        'mean_length': sum(lengths) / len(lengths),
+        'median_length': sorted(lengths)[len(lengths) // 2],
+        'length_distribution': {}
+    }
+    
+    # Count frequency of each length
+    from collections import Counter
+    length_counts = Counter(lengths)
+    stats['length_distribution'] = dict(length_counts)
+    
+    # Calculate percentiles
+    sorted_lengths = sorted(lengths)
+    n = len(sorted_lengths)
+    stats['p90_length'] = sorted_lengths[int(0.9 * n)]
+    stats['p95_length'] = sorted_lengths[int(0.95 * n)]
+    stats['p99_length'] = sorted_lengths[int(0.99 * n)]
+    
+    return stats
+
+
+def suggest_max_seq_length(samples, percentile=95):
+    """
+    Suggest an appropriate max_seq_length based on the distribution of condition lengths
+    
+    Args:
+        samples: List of sample dictionaries
+        percentile: Percentile to use for determining max length (default: 95)
+        
+    Returns:
+        Suggested max_seq_length
+    """
+    stats = analyze_condition_sequence_lengths(samples)
+    
+    if percentile == 90:
+        suggested_length = stats['p90_length']
+    elif percentile == 95:
+        suggested_length = stats['p95_length']
+    elif percentile == 99:
+        suggested_length = stats['p99_length']
+    else:
+        suggested_length = stats['max_length']
+    
+    print(f"Condition sequence length statistics:")
+    print(f"  Min: {stats['min_length']}")
+    print(f"  Max: {stats['max_length']}")
+    print(f"  Mean: {stats['mean_length']:.2f}")
+    print(f"  Median: {stats['median_length']}")
+    print(f"  P90: {stats['p90_length']}")
+    print(f"  P95: {stats['p95_length']}")
+    print(f"  P99: {stats['p99_length']}")
+    print(f"  Suggested max_seq_length (P{percentile}): {suggested_length}")
+    
+    return suggested_length
+
+
+def prepare_dialysis_XY_from_samples(samples, vocabs, conditions_embedder=None, max_seq_length=None):
     """Prepare dialysis prediction training data X and Y directly from samples"""
+    print(f"Max sequence length: {max_seq_length}")
     Xs, Ys = [], []
     for sample in samples:
-        X, y = vectorize_dialysis_sample(sample, vocabs)
+        # print(f"Sample conditions length: {len(sample['conditions'])}")  n
+        X, y = vectorize_dialysis_sample(sample, vocabs, conditions_embedder, max_seq_length)
+        # print(f"X shape: {X.shape}")  [n, 20]
         Xs.append(X)
         Ys.append(y)
-    return torch.stack(Xs), torch.stack(Ys)
+    
+    if max_seq_length is not None:
+        # For sequences with padding, we can stack them directly
+        return torch.stack(Xs), torch.stack(Ys)
+    else:
+        # For variable-length sequences, return as list of tensors
+        return Xs, torch.stack(Ys)
+
+

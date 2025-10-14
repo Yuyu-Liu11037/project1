@@ -20,7 +20,8 @@ from util.data_processing_trinetx import (
     build_dialysis_vocab_from_pairs,
     prepare_dialysis_XY
 )
-from training.training_trinetx import train_model_on_samples, k_fold_cross_validation, train_dialysis_model_on_samples
+from training.training_trinetx import train_diagnosis_model_on_samples, k_fold_cross_validation, train_dialysis_model_on_samples
+from train_hyperbolic_embeddings import load_embeddings
 
 warnings.filterwarnings('ignore')
 
@@ -135,11 +136,19 @@ def parse_args():
                        help='Number of Transformer layers (default: 3)')
     parser.add_argument('--dropout', type=float, default=0.3,
                        help='Dropout rate (default: 0.3)')
+    parser.add_argument('--max_seq_length', type=int, default=None,
+                       help='Maximum sequence length for padding (default: None, auto-determined)')
     
     # Data path
     parser.add_argument('--data_path', type=str, 
                        default="/data/yuyu/data/trinetx_data",
                        help='TriNetX data path')
+    
+    # Hyperbolic embeddings
+    parser.add_argument('--use_hyperbolic_embeddings', action='store_true',
+                       help='Use pre-trained hyperbolic embeddings for conditions (default: False)')
+    parser.add_argument('--embedding_file', type=str, default='hyperbolic_embeddings.pkl',
+                       help='Path to pre-trained hyperbolic embeddings file (default: hyperbolic_embeddings.pkl)')
     
     return parser.parse_args()
 
@@ -167,7 +176,7 @@ if __name__ == "__main__":
     print(f"Early stopping: {args.early_stopping}")
     if args.early_stopping:
         # Use appropriate monitor metric based on task type
-        actual_monitor = 'accuracy' if args.task_type == 'dialysis' else args.monitor_metric
+        actual_monitor = 'auprc' if args.task_type == 'dialysis' else args.monitor_metric
         print(f"  Patience: {args.patience}, Min delta: {args.min_delta}, Monitor: {actual_monitor}")
     
     if args.model == 'transformer':
@@ -197,6 +206,18 @@ if __name__ == "__main__":
         raise ValueError(f"Unknown task_type: {args.task_type}")
     
     print(f"Loaded {len(samples)} samples for {args.task_type} prediction")
+
+    # Load hyperbolic embeddings if requested
+    conditions_embedder = None
+    if args.task_type == 'dialysis' and args.use_hyperbolic_embeddings:
+        try:
+            conditions_embedder = load_embeddings(args.embedding_file)
+        except FileNotFoundError:
+            print(f"Warning: Embedding file {args.embedding_file} not found. Using one-hot encoding instead.")
+            conditions_embedder = None
+        except Exception as e:
+            print(f"Warning: Error loading embeddings from {args.embedding_file}: {e}. Using one-hot encoding instead.")
+            conditions_embedder = None
 
     # Prepare model parameters
     model_kwargs = {
@@ -247,7 +268,7 @@ if __name__ == "__main__":
         print(f"\nStarting single training run for {args.model} model...")
         
         if args.task_type == 'diagnosis':
-            model, vocabs, y_itos, test_metrics = train_model_on_samples(
+            model, vocabs, y_itos, test_metrics = train_diagnosis_model_on_samples(
                 samples,
                 model_type=args.model,
                 task=args.task,
@@ -281,9 +302,11 @@ if __name__ == "__main__":
                 early_stopping=args.early_stopping,
                 patience=args.patience,
                 min_delta=args.min_delta,
-                monitor_metric='auprc',
+                monitor_metric=actual_monitor,
                 use_gpu=args.use_gpu,
                 force_cpu=args.force_cpu,
+                conditions_embedder=conditions_embedder,
+                max_seq_length=args.max_seq_length,
                 **model_kwargs
             )
         else:

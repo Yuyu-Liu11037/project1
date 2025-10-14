@@ -10,6 +10,9 @@ import numpy as np
 from collections import defaultdict
 from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.metrics import precision_score, recall_score, f1_score
 
 from model.models import create_model
 from util.data_processing_trinetx import (
@@ -24,6 +27,7 @@ from util.data_processing_trinetx import (
     build_dialysis_vocab_from_samples,
     prepare_dialysis_XY_from_samples
 )
+from util.hyperbolic_conditions import ConditionsHyperbolicEmbedder
 from metrics.metrics import bce_pos_weight, evaluate
 
 
@@ -233,7 +237,11 @@ def train_single_fold(X_train, Y_train, X_val, Y_val, X_test, Y_test, vocabs, fo
         train_loss = 0
         for batch_X, batch_Y in train_loader:
             optimizer.zero_grad()
-            outputs = model(batch_X)
+            if conditions_embedder is not None and model_type == 'transformer':
+                batch_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
+            else:
+                batch_mask = None
+            outputs = model(batch_X, batch_mask)
             loss = criterion(outputs.squeeze(), batch_Y)
             loss.backward()
             optimizer.step()
@@ -249,7 +257,11 @@ def train_single_fold(X_train, Y_train, X_val, Y_val, X_test, Y_test, vocabs, fo
         
         with torch.no_grad():
             for batch_X, batch_Y in val_loader:
-                outputs = model(batch_X)
+                if conditions_embedder is not None and model_type == 'transformer':
+                    batch_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
+                else:
+                    batch_mask = None
+                outputs = model(batch_X, batch_mask)
                 loss = criterion(outputs.squeeze(), batch_Y)
                 val_loss += loss.item()
                 
@@ -291,7 +303,11 @@ def train_single_fold(X_train, Y_train, X_val, Y_val, X_test, Y_test, vocabs, fo
     
     with torch.no_grad():
         for batch_X, batch_Y in test_loader:
-            outputs = model(batch_X)
+            if conditions_embedder is not None and model_type == 'transformer':
+                batch_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
+            else:
+                batch_mask = None
+            outputs = model(batch_X, batch_mask)
             test_preds.append(torch.sigmoid(outputs.squeeze()))
             test_targets.append(batch_Y)
     
@@ -303,7 +319,7 @@ def train_single_fold(X_train, Y_train, X_val, Y_val, X_test, Y_test, vocabs, fo
     return test_metrics
 
 
-def train_model_on_samples(samples, model_type='mlp', task='next', use_current_step=False, 
+def train_diagnosis_model_on_samples(samples, model_type='mlp', task='next', use_current_step=False, 
                           hidden=512, lr=1e-4, wd=1e-5, epochs=100, seed=42,
                           train_percentage=1.0, batch_size=256, early_stopping=True,
                           patience=10, min_delta=0.001, monitor_metric='Acc@10',
@@ -428,7 +444,11 @@ def train_model_on_samples(samples, model_type='mlp', task='next', use_current_s
         train_loss = 0
         for batch_X, batch_Y in train_loader:
             optimizer.zero_grad()
-            outputs = model(batch_X)
+            if conditions_embedder is not None and model_type == 'transformer':
+                batch_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
+            else:
+                batch_mask = None
+            outputs = model(batch_X, batch_mask)
             loss = criterion(outputs.squeeze(), batch_Y)
             loss.backward()
             optimizer.step()
@@ -444,7 +464,11 @@ def train_model_on_samples(samples, model_type='mlp', task='next', use_current_s
         
         with torch.no_grad():
             for batch_X, batch_Y in val_loader:
-                outputs = model(batch_X)
+                if conditions_embedder is not None and model_type == 'transformer':
+                    batch_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
+                else:
+                    batch_mask = None
+                outputs = model(batch_X, batch_mask)
                 loss = criterion(outputs.squeeze(), batch_Y)
                 val_loss += loss.item()
                 
@@ -486,7 +510,11 @@ def train_model_on_samples(samples, model_type='mlp', task='next', use_current_s
     
     with torch.no_grad():
         for batch_X, batch_Y in test_loader:
-            outputs = model(batch_X)
+            if conditions_embedder is not None and model_type == 'transformer':
+                batch_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
+            else:
+                batch_mask = None
+            outputs = model(batch_X, batch_mask)
             test_preds.append(torch.sigmoid(outputs.squeeze()))
             test_targets.append(batch_Y)
     
@@ -505,7 +533,8 @@ def train_dialysis_model_on_samples(samples, model_type='mlp', hidden=512, lr=1e
                                    epochs=100, seed=42, train_percentage=1.0, batch_size=256,
                                    early_stopping=True, patience=10, min_delta=0.001,
                                    monitor_metric='auprc', use_gpu=True, force_cpu=False, 
-                                   use_optimal_threshold=True, **model_kwargs):
+                                   use_optimal_threshold=True, conditions_embedder=None, 
+                                   max_seq_length=None, **model_kwargs):
     """
     Train model on samples for dialysis prediction
     
@@ -526,6 +555,7 @@ def train_dialysis_model_on_samples(samples, model_type='mlp', hidden=512, lr=1e
         use_gpu: Whether to use GPU
         force_cpu: Whether to force CPU usage
         use_optimal_threshold: Whether to use F1-optimal threshold for final evaluation
+        conditions_embedder: Pre-trained ConditionsHyperbolicEmbedder instance (optional)
         **model_kwargs: Additional model parameters
     
     Returns:
@@ -550,12 +580,45 @@ def train_dialysis_model_on_samples(samples, model_type='mlp', hidden=512, lr=1e
     
     print(f"Vocabulary sizes - Medications: {len(med_stoi)}, Conditions: {len(cond_stoi)}, Procedures: {len(proc_stoi)}")
     
+    # Use provided hyperbolic embedder or None
+    if conditions_embedder is not None:
+        print(f"Using pre-trained hyperbolic embeddings (dim: {conditions_embedder.get_embedding_dim()})")
+    else:
+        print("Using one-hot encoding for conditions")
+    
     # Prepare data directly from samples (more efficient)
-    X, Y = prepare_dialysis_XY_from_samples(samples, vocabs)
-    print(f"Data shape - X: {X.shape}, Y: {Y.shape}")
+    X, Y = prepare_dialysis_XY_from_samples(samples, vocabs, conditions_embedder, max_seq_length)
+    print(f"Max sequence length: {max_seq_length}")
+    
+    # Handle variable-length sequences for transformer models
+    if max_seq_length is None and isinstance(X, list):
+        # For transformer models, we need to determine a suitable max_seq_length
+        if model_type == 'transformer':
+            from util.data_processing_trinetx import suggest_max_seq_length
+            suggested_length = suggest_max_seq_length(samples, percentile=95)
+            print(f"Auto-determining max_seq_length for transformer: {suggested_length}")
+            
+            # Re-prepare data with padding
+            X, Y = prepare_dialysis_XY_from_samples(samples, vocabs, conditions_embedder, suggested_length)
+        else:
+            # For non-transformer models, convert list to stacked tensor
+            # This will pad sequences to the maximum length in the batch
+            max_len = max(x.size(0) for x in X) if X else 0
+            if max_len > 0:
+                padded_X = []
+                for x in X:
+                    if x.size(0) < max_len:
+                        padding = torch.zeros(max_len - x.size(0), x.size(1))
+                        x_padded = torch.cat([x, padding], dim=0)
+                    else:
+                        x_padded = x
+                    padded_X.append(x_padded)
+                X = torch.stack(padded_X)
+            else:
+                # Handle empty case
+                X = torch.zeros(len(X), 0, 20)  # Assuming embedding_dim=20
     
     # Split data
-    from sklearn.model_selection import train_test_split
     X_train, X_temp, Y_train, Y_temp = train_test_split(X, Y, test_size=0.3, random_state=seed)
     X_val, X_test, Y_val, Y_test = train_test_split(X_temp, Y_temp, test_size=0.5, random_state=seed)
     
@@ -584,14 +647,34 @@ def train_dialysis_model_on_samples(samples, model_type='mlp', hidden=512, lr=1e
     X_test = X_test.to(device)
     Y_test = Y_test.to(device)
     
-    # Create model (binary classification)
-    model = create_model(
-        model_type=model_type,
-        in_dim=X_train.shape[1],
-        hidden=hidden,
-        out_dim=1,  # Binary classification
-        **model_kwargs
-    ).to(device)
+    # Create main model (binary classification)
+    if conditions_embedder is not None and model_type == 'transformer':
+        # Use SequentialTransformerModel for hyperbolic embeddings
+        model = create_model(
+            model_type='sequential_transformer',
+            in_dim=X_train.shape[2],  # embedding_dim
+            hidden=hidden,
+            out_dim=1,  # Binary classification
+            **model_kwargs
+        ).to(device)
+    else:
+        # Use regular model for other cases
+        model = create_model(
+            model_type=model_type,
+            in_dim=X_train.shape[1],
+            hidden=hidden,
+            out_dim=1,  # Binary classification
+            **model_kwargs
+        ).to(device)
+    
+    # Create attention masks for SequentialTransformerModel
+    attention_masks = None
+    if conditions_embedder is not None and model_type == 'transformer':
+        # Create attention masks (1 for real tokens, 0 for padding)
+        attention_masks = torch.ones(X_train.size(0), X_train.size(1)).to(device)
+        # Note: For now, we assume all tokens are real (no padding)
+        # In practice, you might want to create proper masks based on actual sequence lengths
+        print(f"Created attention masks: {attention_masks.shape}")
     
     # Loss and optimizer
     pos_weight = bce_pos_weight(Y_train)
@@ -628,7 +711,6 @@ def train_dialysis_model_on_samples(samples, model_type='mlp', hidden=512, lr=1e
     initial_val_preds_binary = (initial_val_preds > 0.5).float()
     initial_val_accuracy = (initial_val_preds_binary == initial_val_targets).float().mean().item()
     
-    from sklearn.metrics import average_precision_score, roc_auc_score
     initial_val_auprc = average_precision_score(initial_val_targets.cpu().numpy(), initial_val_preds.cpu().numpy())
     initial_val_auc = roc_auc_score(initial_val_targets.cpu().numpy(), initial_val_preds.cpu().numpy())
     
@@ -645,7 +727,13 @@ def train_dialysis_model_on_samples(samples, model_type='mlp', hidden=512, lr=1e
         train_loss = 0
         for batch_X, batch_Y in train_loader:
             optimizer.zero_grad()
-            outputs = model(batch_X)
+            if conditions_embedder is not None and model_type == 'transformer':
+                batch_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
+            else:
+                batch_mask = None
+            # print(f"Batch X shape: {batch_X.shape}")
+            outputs = model(batch_X, batch_mask)
+            # print(f"Outputs shape: {outputs.shape}")
             loss = criterion(outputs.squeeze(), batch_Y)
             loss.backward()
             optimizer.step()
@@ -661,7 +749,11 @@ def train_dialysis_model_on_samples(samples, model_type='mlp', hidden=512, lr=1e
         
         with torch.no_grad():
             for batch_X, batch_Y in val_loader:
-                outputs = model(batch_X)
+                if conditions_embedder is not None and model_type == 'transformer':
+                    batch_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
+                else:
+                    batch_mask = None
+                outputs = model(batch_X, batch_mask)
                 loss = criterion(outputs.squeeze(), batch_Y)
                 val_loss += loss.item()
                 
@@ -677,11 +769,9 @@ def train_dialysis_model_on_samples(samples, model_type='mlp', hidden=512, lr=1e
         val_accuracy = (val_preds_binary == val_targets).float().mean().item()
         
         # Calculate AUPRC
-        from sklearn.metrics import average_precision_score
         val_auprc = average_precision_score(val_targets.cpu().numpy(), val_preds.cpu().numpy())
         
         # Calculate AUC
-        from sklearn.metrics import roc_auc_score
         val_auc = roc_auc_score(val_targets.cpu().numpy(), val_preds.cpu().numpy())
         
         # Select metric based on monitor_metric parameter
@@ -721,7 +811,11 @@ def train_dialysis_model_on_samples(samples, model_type='mlp', hidden=512, lr=1e
     
     with torch.no_grad():
         for batch_X, batch_Y in test_loader:
-            outputs = model(batch_X)
+            if conditions_embedder is not None and model_type == 'transformer':
+                batch_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
+            else:
+                batch_mask = None
+            outputs = model(batch_X, batch_mask)
             test_preds.append(torch.sigmoid(outputs.squeeze()))
             test_targets.append(batch_Y)
     
@@ -747,7 +841,6 @@ def train_dialysis_model_on_samples(samples, model_type='mlp', hidden=512, lr=1e
     print(f"Number of negative samples: {len(test_targets_np) - test_targets_np.sum()}")
     
     # Calculate additional metrics
-    from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, average_precision_score
     
     # Use fixed threshold of 0.5
     optimal_threshold = 0.5

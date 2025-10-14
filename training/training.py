@@ -326,14 +326,14 @@ def train_model_on_samples(samples,
     """
     # 1) Sort and assemble (current/next)
     print(f"\nSamples: {samples[0]}")
-    # 每一个sample就是一个病人的一条visit记录
-    # 除了 adm_time 和 cond_hist 以外，其他字段都是这个 visit 特有的记录(这两个字段包含了这个病人过往的记录)
-    # 每条 visit 里，cond_hist 包含病人过往 conditions 原代码，但是 conditions 字段是 CCS 映射后的代码
+    # Each sample is a patient's visit record
+    # Except for adm_time and cond_hist, other fields are specific to this visit (these two fields contain the patient's past records)
+    # In each visit, cond_hist contains the patient's past condition original codes, but the conditions field is CCS-mapped codes
     # TODO: redundant
     by_pid = sort_samples_within_patient(samples)   # defaultdict(list), {"patient_id": [sample1, sample2, ...]}
     print(f"\nBy pid: {by_pid['10001401']}")
-    # build_pairs有问题。。我们应该是要用病人的所有过往visit记录来预测下一次的诊断，而不是上一次的visit
-    # 没事了，cond_hist字段就是之前所有的visits
+    # build_pairs has issues... We should use all past visit records of the patient to predict the next diagnosis, not the previous visit
+    # Never mind, the cond_hist field contains all previous visits
     pairs = build_pairs(by_pid, task=task)   # (sample_t, label_t+1)
     print(f"\nPairs: {pairs[10]}")
 

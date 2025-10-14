@@ -35,13 +35,15 @@ The main training function is ```train_dialysis_model_on_samples()``` in ```trai
 All command line arguments and their descriptions can be found in the `parse_args()` function in `trinetx.py` or `mimic_iv.py`.
 
 ```bash
-# Train and evaluate MLP model on MIMIC-IV (default settings)
-python mimic_iv.py
+# Train hyperbolic embedding of conditions code
+python train_hyperbolic_embeddings.py
 ```
 
 ```bash
 # Train and evaluate Transformer model on TriNetX for dialysis prediction (default settings)
 python trinetx.py
+# Train and evaluate Transformer model on TriNetX for dialysis prediction (using hyperbolic embedding of conditions code)
+python trinetx.py --use_hyperbolic_embeddings
 ```
 ## Dependencies
 

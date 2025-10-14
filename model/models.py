@@ -115,12 +115,87 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+class SequentialTransformerModel(nn.Module):
+    """Transformer model for sequential input (batch_size, seq_len, embedding_dim)"""
+    
+    def __init__(self, embedding_dim, hidden, out_dim, num_heads=8, num_layers=3, p=0.3):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.hidden = hidden
+        self.out_dim = out_dim
+        
+        # Project embedding dimension to hidden dimension
+        self.input_projection = nn.Linear(embedding_dim, hidden)
+        
+        # Positional encoding
+        self.pos_encoding = PositionalEncoding(hidden, p)
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden,
+            nhead=num_heads,
+            dim_feedforward=hidden * 4,
+            dropout=p,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Output layer
+        self.output_projection = nn.Linear(hidden, out_dim)
+        
+        # Dropout
+        self.dropout = nn.Dropout(p)
+        
+    def forward(self, x, attention_mask=None):
+        # x shape: (batch_size, seq_len, embedding_dim)
+        batch_size, seq_len, embedding_dim = x.size()
+        
+        # Project embeddings to hidden dimension
+        x_projected = self.input_projection(x)  # (batch_size, seq_len, hidden)
+        
+        # Positional encoding
+        x_projected = self.pos_encoding(x_projected)
+        
+        # Transformer encoding
+        # If attention mask is provided, convert to the format expected by PyTorch transformer
+        if attention_mask is not None:
+            # PyTorch transformer expects attention_mask where True means "ignore"
+            # Our mask has 1 for "attend" and 0 for "ignore", so we need to invert it
+            attention_mask = (attention_mask == 0)
+        
+        x_encoded = self.transformer(x_projected, src_key_padding_mask=attention_mask)
+        
+        # Global average pooling over sequence dimension
+        # Use attention mask to ignore padding tokens
+        if attention_mask is not None:
+            # Create mask for valid tokens (invert the attention mask)
+            valid_mask = ~attention_mask  # True for valid tokens
+            # Set invalid positions to 0
+            x_encoded = x_encoded * valid_mask.unsqueeze(-1).float()
+            # Sum over sequence dimension
+            x_pooled = x_encoded.sum(dim=1)
+            # Divide by number of valid tokens per sample
+            valid_counts = valid_mask.sum(dim=1, keepdim=True).float()
+            x_pooled = x_pooled / valid_counts.clamp(min=1)
+        else:
+            # Simple average pooling
+            x_pooled = x_encoded.mean(dim=1)
+        
+        # Dropout
+        x_pooled = self.dropout(x_pooled)
+        
+        # Output projection
+        return self.output_projection(x_pooled)
+
+
 def create_model(model_type, in_dim, hidden, out_dim, **kwargs):
     """Model factory function"""
     if model_type.lower() == 'mlp':
         return MLP(in_dim, hidden, out_dim, **kwargs)
     elif model_type.lower() == 'transformer':
         return TransformerModel(in_dim, hidden, out_dim, **kwargs)
+    elif model_type.lower() == 'sequential_transformer':
+        return SequentialTransformerModel(in_dim, hidden, out_dim, **kwargs)
     else:
-        raise ValueError(f"Unsupported model type: {model_type}. Supported types: 'mlp', 'transformer'")
+        raise ValueError(f"Unsupported model type: {model_type}. Supported types: 'mlp', 'transformer', 'sequential_transformer'")
 
