@@ -384,8 +384,11 @@ def train_diagnosis_model_on_samples(samples, model_type='mlp', task='next', use
     
     # Subsample training data if requested
     if train_percentage < 1.0:
+        # Set random seed for reproducible sampling
+        torch.manual_seed(seed)
+        random.seed(seed)
         n_train = int(len(train_pairs) * train_percentage)
-        train_pairs = train_pairs[:n_train]
+        train_pairs = random.sample(train_pairs, n_train)
         print(f"Subsampled training data to {len(train_pairs)} pairs ({train_percentage:.1%})")
     
     # Prepare train/val/test data
@@ -626,9 +629,14 @@ def train_dialysis_model_on_samples(samples, model_type='mlp', hidden=512, lr=1e
     
     # Subsample training data if requested
     if train_percentage < 1.0:
+        # Set random seed for reproducible sampling
+        torch.manual_seed(seed)
+        random.seed(seed)
         n_train = int(len(X_train) * train_percentage)
-        X_train = X_train[:n_train]
-        Y_train = Y_train[:n_train]
+        # Create indices for random sampling
+        train_indices = random.sample(range(len(X_train)), n_train)
+        X_train = X_train[train_indices]
+        Y_train = Y_train[train_indices]
         print(f"Subsampled training data to {len(X_train)} samples ({train_percentage:.1%})")
     
     # Device setup

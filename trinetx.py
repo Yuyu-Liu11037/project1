@@ -100,7 +100,7 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed (default: 42)')
     parser.add_argument('--train_percentage', type=float, default=0.05,
-                       help='Percentage of training data to use for few-shot training (0.01-1.0, default: 1.0)')
+                       help='Percentage of training data to use for few-shot training (0.01-1.0, default: 0.05)')
     parser.add_argument('--batch_size', type=int, default=256,
                        help='Batch size for training (default: 256)')
     parser.add_argument('--use_gpu', action='store_true', default=True,
@@ -109,10 +109,10 @@ def parse_args():
                        help='Force CPU usage even if GPU is available (default: False)')
     
     # Cross validation parameters
-    parser.add_argument('--k_folds', type=int, default=5,
-                       help='Number of folds for k-fold cross validation (default: 5)')
-    parser.add_argument('--num_seeds', type=int, default=3,
-                       help='Number of different random seeds to use (default: 3)')
+    parser.add_argument('--k_folds', type=int, default=3,
+                       help='Number of folds for k-fold cross validation (default: 3)')
+    parser.add_argument('--num_seeds', type=int, default=1,
+                       help='Number of different random seeds to use (default: 1)')
     parser.add_argument('--seed_range', type=str, default='42,123,456',
                        help='Comma-separated list of random seeds to use (default: 42,123,456)')
     parser.add_argument('--use_cross_validation', action='store_true',

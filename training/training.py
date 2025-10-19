@@ -84,6 +84,9 @@ def k_fold_cross_validation(samples, k_folds=5, seeds=[42, 123, 456], **train_kw
             # Apply few-shot sampling to training data if specified
             train_percentage = train_kwargs.get('train_percentage', 1.0)
             if train_percentage < 1.0:
+                # Set random seed for reproducible sampling
+                torch.manual_seed(seed)
+                random.seed(seed)
                 original_train_size = len(train_pairs)
                 sample_size = int(original_train_size * train_percentage)
                 train_pairs = random.sample(train_pairs, sample_size)

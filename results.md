@@ -1,4 +1,4 @@
-### MIMIC-IV
+## MIMIC-IV
 [DONE] MLP model test results: {'P@10': 0.30813953488372087, 'Acc@10': 0.21281510066875609, 'Recall@10': 0.21281510066875609, 'P@20': 0.24540028812512865, 'Acc@20': 0.3389690780262812, 'Recall@20': 0.3389690780262812}
 
 100%:
@@ -37,7 +37,8 @@
   Acc@30: 0.5463
   Recall@30: 0.5463
 
-###Trinetx
+##Trinetx
+### Medications, Conditions, Procedures
 [DONE] TRANSFORMER model test results:
   accuracy: 0.8367
   precision: 0.7516
@@ -47,7 +48,22 @@
   auprc: 0.4554
   threshold: 0.5000
 
-Only conditions:
+### Only conditions:
+100%:
+Confusion Matrix (threshold 0.5):
+  TP: 496, FP: 201
+  FN: 195, TN: 2869
+
+[DONE] TRANSFORMER model test results:
+  accuracy: 0.8947
+  precision: 0.7116
+  recall: 0.7178
+  f1: 0.7147
+  auc: 0.8631
+  auprc: 0.6855
+  threshold: 0.5000
+
+5%
 Confusion Matrix (threshold 0.5):
   TP: 203, FP: 126
   FN: 488, TN: 2944
@@ -61,7 +77,22 @@ Confusion Matrix (threshold 0.5):
   auprc: 0.4437
   threshold: 0.5000
 
-Only conditions, with condition embedding:
+### Only conditions, with condition embedding:
+100%:
+Confusion Matrix (threshold 0.5):
+  TP: 592, FP: 414
+  FN: 99, TN: 2656
+
+[DONE] TRANSFORMER model test results:
+  accuracy: 0.8636
+  precision: 0.5885
+  recall: 0.8567
+  f1: 0.6977
+  auc: 0.9262
+  auprc: 0.7785
+  threshold: 0.5000
+  
+5%:
 Confusion Matrix (threshold 0.5):
   TP: 540, FP: 670
   FN: 151, TN: 2400
