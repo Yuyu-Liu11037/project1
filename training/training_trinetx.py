@@ -729,6 +729,7 @@ def train_dialysis_model_on_samples(samples, model_type='mlp', hidden=512, lr=1e
     patience_counter = 0
     best_model_state = None
     
+    print("\n=== Training Loop ===")
     for epoch in range(epochs):
         # Training
         model.train()

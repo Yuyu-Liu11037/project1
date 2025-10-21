@@ -461,3 +461,185 @@ class ConditionsHyperbolicEmbedder:
     def get_embedding_dim(self) -> int:
         """Get the total embedding dimension for a single condition"""
         return self.embedding_dim
+    
+    def initialize_hierarchical_embeddings(self, output_file: str = "hyperbolic_embeddings.pkl") -> Dict[str, torch.Tensor]:
+        """
+        Initialize embeddings in Poincare ball according to hierarchical rules:
+        1. All codes on the same level (uniquely decided by code length) should be equally far from origin
+        2. Codes with shorter length (lower level) should be closer to origin
+        3. For every code on level n, the nearest code on level n-1 should be its parent code
+        4. The parent code for the lowest level code (length=3) is origin of Poincare ball
+        
+        Args:
+            output_file: Path to save the initialized embeddings
+            
+        Returns:
+            Dictionary mapping condition codes to their initialized hyperbolic embeddings
+        """
+        import pickle
+        import numpy as np
+        from collections import defaultdict
+        
+        print(f"Initializing hierarchical embeddings for {len(self.conditions_codes)} condition codes...")
+        
+        # Group codes by hierarchy level (code length)
+        codes_by_level = defaultdict(list)
+        for code in self.conditions_codes:
+            level = len(code)
+            codes_by_level[level].append(code)
+        
+        # Sort levels (shorter codes = higher hierarchy = closer to origin)
+        sorted_levels = sorted(codes_by_level.keys())
+        print(f"Found hierarchy levels: {sorted_levels}")
+        
+        # Initialize embeddings dictionary
+        code2embedding = {}
+        
+        # Define radius for each level (closer to origin for higher hierarchy)
+        # Level 3 (highest hierarchy) gets smallest radius, increasing for lower levels
+        level_radii = {}
+        max_level = max(sorted_levels) if sorted_levels else 3
+        min_level = min(sorted_levels) if sorted_levels else 3
+        
+        for level in sorted_levels:
+            # Normalize level to [0, 1] range, then scale to [0.1, 0.9] for Poincare ball
+            normalized_level = (level - min_level) / (max_level - min_level) if max_level > min_level else 0
+            radius = 0.1 + 0.8 * normalized_level  # Range from 0.1 to 0.9
+            level_radii[level] = radius
+        
+        print(f"Level radii: {level_radii}")
+        
+        # Initialize embeddings for each level
+        for level in sorted_levels:
+            codes_at_level = codes_by_level[level]
+            radius = level_radii[level]
+            
+            print(f"Initializing level {level} with {len(codes_at_level)} codes at radius {radius:.3f}")
+            
+            # Generate points on sphere at given radius
+            embeddings_at_level = self._generate_points_on_sphere(
+                len(codes_at_level), self.embedding_dim, radius
+            )
+            
+            # Assign embeddings to codes
+            for i, code in enumerate(codes_at_level):
+                code2embedding[code] = embeddings_at_level[i]
+        
+        # Apply parent-child proximity constraints
+        print("Applying parent-child proximity constraints...")
+        code2embedding = self._apply_parent_child_constraints(code2embedding, codes_by_level)
+        
+        # Save embeddings to file
+        print(f"Saving initialized embeddings to {output_file}")
+        with open(output_file, 'wb') as f:
+            pickle.dump(code2embedding, f)
+        
+        print(f"Successfully initialized and saved hierarchical embeddings!")
+        return code2embedding
+    
+    def _generate_points_on_sphere(self, n_points: int, dim: int, radius: float) -> torch.Tensor:
+        """
+        Generate n_points uniformly distributed on a sphere of given radius in dim dimensions
+        
+        Args:
+            n_points: Number of points to generate
+            dim: Dimension of the embedding space
+            radius: Radius of the sphere (distance from origin)
+            
+        Returns:
+            Tensor of shape [n_points, dim] with points on the sphere
+        """
+        if n_points == 0:
+            return torch.empty(0, dim)
+        
+        # Generate random points in unit ball
+        points = torch.randn(n_points, dim)
+        
+        # Normalize to unit sphere
+        norms = torch.norm(points, dim=1, keepdim=True)
+        points = points / norms
+        
+        # Scale to desired radius
+        points = points * radius
+        
+        return points
+    
+    def _apply_parent_child_constraints(self, code2embedding: Dict[str, torch.Tensor], 
+                                      codes_by_level: Dict[int, List[str]]) -> Dict[str, torch.Tensor]:
+        """
+        Apply parent-child proximity constraints to ensure children are near their parents
+        
+        Args:
+            code2embedding: Dictionary mapping codes to embeddings
+            codes_by_level: Dictionary mapping level to list of codes at that level
+            
+        Returns:
+            Updated dictionary with parent-child constraints applied
+        """
+        sorted_levels = sorted(codes_by_level.keys())
+        
+        # For each level (except the highest), adjust children to be near their parents
+        for i in range(1, len(sorted_levels)):
+            current_level = sorted_levels[i]
+            parent_level = sorted_levels[i-1]
+            
+            codes_at_level = codes_by_level[current_level]
+            parent_codes = codes_by_level[parent_level]
+            
+            for child_code in codes_at_level:
+                # Find the parent code (first parent_level characters)
+                parent_code = child_code[:parent_level]
+                
+                if parent_code in code2embedding:
+                    # Get parent embedding
+                    parent_embedding = code2embedding[parent_code]
+                    
+                    # Generate new child embedding near parent
+                    child_embedding = self._generate_child_near_parent(
+                        parent_embedding, self.embedding_dim, 
+                        current_level, sorted_levels
+                    )
+                    
+                    code2embedding[child_code] = child_embedding
+        
+        return code2embedding
+    
+    def _generate_child_near_parent(self, parent_embedding: torch.Tensor, dim: int, 
+                                  child_level: int, all_levels: List[int]) -> torch.Tensor:
+        """
+        Generate a child embedding near its parent
+        
+        Args:
+            parent_embedding: Parent's embedding vector
+            dim: Embedding dimension
+            child_level: Level of the child code
+            all_levels: List of all levels for radius calculation
+            
+        Returns:
+            Child embedding vector near the parent
+        """
+        # Calculate radius for child level
+        min_level = min(all_levels)
+        max_level = max(all_levels)
+        normalized_level = (child_level - min_level) / (max_level - min_level) if max_level > min_level else 0
+        child_radius = 0.1 + 0.8 * normalized_level
+        
+        # Generate random direction
+        direction = torch.randn(dim)
+        direction = direction / torch.norm(direction)
+        
+        # Scale to child radius
+        child_embedding = direction * child_radius
+        
+        # Add small perturbation towards parent (but maintain radius constraint)
+        parent_direction = parent_embedding / torch.norm(parent_embedding)
+        perturbation_strength = 0.1  # How much to move towards parent
+        
+        # Blend child direction with parent direction
+        blended_direction = (1 - perturbation_strength) * direction + perturbation_strength * parent_direction
+        blended_direction = blended_direction / torch.norm(blended_direction)
+        
+        # Final child embedding
+        child_embedding = blended_direction * child_radius
+        
+        return child_embedding
