@@ -135,12 +135,17 @@ def process_trinetx_dialysis_patients(data: dict,
     max_window_days: int = 1100
 ):
     """
-    Construct data processing isomorphic to aki.ipynb and return sample list samples (each sample is a dictionary) with fields:
+    Construct data processing for dialysis prediction with modified criteria:
+    
+    Positive samples: Only patients with dialysis occurring 90+ days after AKI
+    Feature window: Fixed 90-day window after AKI onset for both positive and negative samples
+    
+    Returns sample list samples (each sample is a dictionary) with fields:
       - patient_id (str)
       - visit_id (str) = "{patient_id}_aki_visit"
-      - medications (list[str])  # Medication codes during AKI→dialysis (or artificial window)
-      - conditions  (list[str])  # Diagnosis codes within the same window
-      - procedures  (list[str])  # Procedure/treatment codes within the same window
+      - medications (list[str])  # Medication codes within 90 days after AKI
+      - conditions  (list[str])  # Diagnosis codes within 90 days after AKI
+      - procedures  (list[str])  # Procedure/treatment codes within 90 days after AKI
       - aki_date (str: "YYYY-MM-DD HH:MM")
       - dialysis_date (str: "YYYY-MM-DD HH:MM" or "None")
       - dialysis_label (int: 1/0)
@@ -212,10 +217,12 @@ def process_trinetx_dialysis_patients(data: dict,
         dialysis_dates = dialysis_all.groupby('patient_id')['date'].min().rename('dialysis_date').to_frame()
 
     # ---- 3) day_gap = AKI - Dialysis, and limit to [-1100, 0] ----
+    # Modified: Only consider patients with dialysis 90+ days after AKI
     merged = aki_first.merge(dialysis_dates, on='patient_id', how='inner')
     if not merged.empty:
         merged['day_gap'] = (merged['aki_date'] - merged['dialysis_date']).dt.days
-        dialysis_patients = merged[(merged['day_gap'] <= 0) & (merged['day_gap'] >= -max_window_days)].copy()
+        # Only keep patients where dialysis occurs 90+ days after AKI (day_gap <= -90)
+        dialysis_patients = merged[(merged['day_gap'] <= -90) & (merged['day_gap'] >= -max_window_days)].copy()
     else:
         dialysis_patients = merged.copy()
 
@@ -246,11 +253,13 @@ def process_trinetx_dialysis_patients(data: dict,
             aki_date = row['aki_date']
             dial_date = row['dialysis_date']
 
-            # Window: AKI ≤ date ≤ Dialysis
+            # Modified: Window: AKI ≤ date ≤ AKI + 90 days (fixed 90-day window)
+            feature_end_date = aki_date + pd.Timedelta(days=90)
+            
             # medications
             if pid in med_by_pid.groups:
                 m = med_by_pid.get_group(pid)
-                mm = m[(m['start_date']>=aki_date) & (m['start_date']<=dial_date) & (~m['code'].isna())]
+                mm = m[(m['start_date']>=aki_date) & (m['start_date']<=feature_end_date) & (~m['code'].isna())]
                 meds_list = mm['code'].astype(str).dropna().unique().tolist()
             else:
                 meds_list = []
@@ -258,7 +267,7 @@ def process_trinetx_dialysis_patients(data: dict,
             # diagnoses (conditions)
             if pid in dx_by_pid.groups:
                 d = dx_by_pid.get_group(pid)
-                dd = d[(d['date']>=aki_date) & (d['date']<=dial_date) & (~d['code'].isna())]
+                dd = d[(d['date']>=aki_date) & (d['date']<=feature_end_date) & (~d['code'].isna())]
                 cond_list = dd['code'].astype(str).dropna().unique().tolist()
             else:
                 cond_list = []
@@ -266,7 +275,7 @@ def process_trinetx_dialysis_patients(data: dict,
             # procedures
             if pid in pr_by_pid.groups:
                 p = pr_by_pid.get_group(pid)
-                pp = p[(p['date']>=aki_date) & (p['date']<=dial_date) & (~p['code'].isna())]
+                pp = p[(p['date']>=aki_date) & (p['date']<=feature_end_date) & (~p['code'].isna())]
                 proc_list = pp['code'].astype(str).dropna().unique().tolist()
             else:
                 proc_list = []
@@ -300,13 +309,14 @@ def process_trinetx_dialysis_patients(data: dict,
         gaps = np.clip(gaps, 0, max_window_days)
 
         for (pid, aki_date), gap in zip(neg_patients[['patient_id','aki_date']].itertuples(index=False), gaps):
-            end_date = aki_date + pd.Timedelta(days=gap)  # Keep datetime64[ns]
+            # Modified: Use fixed 90-day window for negative samples too
+            feature_end_date = aki_date + pd.Timedelta(days=90)
 
-            # Window: AKI ≤ date ≤ AKI + artificial_gap
+            # Window: AKI ≤ date ≤ AKI + 90 days (fixed 90-day window)
             # medications
             if pid in med_by_pid.groups:
                 m = med_by_pid.get_group(pid)
-                mm = m[(m['start_date']>=aki_date) & (m['start_date']<=end_date) & (~m['code'].isna())]
+                mm = m[(m['start_date']>=aki_date) & (m['start_date']<=feature_end_date) & (~m['code'].isna())]
                 meds_list = mm['code'].astype(str).dropna().unique().tolist()
             else:
                 meds_list = []
@@ -314,7 +324,7 @@ def process_trinetx_dialysis_patients(data: dict,
             # diagnoses
             if pid in dx_by_pid.groups:
                 d = dx_by_pid.get_group(pid)
-                dd = d[(d['date']>=aki_date) & (d['date']<=end_date) & (~d['code'].isna())]
+                dd = d[(d['date']>=aki_date) & (d['date']<=feature_end_date) & (~d['code'].isna())]
                 cond_list = dd['code'].astype(str).dropna().unique().tolist()
             else:
                 cond_list = []
@@ -322,7 +332,7 @@ def process_trinetx_dialysis_patients(data: dict,
             # procedures
             if pid in pr_by_pid.groups:
                 p = pr_by_pid.get_group(pid)
-                pp = p[(p['date']>=aki_date) & (p['date']<=end_date) & (~p['code'].isna())]
+                pp = p[(p['date']>=aki_date) & (p['date']<=feature_end_date) & (~p['code'].isna())]
                 proc_list = pp['code'].astype(str).dropna().unique().tolist()
             else:
                 proc_list = []
