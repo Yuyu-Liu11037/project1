@@ -8,7 +8,6 @@ import torch.optim as optim
 import random
 import numpy as np
 from collections import defaultdict
-from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader, TensorDataset
 
 from model.models import create_model
@@ -20,271 +19,10 @@ from util.data_processing import (
     split_by_patient,
     build_dialysis_pairs,
     build_dialysis_vocab_from_pairs,
-    prepare_dialysis_XY
+    prepare_dialysis_XY,
+    load_hyperbolic_embeddings
 )
 from metrics.metrics import bce_pos_weight, evaluate
-
-
-def k_fold_cross_validation(samples, k_folds=5, seeds=[42, 123, 456], **train_kwargs):
-    """
-    Perform k-fold cross validation with multiple random seeds
-    
-    Args:
-        samples: Sample data
-        k_folds: Number of folds for cross validation
-        seeds: List of random seeds to use
-        **train_kwargs: Additional training parameters
-    
-    Returns:
-        Dictionary containing aggregated results across all folds and seeds
-    """
-    print(f"\nStarting {k_folds}-fold cross validation with {len(seeds)} random seeds...")
-    print(f"Seeds: {seeds}")
-    
-    all_results = []
-    fold_results = []
-    
-    for seed_idx, seed in enumerate(seeds):
-        print(f"\n{'='*60}")
-        print(f"SEED {seed_idx + 1}/{len(seeds)}: {seed}")
-        print(f"{'='*60}")
-        
-        # Set random seed for this iteration
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
-        
-        # Sort samples by patient and build pairs
-        by_pid = sort_samples_within_patient(samples)
-        pairs = build_pairs(by_pid, task=train_kwargs.get('task', 'next'))
-        
-        # Get unique patient IDs for patient-level k-fold split
-        patient_ids = list(by_pid.keys())
-        print(f"Total patients: {len(patient_ids)}")
-        
-        # Initialize k-fold splitter
-        kf = KFold(n_splits=k_folds, shuffle=True, random_state=seed)
-        
-        fold_metrics = []
-        
-        for fold_idx, (train_patients_idx, val_patients_idx) in enumerate(kf.split(patient_ids)):
-            print(f"\n--- FOLD {fold_idx + 1}/{k_folds} ---")
-            
-            # Get patient IDs for this fold
-            train_patients = [patient_ids[i] for i in train_patients_idx]
-            val_patients = [patient_ids[i] for i in val_patients_idx]
-            
-            # Split pairs based on patient IDs
-            train_pairs = [pair for pair in pairs if pair[0]['patient_id'] in train_patients]
-            val_pairs = [pair for pair in pairs if pair[0]['patient_id'] in val_patients]
-            
-            print(f"Train patients: {len(train_patients)}, Train pairs: {len(train_pairs)}")
-            print(f"Val patients: {len(val_patients)}, Val pairs: {len(val_pairs)}")
-            
-            # Apply few-shot sampling to training data if specified
-            train_percentage = train_kwargs.get('train_percentage', 1.0)
-            if train_percentage < 1.0:
-                # Set random seed for reproducible sampling
-                torch.manual_seed(seed)
-                random.seed(seed)
-                original_train_size = len(train_pairs)
-                sample_size = int(original_train_size * train_percentage)
-                train_pairs = random.sample(train_pairs, sample_size)
-                print(f"Few-shot training: Using {len(train_pairs)}/{original_train_size} samples ({train_percentage:.1%})")
-            
-            # Train model on this fold
-            fold_kwargs = train_kwargs.copy()
-            fold_kwargs['seed'] = seed
-            fold_kwargs['train_pairs'] = train_pairs
-            fold_kwargs['val_pairs'] = val_pairs
-            
-            try:
-                model, vocabs, y_itos, test_metrics = train_model_on_fold(**fold_kwargs)
-                fold_metrics.append(test_metrics)
-                print(f"Fold {fold_idx + 1} results: {test_metrics}")
-            except Exception as e:
-                print(f"Error in fold {fold_idx + 1}: {e}")
-                # Add zero metrics for failed fold
-                fold_metrics.append({k: 0.0 for k in ['P@10', 'Acc@10', 'P@20', 'Acc@20']})
-        
-        # Aggregate results for this seed
-        seed_results = aggregate_fold_results(fold_metrics)
-        all_results.append(seed_results)
-        fold_results.extend(fold_metrics)
-        
-        print(f"\nSeed {seed} aggregated results:")
-        for metric, stats in seed_results.items():
-            print(f"  {metric}: {stats['mean']:.4f} ± {stats['std']:.4f}")
-    
-    # Aggregate results across all seeds
-    final_results = aggregate_seed_results(all_results)
-    
-    print(f"\n{'='*60}")
-    print("FINAL CROSS-VALIDATION RESULTS")
-    print(f"{'='*60}")
-    for metric, stats in final_results.items():
-        print(f"{metric}: {stats['mean']:.4f} ± {stats['std']:.4f} (min: {stats['min']:.4f}, max: {stats['max']:.4f})")
-    
-    return final_results, fold_results
-
-
-def train_model_on_fold(train_pairs, val_pairs, model_type="mlp", task="next", 
-                       use_current_step=False, hidden=512, lr=1e-3, wd=1e-5,
-                       epochs=10, seed=42, train_percentage=1.0, batch_size=32,
-                       early_stopping=True, patience=10, min_delta=0.001,
-                       monitor_metric='Acc@10', use_gpu=True, force_cpu=False, **model_kwargs):
-    """
-    Train model on a single fold of cross validation
-    
-    Args:
-        train_pairs: Training pairs for this fold
-        val_pairs: Validation pairs for this fold
-        **kwargs: Training parameters
-    
-    Returns:
-        model, vocabs, y_itos, test_metrics
-    """
-    # Setup device (GPU if available and requested)
-    if force_cpu:
-        device = torch.device('cpu')
-        print("Using device: cpu (forced)")
-    elif use_gpu and torch.cuda.is_available():
-        device = torch.device('cuda')
-        print(f"Using device: {device}")
-    else:
-        device = torch.device('cpu')
-        print(f"Using device: {device} (GPU not available or disabled)")
-    
-    # Build vocabulary from training pairs
-    (diag_stoi,_), (proc_stoi,_), (drug_stoi,_), (y_stoi, y_itos) = build_vocab_from_pairs(train_pairs)
-    vocabs = (diag_stoi, proc_stoi, drug_stoi, y_stoi)
-
-    # Vectorize data
-    Xtr, Ytr = prepare_XY(train_pairs, vocabs, use_current_step=use_current_step)
-    Xva, Yva = prepare_XY(val_pairs, vocabs, use_current_step=use_current_step)
-
-    # Create DataLoaders
-    train_dataset = TensorDataset(Xtr, Ytr)
-    val_dataset = TensorDataset(Xva, Yva)
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-
-    # Create model and optimizer
-    model = create_model(model_type, Xtr.size(1), hidden=hidden, out_dim=Ytr.size(1), **model_kwargs)
-    model = model.to(device)  # Move model to device
-    
-    pw = bce_pos_weight(Ytr).to(device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pw)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
-
-    # Training loop with early stopping
-    best_metric = -float('inf')
-    patience_counter = 0
-    best_model_state = None
-    
-    for ep in range(1, epochs+1):
-        model.train()
-        epoch_loss = 0.0
-        num_batches = 0
-        
-        # Training phase
-        for batch_X, batch_Y in train_loader:
-            batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
-            logits = model(batch_X)
-            loss = criterion(logits, batch_Y)
-            
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            
-            epoch_loss += loss.item()
-            num_batches += 1
-
-        avg_loss = epoch_loss / num_batches
-
-        # Validation phase
-        if ep % 10 == 0:  # Check every 10 epochs to reduce overhead
-            val_metrics = evaluate_batched(model, val_loader, ks=(10, 20, 30), device=device)
-            current_metric = val_metrics[monitor_metric]
-            
-            # Early stopping logic
-            if early_stopping:
-                if current_metric > best_metric + min_delta:
-                    best_metric = current_metric
-                    patience_counter = 0
-                    best_model_state = model.state_dict().copy()
-                else:
-                    patience_counter += 1
-                
-                if patience_counter >= patience:
-                    model.load_state_dict(best_model_state)
-                    break
-
-    # Final evaluation on validation set
-    test_metrics = evaluate_batched(model, val_loader, ks=(10, 20, 30), device=device)
-    
-    return model, vocabs, y_itos, test_metrics
-
-
-def aggregate_fold_results(fold_metrics):
-    """
-    Aggregate results across folds for a single seed
-    
-    Args:
-        fold_metrics: List of metric dictionaries from each fold
-    
-    Returns:
-        Dictionary with mean, std, min, max for each metric
-    """
-    aggregated = {}
-    
-    # Get all metric names
-    metric_names = fold_metrics[0].keys()
-    
-    for metric in metric_names:
-        values = [fold[metric] for fold in fold_metrics if metric in fold]
-        if values:
-            aggregated[metric] = {
-                'mean': np.mean(values),
-                'std': np.std(values),
-                'min': np.min(values),
-                'max': np.max(values)
-            }
-    
-    return aggregated
-
-
-def aggregate_seed_results(seed_results):
-    """
-    Aggregate results across all seeds
-    
-    Args:
-        seed_results: List of aggregated results from each seed
-    
-    Returns:
-        Dictionary with final statistics across all seeds
-    """
-    final_results = {}
-    
-    # Get all metric names
-    metric_names = seed_results[0].keys()
-    
-    for metric in metric_names:
-        means = [seed[metric]['mean'] for seed in seed_results if metric in seed]
-        stds = [seed[metric]['std'] for seed in seed_results if metric in seed]
-        mins = [seed[metric]['min'] for seed in seed_results if metric in seed]
-        maxs = [seed[metric]['max'] for seed in seed_results if metric in seed]
-        
-        if means:
-            final_results[metric] = {
-                'mean': np.mean(means),
-                'std': np.std(means),
-                'min': np.min(mins),
-                'max': np.max(maxs)
-            }
-    
-    return final_results
 
 
 def train_model_on_samples(samples,
@@ -299,6 +37,10 @@ def train_model_on_samples(samples,
                            min_delta=0.001,      # Minimum change to qualify as improvement
                            monitor_metric='Acc@10', # Metric to monitor for early stopping
                            use_gpu=True, force_cpu=False,  # GPU control
+                           hyperbolic_embeddings_file=None,  # Path to hyperbolic embeddings file
+                           max_seq_length=None,   # Maximum sequence length for transformer
+                           use_riemannian_embeddings=False,  # Use Riemannian optimization for embeddings
+                           riemannian_optimizer='riemannian_sgd',  # Type of Riemannian optimizer
                            **model_kwargs):
     """
     Train model for diagnosis prediction
@@ -319,6 +61,10 @@ def train_model_on_samples(samples,
         patience: Number of epochs to wait before stopping (default: 10)
         min_delta: Minimum change to qualify as improvement (default: 0.001)
         monitor_metric: Metric to monitor for early stopping (default: 'Acc@10')
+        hyperbolic_embeddings_file: Path to hyperbolic embeddings file (optional)
+        max_seq_length: Maximum sequence length for transformer (optional)
+        use_riemannian_embeddings: Use Riemannian optimization for embeddings (default: False)
+        riemannian_optimizer: Type of Riemannian optimizer (default: 'riemannian_sgd')
         **model_kwargs: Model-specific parameters (e.g., num_heads, num_layers, etc.)
     
     Returns:
@@ -327,18 +73,23 @@ def train_model_on_samples(samples,
         y_itos: Label index to string mapping
         test_metrics: Test set evaluation metrics
     """
+    # Load hyperbolic embeddings if provided
+    conditions_embedder = None
+    if hyperbolic_embeddings_file is not None:
+        conditions_embedder = load_hyperbolic_embeddings(hyperbolic_embeddings_file)
+        print(f"Using hyperbolic embeddings with dimension: {conditions_embedder.get_embedding_dim()}")
+    else:
+        print("Using multi-hot encoding for conditions")
+
     # 1) Sort and assemble (current/next)
-    print(f"\nSamples: {samples[0]}")
     # Each sample is a patient's visit record
     # Except for adm_time and cond_hist, other fields are specific to this visit (these two fields contain the patient's past records)
     # In each visit, cond_hist contains the patient's past condition original codes, but the conditions field is CCS-mapped codes
     # TODO: redundant
     by_pid = sort_samples_within_patient(samples)   # defaultdict(list), {"patient_id": [sample1, sample2, ...]}
-    print(f"\nBy pid: {by_pid['10001401']}")
-    # build_pairs has issues... We should use all past visit records of the patient to predict the next diagnosis, not the previous visit
-    # Never mind, the cond_hist field contains all previous visits
+    # print(f"\nBy pid: {by_pid['10001401']}")
     pairs = build_pairs(by_pid, task=task)   # (sample_t, label_t+1)
-    print(f"\nPairs: {pairs[10]}")
+    # print(f"\nPairs: {pairs[10]}")
 
     # 2) Patient-level split
     train_pairs, val_pairs, test_pairs = split_by_patient(pairs, seed=seed)
@@ -358,17 +109,17 @@ def train_model_on_samples(samples,
     vocabs = (diag_stoi, proc_stoi, drug_stoi, y_stoi)
 
     # 4) Vectorization
-    Xtr, Ytr = prepare_XY(train_pairs, vocabs, use_current_step=use_current_step)   # X = torch.cat([x_diag, x_proc, x_drug], dim=0)
+    Xtr, Ytr = prepare_XY(train_pairs, vocabs, use_current_step=use_current_step, 
+                          conditions_embedder=conditions_embedder, max_seq_length=max_seq_length)   # X = torch.cat([x_diag, x_proc, x_drug], dim=0)
     print(f"\nTrain data shape: {Xtr.shape}")   # 100% [34972, 19733]
-    print(f"\nTrain data: {Xtr[10]}")
     print(f"\nTrain label shape: {Ytr.shape}")   # 100% [34972, 274]
-    print(f"\nTrain label: {Ytr[10]}")
-    Xva, Yva = prepare_XY(val_pairs,   vocabs, use_current_step=use_current_step)
-    Xte, Yte = prepare_XY(test_pairs,   vocabs, use_current_step=use_current_step)
+    Xva, Yva = prepare_XY(val_pairs,   vocabs, use_current_step=use_current_step, 
+                          conditions_embedder=conditions_embedder, max_seq_length=max_seq_length)
+    Xte, Yte = prepare_XY(test_pairs,   vocabs, use_current_step=use_current_step, 
+                          conditions_embedder=conditions_embedder, max_seq_length=max_seq_length)
 
     # 5) Create DataLoaders for batch training
     train_dataset = TensorDataset(Xtr, Ytr)
-    print(f"\nTrain dataset: {train_dataset[0]}")
     val_dataset = TensorDataset(Xva, Yva)
     test_dataset = TensorDataset(Xte, Yte)
     
@@ -391,12 +142,35 @@ def train_model_on_samples(samples,
         device = torch.device('cpu')
         print(f"Using device: {device} (GPU not available or disabled)")
     
-    model = create_model(model_type, Xtr.size(1), hidden=hidden, out_dim=Ytr.size(1), **model_kwargs)
-    model = model.to(device)  # Move model to device
+    # Create model
+    if conditions_embedder is not None and model_type == 'transformer':
+        # Use SequentialTransformerModel for hyperbolic embeddings
+        model = create_model(
+            model_type='sequential_transformer',
+            in_dim=Xtr.shape[2],  # embedding_dim
+            hidden=hidden,
+            out_dim=Ytr.shape[1],
+            **model_kwargs
+        ).to(device)
+        print(f"Created SequentialTransformerModel with input dim: {Xtr.shape[2]}")
+    else:
+        # Use regular model for other cases
+        model = create_model(
+            model_type=model_type,
+            in_dim=Xtr.shape[1],
+            hidden=hidden,
+            out_dim=Ytr.shape[1],
+            **model_kwargs
+        ).to(device)
+        print(f"Created {model_type} model with input dim: {Xtr.shape[1]}")
     
     pw = bce_pos_weight(Ytr).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pw)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+
+    # For SequentialTransformerModel, we'll skip attention masks for now
+    # since all sequences are padded to the same length and we don't have padding detection
+    use_attention_masks = False  # Disable attention masks for now
 
     # 7) Training loop with batches and early stopping
     best_metric = -float('inf')
@@ -411,7 +185,16 @@ def train_model_on_samples(samples,
         # Training phase
         for batch_X, batch_Y in train_loader:
             batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
-            logits = model(batch_X)
+            
+            # Handle attention mask for SequentialTransformerModel
+            if use_attention_masks:
+                # Create attention mask for this batch (1 for real tokens, 0 for padding)
+                # For now, assume all tokens are real (no padding detection)
+                batch_attention_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
+                logits = model(batch_X, attention_mask=batch_attention_mask)
+            else:
+                logits = model(batch_X)
+            
             loss = criterion(logits, batch_Y)
             
             opt.zero_grad()
@@ -425,7 +208,7 @@ def train_model_on_samples(samples,
 
         # Validation phase
         if ep % 1 == 0:
-            val_metrics = evaluate_batched(model, val_loader, ks=(10, 20, 30), device=device)
+            val_metrics = evaluate_batched(model, val_loader, ks=(10, 20, 30), device=device, use_attention_masks=use_attention_masks)
             current_metric = val_metrics[monitor_metric]
             
             print(f"Epoch {ep:02d} | avg_loss={avg_loss:.4f} | "
@@ -452,7 +235,7 @@ def train_model_on_samples(samples,
                     break
 
     # 8) Test set evaluation (consistent with paper: Visit-level P@k, Code-level Acc@k)
-    test_metrics = evaluate_batched(model, test_loader, ks=(10, 20, 30), device=device)
+    test_metrics = evaluate_batched(model, test_loader, ks=(10, 20, 30), device=device, use_attention_masks=use_attention_masks)
     print("[TEST]", test_metrics)
     
     return model, vocabs, y_itos, test_metrics
@@ -463,7 +246,7 @@ def train_mlp_on_samples(samples, **kwargs):
     return train_model_on_samples(samples, model_type="mlp", **kwargs)
 
 
-def evaluate_batched(model, data_loader, ks=(10, 20, 30), device=None):
+def evaluate_batched(model, data_loader, ks=(10, 20, 30), device=None, use_attention_masks=False):
     """
     Evaluate model using batched data loader
     Compatible with the original evaluate function but works with DataLoader
@@ -473,6 +256,7 @@ def evaluate_batched(model, data_loader, ks=(10, 20, 30), device=None):
         data_loader: DataLoader containing (X, Y) batches
         ks: List of k values for evaluation metrics
         device: Device to use for evaluation (if None, uses model's device)
+        use_attention_masks: Whether to use attention masks for SequentialTransformerModel
     
     Returns:
         Dictionary containing evaluation metrics
@@ -492,7 +276,16 @@ def evaluate_batched(model, data_loader, ks=(10, 20, 30), device=None):
     with torch.no_grad():
         for batch_X, batch_Y in data_loader:
             batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
-            logits = model(batch_X)
+            
+            # Handle attention mask for SequentialTransformerModel
+            if use_attention_masks:
+                # Create attention mask for this batch (1 for real tokens, 0 for padding)
+                # For now, assume all tokens are real (no padding detection)
+                batch_attention_mask = torch.ones(batch_X.size(0), batch_X.size(1)).to(device)
+                logits = model(batch_X, attention_mask=batch_attention_mask)
+            else:
+                logits = model(batch_X)
+            
             all_logits.append(logits.cpu())
             all_labels.append(batch_Y.cpu())
     

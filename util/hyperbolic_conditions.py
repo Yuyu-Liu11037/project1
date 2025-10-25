@@ -2,11 +2,14 @@
 Hyperbolic embedding module for conditions codes
 Integrates with the existing dialysis prediction pipeline
 """
+import pickle
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 import random
+import numpy as np
+from collections import defaultdict
 from typing import Dict, List, Tuple
 from collections import defaultdict
 from tqdm import tqdm
@@ -35,20 +38,14 @@ def poincare_dist(u, v, eps=EPS):
 
 def extract_icd_parent_child_pair(code: str) -> List[Tuple[str, str]]:
     """
-    Extract parent-child pairs for an ICD-10-CM code.
+    Extract parent-child pairs for an ICD code without decimal points.
     
-    For codes with length > 3, the first three characters are considered the parent.
-    For codes with length >= 6, additional parent-child pairs are extracted:
-    (code[:n-1], code[:n]) for n >= 6 and n <= len(code)
-    
-    Examples:
-    - 'E11.65' -> [('E11', 'E11.6'), ('E11.6', 'E11.65')]
-    - 'N17.9' -> [('N17', 'N17.9')] 
-    - 'E11' -> [] (no parent)
-    - 'E11.654' -> [('E11', 'E11.6'), ('E11.6', 'E11.65'), ('E11.65', 'E11.654')]
+    For codes without decimal points (up to 7 digits):
+    - 'E1165' -> [('E11', 'E116'), ('E116', 'E1165')]
+    - 'N179' -> [('N17', 'N179')] 
     
     Args:
-        code: ICD code string (e.g., 'E11.65', 'N17.9')
+        code: ICD code string without decimal points (e.g., 'E1165', 'N179')
         
     Returns:
         List of (parent, child) tuples
@@ -58,17 +55,12 @@ def extract_icd_parent_child_pair(code: str) -> List[Tuple[str, str]]:
     
     pairs = []
     
-    # For codes with length >= 6, extract step-by-step parent-child pairs starting from n=4
-    if len(code) >= 6:
+    # Handle codes without decimal points
+    if len(code) >= 4:
         for n in range(4, len(code) + 1):
             parent = code[:n-1]
             child = code[:n]
             pairs.append((parent, child))
-    elif len(code) > 3:
-        # For codes with length 4-5, first 3 characters are the parent
-        parent = code[:3]
-        child = code
-        pairs.append((parent, child))
     
     return pairs
 
@@ -102,42 +94,15 @@ def build_parent_child_pairs_from_codes(codes: List[str]) -> List[Tuple[str, str
 # Hyperbolic embedding model
 # ---------------------------
 class PoincareEmbedding(nn.Module):
-    def __init__(self, num_nodes: int, dim: int = 16, init_scale=1e-3, 
-                 hierarchy_init: bool = False, code2id: Dict[str, int] = None):
+    def __init__(self, num_nodes: int, dim: int = 16, init_scale=1e-4):
         super().__init__()
         self.emb = nn.Embedding(num_nodes, dim)
         
-        if hierarchy_init and code2id is not None:
-            # Initialize with hierarchy-aware strategy
-            self._hierarchy_aware_init(code2id, init_scale)
-        else:
-            # Initialize all embeddings randomly
-            nn.init.uniform_(self.emb.weight, a=-init_scale, b=init_scale)
+        # Initialize all embeddings randomly with small scale (near origin)
+        nn.init.uniform_(self.emb.weight, a=-init_scale, b=init_scale)
         
         with torch.no_grad():
             self.emb.weight.copy_(mobius_proj(self.emb.weight))
-    
-    def _hierarchy_aware_init(self, code2id: Dict[str, int], init_scale: float):
-        """Initialize embeddings with hierarchy awareness: parents closer to origin"""
-        id2code = {i: c for c, i in code2id.items()}
-        
-        with torch.no_grad():
-            for node_id in range(len(code2id)):
-                code = id2code[node_id]
-                
-                # Determine hierarchy level based on code length
-                if len(code) <= 3:
-                    # Top-level codes (e.g., "E11") - closest to origin
-                    scale = init_scale * 0.1
-                elif len(code) <= 5:
-                    # Mid-level codes (e.g., "E11.6") - medium distance
-                    scale = init_scale * 0.5
-                else:
-                    # Leaf-level codes (e.g., "E11.65") - furthest from origin
-                    scale = init_scale * 1.0
-                
-                # Initialize with smaller scale for higher hierarchy levels
-                nn.init.uniform_(self.emb.weight[node_id], a=-scale, b=scale)
     
     def forward(self, idx):
         return mobius_proj(self.emb(idx))
@@ -275,7 +240,7 @@ def train_conditions_hyperbolic_embedding(
     Train hyperbolic embeddings for conditions codes using parent-child relationships
     
     Args:
-        conditions_codes: List of condition codes (e.g., ICD-10 codes)
+        conditions_codes: List of condition codes without decimal points (up to 7 digits, e.g., ICD-10 codes)
         dim: Embedding dimension
         neg_k: Number of negative samples per positive pair
         steps: Number of training steps
@@ -322,15 +287,18 @@ def train_conditions_hyperbolic_embedding(
     
     loader = torch.utils.data.DataLoader(ds, batch_size=batch_size)
     
-    # Create model with hierarchy-aware initialization
-    model = PoincareEmbedding(num_nodes, dim=dim, hierarchy_init=True, code2id=code2id).to(device)
+    # Create model with origin initialization
+    model = PoincareEmbedding(num_nodes, dim=dim).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-8)  # Better numerical stability
     
     # Training loop
     model.train()
     it = iter(loader)
     
-    for step in range(1, steps + 1):
+    # Create progress bar
+    pbar = tqdm(range(1, steps + 1), desc="Hyperbolic Training", unit="step")
+    
+    for step in pbar:
         try:
             # Parent-child dataset returns (parent, child, negs, weight)
             p_idx, c_idx, neg_idx, weights = next(it)
@@ -365,13 +333,19 @@ def train_conditions_hyperbolic_embedding(
             with torch.no_grad():
                 model.emb.weight.copy_(mobius_proj(model.emb.weight))
             
-            if step % 10 == 0:
-                print(f"Hyperbolic embedding step {step:6d}  recon_loss = {recon_loss.item():.4f}  hierarchy_loss = {hierarchy_loss.item():.4f}  total_loss = {total_loss.item():.4f}")
+            # Update progress bar with loss information
+            pbar.set_postfix({
+                'recon_loss': f'{recon_loss.item():.4f}',
+                'hierarchy_loss': f'{hierarchy_loss.item():.4f}',
+                'total_loss': f'{total_loss.item():.4f}'
+            })
                 
         except StopIteration:
             # Restart iterator if it runs out
             it = iter(loader)
             continue
+    
+    pbar.close()
     
     # Return code → embedding dict (torch tensor)
     with torch.no_grad():
@@ -440,9 +414,6 @@ class ConditionsHyperbolicEmbedder:
         Returns:
             Embedding tensor of shape [n, embedding_dim] where n is the number of conditions
         """
-        if not self.trained:
-            raise ValueError("Embeddings not trained yet. Call train_embeddings() first.")
-        
         embeddings = []
         for cond in conditions_list:
             if cond in self.code2embedding:
@@ -462,80 +433,55 @@ class ConditionsHyperbolicEmbedder:
         """Get the total embedding dimension for a single condition"""
         return self.embedding_dim
     
-    def initialize_hierarchical_embeddings(self, output_file: str = "hyperbolic_embeddings.pkl") -> Dict[str, torch.Tensor]:
+    def initialize_origin_embeddings(self, output_file: str = "hyperbolic_embeddings.pkl"):
         """
-        Initialize embeddings in Poincare ball according to hierarchical rules:
-        1. All codes on the same level (uniquely decided by code length) should be equally far from origin
-        2. Codes with shorter length (lower level) should be closer to origin
-        3. For every code on level n, the nearest code on level n-1 should be its parent code
-        4. The parent code for the lowest level code (length=3) is origin of Poincare ball
+        Initialize hyperbolic embeddings near the origin (uniform small scale)
         
         Args:
-            output_file: Path to save the initialized embeddings
-            
-        Returns:
-            Dictionary mapping condition codes to their initialized hyperbolic embeddings
+            output_file: Output file to save embeddings
         """
+        print(f"Initializing hyperbolic embeddings near origin...")
+        
+        # Build vocabulary - include original codes and all their parents/children
+        original_codes = sorted(list(set(self.conditions_codes)))
+        parent_child_pairs = build_parent_child_pairs_from_codes(original_codes)
+        
+        # Collect all unique codes including parents and children
+        all_codes = set(original_codes)  # Start with original codes
+        for parent, child in parent_child_pairs:
+            all_codes.add(parent)
+            all_codes.add(child)
+        
+        codes = sorted(list(all_codes))
+        code2id = {c: i for i, c in enumerate(codes)}
+        num_nodes = len(code2id)
+        
+        print(f"Original codes: {len(original_codes)}")
+        print(f"Total codes (including parents/children): {len(codes)}")
+        
+        # Create model with origin initialization (small scale near origin)
+        model = PoincareEmbedding(
+            num_nodes, 
+            dim=self.embedding_dim, 
+            init_scale=1e-4  # Very small scale to keep near origin
+        )
+        
+        # Extract embeddings
+        with torch.no_grad():
+            emb = mobius_proj(model.emb.weight.data).cpu()
+        
+        id2code = {i: c for c, i in code2id.items()}
+        self.code2embedding = {id2code[i]: emb[i] for i in range(num_nodes)}
+        self.trained = True
+        
+        # Save to file
         import pickle
-        import numpy as np
-        from collections import defaultdict
-        
-        print(f"Initializing hierarchical embeddings for {len(self.conditions_codes)} condition codes...")
-        
-        # Group codes by hierarchy level (code length)
-        codes_by_level = defaultdict(list)
-        for code in self.conditions_codes:
-            level = len(code)
-            codes_by_level[level].append(code)
-        
-        # Sort levels (shorter codes = higher hierarchy = closer to origin)
-        sorted_levels = sorted(codes_by_level.keys())
-        print(f"Found hierarchy levels: {sorted_levels}")
-        
-        # Initialize embeddings dictionary
-        code2embedding = {}
-        
-        # Define radius for each level (closer to origin for higher hierarchy)
-        # Level 3 (highest hierarchy) gets smallest radius, increasing for lower levels
-        level_radii = {}
-        max_level = max(sorted_levels) if sorted_levels else 3
-        min_level = min(sorted_levels) if sorted_levels else 3
-        
-        for level in sorted_levels:
-            # Normalize level to [0, 1] range, then scale to [0.1, 0.9] for Poincare ball
-            normalized_level = (level - min_level) / (max_level - min_level) if max_level > min_level else 0
-            radius = 0.1 + 0.8 * normalized_level  # Range from 0.1 to 0.9
-            level_radii[level] = radius
-        
-        print(f"Level radii: {level_radii}")
-        
-        # Initialize embeddings for each level
-        for level in sorted_levels:
-            codes_at_level = codes_by_level[level]
-            radius = level_radii[level]
-            
-            print(f"Initializing level {level} with {len(codes_at_level)} codes at radius {radius:.3f}")
-            
-            # Generate points on sphere at given radius
-            embeddings_at_level = self._generate_points_on_sphere(
-                len(codes_at_level), self.embedding_dim, radius
-            )
-            
-            # Assign embeddings to codes
-            for i, code in enumerate(codes_at_level):
-                code2embedding[code] = embeddings_at_level[i]
-        
-        # Apply parent-child proximity constraints
-        print("Applying parent-child proximity constraints...")
-        code2embedding = self._apply_parent_child_constraints(code2embedding, codes_by_level)
-        
-        # Save embeddings to file
-        print(f"Saving initialized embeddings to {output_file}")
         with open(output_file, 'wb') as f:
-            pickle.dump(code2embedding, f)
+            pickle.dump(self, f)
         
-        print(f"Successfully initialized and saved hierarchical embeddings!")
-        return code2embedding
+        print(f"Saved origin-initialized embeddings to: {output_file}")
+        return self.code2embedding
+
     
     def _generate_points_on_sphere(self, n_points: int, dim: int, radius: float) -> torch.Tensor:
         """

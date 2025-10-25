@@ -8,53 +8,10 @@ import numpy as np
 import warnings
 from pyhealth.datasets import MIMIC4Dataset
 
-from util.data_processing import diag_prediction_mimic4_fn, dialysis_prediction_mimic4_fn
-from training.training import train_model_on_samples, k_fold_cross_validation, train_dialysis_model_on_samples
+from util.data_processing import diag_prediction_mimic4_fn, dialysis_prediction_mimic4_fn, preprocess_conditions_codes, GEMMapper
+from training.training import train_model_on_samples, train_dialysis_model_on_samples
 
 warnings.filterwarnings('ignore')
-
-
-def save_cross_validation_results(final_results, fold_results, args):
-    """
-    Save cross validation results to files
-    
-    Args:
-        final_results: Aggregated results across all seeds
-        fold_results: Individual fold results
-        args: Command line arguments
-    """
-    import json
-    import pandas as pd
-    from datetime import datetime
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Save final aggregated results
-    results_summary = {
-        'model': args.model,
-        'task': args.task,
-        'k_folds': args.k_folds,
-        'seeds': args.seed_range,
-        'timestamp': timestamp,
-        'final_results': final_results
-    }
-    
-    with open(f'cv_results_{args.model}_{timestamp}.json', 'w') as f:
-        json.dump(results_summary, f, indent=2)
-    
-    # Save detailed fold results as CSV
-    fold_data = []
-    for i, fold_result in enumerate(fold_results):
-        row = {'fold': i + 1}
-        row.update(fold_result)
-        fold_data.append(row)
-    
-    df = pd.DataFrame(fold_data)
-    df.to_csv(f'cv_fold_results_{args.model}_{timestamp}.csv', index=False)
-    
-    print(f"\nResults saved to:")
-    print(f"  - cv_results_{args.model}_{timestamp}.json")
-    print(f"  - cv_fold_results_{args.model}_{timestamp}.csv")
 
 
 def parse_args():
@@ -67,7 +24,7 @@ def parse_args():
                        help='Model type: mlp or transformer (default: mlp)')
     
     # Task selection
-    parser.add_argument('--task_type', type=str, default='dialysis',
+    parser.add_argument('--task_type', type=str, default='diagnosis',
                        choices=['diagnosis', 'dialysis'],
                        help='Task type: diagnosis prediction or dialysis prediction (default: diagnosis)')
     
@@ -96,15 +53,6 @@ def parse_args():
     parser.add_argument('--force_cpu', action='store_true',
                        help='Force CPU usage even if GPU is available (default: False)')
     
-    # Cross validation parameters
-    parser.add_argument('--k_folds', type=int, default=5,
-                       help='Number of folds for k-fold cross validation (default: 5)')
-    parser.add_argument('--num_seeds', type=int, default=3,
-                       help='Number of different random seeds to use (default: 3)')
-    parser.add_argument('--seed_range', type=str, default='42,123,456',
-                       help='Comma-separated list of random seeds to use (default: 42,123,456)')
-    parser.add_argument('--use_cross_validation', action='store_true',
-                       help='Enable k-fold cross validation with multiple seeds (default: False)')
     
     # Early stopping parameters
     parser.add_argument('--early_stopping', action='store_true', default=True,
@@ -116,6 +64,17 @@ def parse_args():
     parser.add_argument('--monitor_metric', type=str, default='Acc@10',
                        choices=['P@10', 'Acc@10', 'P@20', 'Acc@20', 'P@30', 'Acc@30'],
                        help='Metric to monitor for early stopping (default: Acc@10)')
+    
+    # Hyperbolic embeddings parameters
+    parser.add_argument('--hyperbolic_embeddings_file', type=str, default="hyperbolic_embeddings.pkl",
+                       help='Path to hyperbolic embeddings file (optional)')
+    parser.add_argument('--max_seq_length', type=int, default=None,
+                       help='Maximum sequence length for transformer (optional)')
+    parser.add_argument('--use_riemannian_embeddings', action='store_true',
+                       help='Use Riemannian optimization for hyperbolic embeddings (default: False)')
+    parser.add_argument('--riemannian_optimizer', type=str, default='riemannian_sgd',
+                       choices=['riemannian_sgd', 'riemannian_adam'],
+                       help='Type of Riemannian optimizer for embeddings (default: riemannian_sgd)')
     
     # Transformer specific parameters
     parser.add_argument('--num_heads', type=int, default=8,
@@ -129,6 +88,12 @@ def parse_args():
     parser.add_argument('--data_path', type=str, 
                        default="/data/yuyu/data/MIMIC_IV/hosp",
                        help='MIMIC-IV data path')
+    
+    # GEM mapping parameters
+    parser.add_argument('--gem_file', type=str, default=None,
+                       help='Path to GEM mapping file for ICD-9-CM to ICD-10-CM conversion (optional)')
+    parser.add_argument('--disable_gem_mapping', action='store_true',
+                       help='Disable ICD-9-CM to ICD-10-CM mapping (default: False)')
     
     return parser.parse_args()
 
@@ -162,12 +127,7 @@ if __name__ == "__main__":
     if args.model == 'transformer':
         print(f"Transformer parameters - attention heads: {args.num_heads}, layers: {args.num_layers}")
     
-    # Cross validation settings
-    if args.use_cross_validation:
-        print(f"Cross validation: {args.k_folds}-fold with {args.num_seeds} seeds")
-        print(f"Seeds: {args.seed_range}")
-    else:
-        print(f"Single training run with seed: {args.seed}")
+    print(f"Single training run with seed: {args.seed}")
     
     print(f"\nLoading MIMIC-IV dataset for {args.task_type} prediction...")
     mimic4_base = MIMIC4Dataset(
@@ -195,15 +155,29 @@ if __name__ == "__main__":
             'num_layers': args.num_layers,
         })
     
-    if args.use_cross_validation:
-        # Parse seed range
-        seeds = [int(s.strip()) for s in args.seed_range.split(',')]
-        
-        print(f"\nStarting {args.k_folds}-fold cross validation with {len(seeds)} seeds...")
-        final_results, fold_results = k_fold_cross_validation(
+    print(f"\nPreprocessing conditions codes...")
+    
+    # Initialize GEM mapper if not disabled
+    gem_mapper = None
+    if not args.disable_gem_mapping:
+        gem_mapper = GEMMapper(gem_file_path=args.gem_file)
+        stats = gem_mapper.get_mapping_stats()
+        print(f"GEM mapping statistics:")
+        print(f"  Total ICD-9-CM codes: {stats['total_icd9_codes']}")
+        print(f"  Single mappings: {stats['single_mappings']}")
+        print(f"  Multiple mappings: {stats['multiple_mappings']}")
+        print(f"  Average ICD-10-CM codes per ICD-9-CM: {stats['avg_icd10_per_icd9']:.2f}")
+    else:
+        print("GEM mapping disabled.")
+    
+    mimic4_prediction.samples = preprocess_conditions_codes(mimic4_prediction.samples, gem_mapper=gem_mapper)
+    print(f"Preprocessing completed. Processed {len(mimic4_prediction.samples)} samples.")
+    
+    print(f"\nStarting single training run for {args.model} model...")
+    
+    if args.task_type == 'diagnosis':
+        model, vocabs, y_itos, test_metrics = train_model_on_samples(
             mimic4_prediction.samples,
-            k_folds=args.k_folds,
-            seeds=seeds,
             model_type=args.model,
             task=args.task,
             use_current_step=args.use_current_step,
@@ -211,6 +185,7 @@ if __name__ == "__main__":
             lr=args.lr,
             wd=args.wd,
             epochs=args.epochs,
+            seed=args.seed,
             train_percentage=args.train_percentage,
             batch_size=args.batch_size,
             early_stopping=args.early_stopping,
@@ -219,62 +194,34 @@ if __name__ == "__main__":
             monitor_metric=args.monitor_metric,
             use_gpu=args.use_gpu,
             force_cpu=args.force_cpu,
+            hyperbolic_embeddings_file=args.hyperbolic_embeddings_file,
+            max_seq_length=args.max_seq_length,
+            use_riemannian_embeddings=args.use_riemannian_embeddings,
+            riemannian_optimizer=args.riemannian_optimizer,
             **model_kwargs
         )
-        
-        print(f"\n[DONE] Cross validation results for {args.model.upper()} model:")
-        for metric, stats in final_results.items():
-            print(f"  {metric}: {stats['mean']:.4f} ± {stats['std']:.4f}")
-        
-        # Save detailed results
-        save_cross_validation_results(final_results, fold_results, args)
-        
+    elif args.task_type == 'dialysis':
+        model, vocabs, test_metrics = train_dialysis_model_on_samples(
+            mimic4_prediction.samples,
+            model_type=args.model,
+            hidden=args.hidden,
+            lr=args.lr,
+            wd=args.wd,
+            epochs=args.epochs,
+            seed=args.seed,
+            train_percentage=args.train_percentage,
+            batch_size=args.batch_size,
+            early_stopping=args.early_stopping,
+            patience=args.patience,
+            min_delta=args.min_delta,
+            monitor_metric='accuracy',  # Use accuracy for dialysis prediction
+            use_gpu=args.use_gpu,
+            force_cpu=args.force_cpu,
+            **model_kwargs
+        )
     else:
-        print(f"\nStarting single training run for {args.model} model...")
-        
-        if args.task_type == 'diagnosis':
-            model, vocabs, y_itos, test_metrics = train_model_on_samples(
-                mimic4_prediction.samples,
-                model_type=args.model,
-                task=args.task,
-                use_current_step=args.use_current_step,
-                hidden=args.hidden,
-                lr=args.lr,
-                wd=args.wd,
-                epochs=args.epochs,
-                seed=args.seed,
-                train_percentage=args.train_percentage,
-                batch_size=args.batch_size,
-                early_stopping=args.early_stopping,
-                patience=args.patience,
-                min_delta=args.min_delta,
-                monitor_metric=args.monitor_metric,
-                use_gpu=args.use_gpu,
-                force_cpu=args.force_cpu,
-                **model_kwargs
-            )
-        elif args.task_type == 'dialysis':
-            model, vocabs, test_metrics = train_dialysis_model_on_samples(
-                mimic4_prediction.samples,
-                model_type=args.model,
-                hidden=args.hidden,
-                lr=args.lr,
-                wd=args.wd,
-                epochs=args.epochs,
-                seed=args.seed,
-                train_percentage=args.train_percentage,
-                batch_size=args.batch_size,
-                early_stopping=args.early_stopping,
-                patience=args.patience,
-                min_delta=args.min_delta,
-                monitor_metric='accuracy',  # Use accuracy for dialysis prediction
-                use_gpu=args.use_gpu,
-                force_cpu=args.force_cpu,
-                **model_kwargs
-            )
-        else:
-            raise ValueError(f"Unknown task_type: {args.task_type}")
-        
-        print(f"\n[DONE] {args.model.upper()} model test results:")
-        for metric, value in test_metrics.items():
-            print(f"  {metric}: {value:.4f}")
+        raise ValueError(f"Unknown task_type: {args.task_type}")
+    
+    print(f"\n[DONE] {args.model.upper()} model test results:")
+    for metric, value in test_metrics.items():
+        print(f"  {metric}: {value:.4f}")

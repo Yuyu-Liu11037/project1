@@ -20,53 +20,12 @@ from util.data_processing_trinetx import (
     build_dialysis_vocab_from_pairs,
     prepare_dialysis_XY
 )
-from training.training_trinetx import train_diagnosis_model_on_samples, k_fold_cross_validation, train_dialysis_model_on_samples
+from training.training_trinetx import train_diagnosis_model_on_samples, train_dialysis_model_on_samples
 from train_hyperbolic_embeddings import load_embeddings
 
 warnings.filterwarnings('ignore')
 
 
-def save_cross_validation_results(final_results, fold_results, args):
-    """
-    Save cross validation results to files
-    
-    Args:
-        final_results: Aggregated results across all seeds
-        fold_results: Individual fold results
-        args: Command line arguments
-    """
-    import json
-    import pandas as pd
-    from datetime import datetime
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Save final aggregated results
-    results_summary = {
-        'model': args.model,
-        'task': args.task,
-        'k_folds': args.k_folds,
-        'seeds': args.seed_range,
-        'timestamp': timestamp,
-        'final_results': final_results
-    }
-    
-    with open(f'cv_results_{args.model}_{timestamp}.json', 'w') as f:
-        json.dump(results_summary, f, indent=2)
-    
-    # Save detailed fold results as CSV
-    fold_data = []
-    for i, fold_result in enumerate(fold_results):
-        row = {'fold': i + 1}
-        row.update(fold_result)
-        fold_data.append(row)
-    
-    df = pd.DataFrame(fold_data)
-    df.to_csv(f'cv_fold_results_{args.model}_{timestamp}.csv', index=False)
-    
-    print(f"\nResults saved to:")
-    print(f"  - cv_results_{args.model}_{timestamp}.json")
-    print(f"  - cv_fold_results_{args.model}_{timestamp}.csv")
 
 
 def parse_args():
@@ -108,15 +67,6 @@ def parse_args():
     parser.add_argument('--force_cpu', action='store_true',
                        help='Force CPU usage even if GPU is available (default: False)')
     
-    # Cross validation parameters
-    parser.add_argument('--k_folds', type=int, default=3,
-                       help='Number of folds for k-fold cross validation (default: 3)')
-    parser.add_argument('--num_seeds', type=int, default=1,
-                       help='Number of different random seeds to use (default: 1)')
-    parser.add_argument('--seed_range', type=str, default='42,123,456',
-                       help='Comma-separated list of random seeds to use (default: 42,123,456)')
-    parser.add_argument('--use_cross_validation', action='store_true',
-                       help='Enable k-fold cross validation with multiple seeds (default: False)')
     
     # Early stopping parameters
     parser.add_argument('--early_stopping', action='store_true', default=True,
@@ -182,12 +132,7 @@ if __name__ == "__main__":
     if args.model == 'transformer':
         print(f"Transformer parameters - attention heads: {args.num_heads}, layers: {args.num_layers}")
     
-    # Cross validation settings
-    if args.use_cross_validation:
-        print(f"Cross validation: {args.k_folds}-fold with {args.num_seeds} seeds")
-        print(f"Seeds: {args.seed_range}")
-    else:
-        print(f"Single training run with seed: {args.seed}")
+    print(f"Single training run with seed: {args.seed}")
     
     print(f"\nLoading TriNetX dataset for {args.task_type} prediction...")
     
@@ -230,15 +175,11 @@ if __name__ == "__main__":
             'num_layers': args.num_layers,
         })
     
-    if args.use_cross_validation:
-        # Parse seed range
-        seeds = [int(s.strip()) for s in args.seed_range.split(',')]
-        
-        print(f"\nStarting {args.k_folds}-fold cross validation with {len(seeds)} seeds...")
-        final_results, fold_results = k_fold_cross_validation(
+    print(f"\nStarting single training run for {args.model} model...")
+    
+    if args.task_type == 'diagnosis':
+        model, vocabs, y_itos, test_metrics = train_diagnosis_model_on_samples(
             samples,
-            k_folds=args.k_folds,
-            seeds=seeds,
             model_type=args.model,
             task=args.task,
             use_current_step=args.use_current_step,
@@ -246,6 +187,7 @@ if __name__ == "__main__":
             lr=args.lr,
             wd=args.wd,
             epochs=args.epochs,
+            seed=args.seed,
             train_percentage=args.train_percentage,
             batch_size=args.batch_size,
             early_stopping=args.early_stopping,
@@ -256,62 +198,30 @@ if __name__ == "__main__":
             force_cpu=args.force_cpu,
             **model_kwargs
         )
-        
-        print(f"\n[DONE] Cross validation results for {args.model.upper()} model:")
-        for metric, stats in final_results.items():
-            print(f"  {metric}: {stats['mean']:.4f} ± {stats['std']:.4f}")
-        
-        # Save detailed results
-        save_cross_validation_results(final_results, fold_results, args)
-        
+    elif args.task_type == 'dialysis':
+        model, vocabs, test_metrics = train_dialysis_model_on_samples(
+            samples,
+            model_type=args.model,
+            hidden=args.hidden,
+            lr=args.lr,
+            wd=args.wd,
+            epochs=args.epochs,
+            seed=args.seed,
+            train_percentage=args.train_percentage,
+            batch_size=args.batch_size,
+            early_stopping=args.early_stopping,
+            patience=args.patience,
+            min_delta=args.min_delta,
+            monitor_metric=actual_monitor,
+            use_gpu=args.use_gpu,
+            force_cpu=args.force_cpu,
+            conditions_embedder=conditions_embedder,
+            max_seq_length=args.max_seq_length,
+            **model_kwargs
+        )
     else:
-        print(f"\nStarting single training run for {args.model} model...")
-        
-        if args.task_type == 'diagnosis':
-            model, vocabs, y_itos, test_metrics = train_diagnosis_model_on_samples(
-                samples,
-                model_type=args.model,
-                task=args.task,
-                use_current_step=args.use_current_step,
-                hidden=args.hidden,
-                lr=args.lr,
-                wd=args.wd,
-                epochs=args.epochs,
-                seed=args.seed,
-                train_percentage=args.train_percentage,
-                batch_size=args.batch_size,
-                early_stopping=args.early_stopping,
-                patience=args.patience,
-                min_delta=args.min_delta,
-                monitor_metric=args.monitor_metric,
-                use_gpu=args.use_gpu,
-                force_cpu=args.force_cpu,
-                **model_kwargs
-            )
-        elif args.task_type == 'dialysis':
-            model, vocabs, test_metrics = train_dialysis_model_on_samples(
-                samples,
-                model_type=args.model,
-                hidden=args.hidden,
-                lr=args.lr,
-                wd=args.wd,
-                epochs=args.epochs,
-                seed=args.seed,
-                train_percentage=args.train_percentage,
-                batch_size=args.batch_size,
-                early_stopping=args.early_stopping,
-                patience=args.patience,
-                min_delta=args.min_delta,
-                monitor_metric=actual_monitor,
-                use_gpu=args.use_gpu,
-                force_cpu=args.force_cpu,
-                conditions_embedder=conditions_embedder,
-                max_seq_length=args.max_seq_length,
-                **model_kwargs
-            )
-        else:
-            raise ValueError(f"Unknown task_type: {args.task_type}")
-        
-        print(f"\n[DONE] {args.model.upper()} model test results:")
-        for metric, value in test_metrics.items():
-            print(f"  {metric}: {value:.4f}")
+        raise ValueError(f"Unknown task_type: {args.task_type}")
+    
+    print(f"\n[DONE] {args.model.upper()} model test results:")
+    for metric, value in test_metrics.items():
+        print(f"  {metric}: {value:.4f}")
