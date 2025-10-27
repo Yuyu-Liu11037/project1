@@ -199,3 +199,36 @@ def create_model(model_type, in_dim, hidden, out_dim, **kwargs):
     else:
         raise ValueError(f"Unsupported model type: {model_type}. Supported types: 'mlp', 'transformer', 'sequential_transformer'")
 
+
+def create_model_from_data(model_type, X_sample, hidden, out_dim, **kwargs):
+    """
+    Create model with automatic input dimension detection
+    
+    Args:
+        model_type: Type of model ('mlp', 'transformer', 'sequential_transformer')
+        X_sample: Sample input tensor to determine input dimensions
+        hidden: Hidden layer dimension
+        out_dim: Output dimension
+        **kwargs: Additional model parameters
+        
+    Returns:
+        Model instance
+    """
+    if len(X_sample.shape) == 3:
+        # Sequential input: (batch_size, seq_len, embedding_dim)
+        embedding_dim = X_sample.shape[2]
+        if model_type.lower() == 'transformer':
+            # Auto-convert transformer to sequential_transformer for 3D input
+            print(f"Auto-converting transformer to sequential_transformer for 3D input")
+            return SequentialTransformerModel(embedding_dim, hidden, out_dim, **kwargs)
+        elif model_type.lower() == 'sequential_transformer':
+            return SequentialTransformerModel(embedding_dim, hidden, out_dim, **kwargs)
+        else:
+            raise ValueError(f"Model type '{model_type}' not supported for 3D sequential input")
+    elif len(X_sample.shape) == 2:
+        # Flat input: (batch_size, feature_dim)
+        in_dim = X_sample.shape[1]
+        return create_model(model_type, in_dim, hidden, out_dim, **kwargs)
+    else:
+        raise ValueError(f"Unsupported input tensor shape: {X_sample.shape}")
+

@@ -5,12 +5,111 @@ Contains data preprocessing, vectorization, vocabulary building functions
 from collections import defaultdict, Counter
 import torch
 import numpy as np
+import pickle
 from sklearn.model_selection import train_test_split
 from pyhealth.data import Patient
 from pyhealth.medcode import CrossMap
+from util.hyperbolic_conditions import ConditionsHyperbolicEmbedder
 
 
 mapping = CrossMap("ICD10CM", "CCSCM")
+
+# Global cache for hyperbolic embeddings
+_hyperbolic_embeddings_cache = None
+_visit_sep_embedding = None
+
+
+def load_hyperbolic_embeddings(embedding_file="hyperbolic_embeddings.pkl"):
+    """
+    Load hyperbolic embeddings from file and cache globally
+    
+    Args:
+        embedding_file: Path to the hyperbolic embeddings pickle file
+        
+    Returns:
+        ConditionsHyperbolicEmbedder instance
+    """
+    global _hyperbolic_embeddings_cache, _visit_sep_embedding
+    
+    if _hyperbolic_embeddings_cache is None:
+        print(f"Loading hyperbolic embeddings from: {embedding_file}")
+        with open(embedding_file, 'rb') as f:
+            _hyperbolic_embeddings_cache = pickle.load(f)
+        
+        # Create visit separator embedding (same dimension as condition embeddings)
+        embedding_dim = _hyperbolic_embeddings_cache.get_embedding_dim()
+        # Initialize with small random values (similar to hyperbolic embedding init)
+        _visit_sep_embedding = torch.randn(embedding_dim) * 0.01
+        
+        print(f"Loaded hyperbolic embeddings with dimension: {embedding_dim}")
+        print(f"Number of condition codes: {len(_hyperbolic_embeddings_cache.conditions_codes)}")
+    
+    return _hyperbolic_embeddings_cache
+
+
+def create_embedding_sequence_with_visit_markers(cond_hist, embeddings_cache, max_seq_length=200):
+    """
+    Create embedding sequence from condition history with visit boundary markers
+    
+    Args:
+        cond_hist: List of lists, each inner list contains codes for one visit
+                  Last visit is empty to prevent leakage
+        embeddings_cache: ConditionsHyperbolicEmbedder instance
+        max_seq_length: Maximum sequence length (for padding)
+        
+    Returns:
+        Tuple of (sequence_tensor, attention_mask)
+        - sequence_tensor: (seq_len, embedding_dim) padded tensor
+        - attention_mask: (seq_len,) tensor with 1 for real tokens, 0 for padding
+    """
+    global _visit_sep_embedding
+    
+    if _visit_sep_embedding is None:
+        raise ValueError("Visit separator embedding not initialized. Call load_hyperbolic_embeddings() first.")
+    
+    embedding_dim = embeddings_cache.get_embedding_dim()
+    sequence_embeddings = []
+    
+    # Process each visit (except the last empty one)
+    for visit_idx, visit_codes in enumerate(cond_hist[:-1]):  # Skip last empty visit
+        # Add embeddings for each code in this visit
+        for code in visit_codes:
+            if code in embeddings_cache.code2embedding:
+                sequence_embeddings.append(embeddings_cache.code2embedding[code])
+            else:
+                # Use zero embedding for unknown codes
+                sequence_embeddings.append(torch.zeros(embedding_dim))
+        
+        # Add visit separator after each visit (except the last one)
+        if visit_idx < len(cond_hist) - 2:  # Don't add separator after last visit
+            sequence_embeddings.append(_visit_sep_embedding)
+    
+    if len(sequence_embeddings) == 0:
+        # Handle case where no conditions exist
+        sequence_embeddings = [torch.zeros(embedding_dim)]
+    
+    # Convert to tensor
+    sequence_tensor = torch.stack(sequence_embeddings)  # (seq_len, embedding_dim)
+    
+    # Create attention mask (1 for real tokens, 0 for padding)
+    seq_len = sequence_tensor.size(0)
+    attention_mask = torch.ones(seq_len, dtype=torch.long)
+    
+    # Pad sequence if needed
+    if seq_len < max_seq_length:
+        padding_length = max_seq_length - seq_len
+        padding = torch.zeros(padding_length, embedding_dim)
+        sequence_tensor = torch.cat([sequence_tensor, padding], dim=0)
+        
+        # Extend attention mask with zeros for padding
+        padding_mask = torch.zeros(padding_length, dtype=torch.long)
+        attention_mask = torch.cat([attention_mask, padding_mask], dim=0)
+    elif seq_len > max_seq_length:
+        # Truncate if too long
+        sequence_tensor = sequence_tensor[:max_seq_length]
+        attention_mask = attention_mask[:max_seq_length]
+    
+    return sequence_tensor, attention_mask
 
 
 def diag_prediction_mimic4_fn(patient: Patient):
@@ -136,38 +235,79 @@ def multihot_from_sequence(seq_of_lists, stoi):
     return x
 
 
-def vectorize_pair(s, y_codes, vocabs, use_current_step=False):
+def vectorize_pair(s, y_codes, vocabs, use_current_step=False, use_hyperbolic_embeddings=False, embedding_file="hyperbolic_embeddings.pkl", max_seq_length=200):
     """Vectorize sample pair"""
     diag_stoi, proc_stoi, drug_stoi, y_stoi = vocabs
     
-    # Admission prediction: don't look at current step's proc/drug; discharge prediction can look
-    if use_current_step:
-        proc_hist = s["procedures"]
-        drug_hist = s["drugs"]
+    if use_hyperbolic_embeddings:
+        # Load hyperbolic embeddings if not already cached
+        embeddings_cache = load_hyperbolic_embeddings(embedding_file)
+        
+        # Create embedding sequence with visit markers
+        X, attention_mask = create_embedding_sequence_with_visit_markers(
+            s["cond_hist"], embeddings_cache, max_seq_length
+        )
+        
+        # Return both sequence and attention mask
+        return X, attention_mask, y_codes
     else:
-        proc_hist = s["procedures"][:-1] if len(s["procedures"])>0 else []
-        drug_hist = s["drugs"][:-1] if len(s["drugs"])>0 else []
+        # Original multi-hot implementation
+        # Admission prediction: don't look at current step's proc/drug; discharge prediction can look
+        # if use_current_step:
+        #     proc_hist = s["procedures"]
+        #     drug_hist = s["drugs"]
+        # else:
+        #     proc_hist = s["procedures"][:-1] if len(s["procedures"])>0 else []
+        #     drug_hist = s["drugs"][:-1] if len(s["drugs"])>0 else []
 
-    x_diag = multihot_from_sequence(s["cond_hist"], diag_stoi)  # Historical ICD (current step is empty)
-    x_proc = multihot_from_sequence(proc_hist, proc_stoi)
-    x_drug = multihot_from_sequence(drug_hist, drug_stoi)
-    X = torch.cat([x_diag, x_proc, x_drug], dim=0)
+        x_diag = multihot_from_sequence(s["cond_hist"], diag_stoi)  # Historical ICD (current step is empty)
+        # x_proc = multihot_from_sequence(proc_hist, proc_stoi)
+        # x_drug = multihot_from_sequence(drug_hist, drug_stoi)
+        # X = torch.cat([x_diag, x_proc, x_drug], dim=0)
+        X = x_diag
 
-    y = torch.zeros(len(y_stoi), dtype=torch.float32)
-    for c in y_codes:
-        if c in y_stoi: 
-            y[y_stoi[c]] = 1.0
-    return X, y
+        y = torch.zeros(len(y_stoi), dtype=torch.float32)
+        for c in y_codes:
+            if c in y_stoi: 
+                y[y_stoi[c]] = 1.0
+        return X, y
 
 
-def prepare_XY(pairs, vocabs, use_current_step=False):
+def prepare_XY(pairs, vocabs, use_current_step=False, use_hyperbolic_embeddings=False, embedding_file="hyperbolic_embeddings.pkl", max_seq_length=200):
     """Prepare training data X and Y"""
-    Xs, Ys = [], []
-    for s, y_codes in pairs:
-        X, y = vectorize_pair(s, y_codes, vocabs, use_current_step=use_current_step)
-        Xs.append(X)
-        Ys.append(y)
-    return torch.stack(Xs), torch.stack(Ys)
+    if use_hyperbolic_embeddings:
+        # Sequential data preparation
+        Xs, masks, Ys = [], [], []
+        for s, y_codes in pairs:
+            X, attention_mask, y_codes_list = vectorize_pair(s, y_codes, vocabs, use_current_step=use_current_step, 
+                                                           use_hyperbolic_embeddings=True, embedding_file=embedding_file, 
+                                                           max_seq_length=max_seq_length)
+            Xs.append(X)
+            masks.append(attention_mask)
+            Ys.append(y_codes_list)
+        
+        # Convert to tensors
+        X_tensor = torch.stack(Xs)  # (batch_size, max_seq_length, embedding_dim)
+        mask_tensor = torch.stack(masks)  # (batch_size, max_seq_length)
+        
+        # Convert y_codes to multi-hot vectors
+        diag_stoi, proc_stoi, drug_stoi, y_stoi = vocabs
+        Y_tensor = torch.zeros(len(Ys), len(y_stoi), dtype=torch.float32)
+        for i, y_codes_list in enumerate(Ys):
+            for c in y_codes_list:
+                if c in y_stoi: 
+                    Y_tensor[i, y_stoi[c]] = 1.0
+        
+        return X_tensor, mask_tensor, Y_tensor
+    else:
+        # Original multi-hot implementation
+        Xs, Ys = [], []
+        for s, y_codes in pairs:
+            X, y = vectorize_pair(s, y_codes, vocabs, use_current_step=use_current_step, 
+                                use_hyperbolic_embeddings=False)
+            Xs.append(X)
+            Ys.append(y)
+        return torch.stack(Xs), torch.stack(Ys)
 
 
 def split_by_patient(pairs, test_size=0.2, val_size=0.1, seed=42):

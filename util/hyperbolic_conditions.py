@@ -34,41 +34,16 @@ def poincare_dist(u, v, eps=EPS):
     return torch.acosh(x)
 
 def extract_icd_parent_child_pair(code: str) -> List[Tuple[str, str]]:
-    """
-    Extract parent-child pairs for an ICD-10-CM code.
-    
-    For codes with length > 3, the first three characters are considered the parent.
-    For codes with length >= 6, additional parent-child pairs are extracted:
-    (code[:n-1], code[:n]) for n >= 6 and n <= len(code)
-    
-    Examples:
-    - 'E11.65' -> [('E11', 'E11.6'), ('E11.6', 'E11.65')]
-    - 'N17.9' -> [('N17', 'N17.9')] 
-    - 'E11' -> [] (no parent)
-    - 'E11.654' -> [('E11', 'E11.6'), ('E11.6', 'E11.65'), ('E11.65', 'E11.654')]
-    
-    Args:
-        code: ICD code string (e.g., 'E11.65', 'N17.9')
-        
-    Returns:
-        List of (parent, child) tuples
-    """
     if not code or len(code) <= 3:
         return []
     
     pairs = []
     
-    # For codes with length >= 6, extract step-by-step parent-child pairs starting from n=4
-    if len(code) >= 6:
+    if len(code) >= 4:
         for n in range(4, len(code) + 1):
             parent = code[:n-1]
             child = code[:n]
             pairs.append((parent, child))
-    elif len(code) > 3:
-        # For codes with length 4-5, first 3 characters are the parent
-        parent = code[:3]
-        child = code
-        pairs.append((parent, child))
     
     return pairs
 
@@ -103,13 +78,16 @@ def build_parent_child_pairs_from_codes(codes: List[str]) -> List[Tuple[str, str
 # ---------------------------
 class PoincareEmbedding(nn.Module):
     def __init__(self, num_nodes: int, dim: int = 16, init_scale=1e-3, 
-                 hierarchy_init: bool = False, code2id: Dict[str, int] = None):
+                 hierarchy_init: bool = False, origin_init: bool = False, code2id: Dict[str, int] = None):
         super().__init__()
         self.emb = nn.Embedding(num_nodes, dim)
         
         if hierarchy_init and code2id is not None:
             # Initialize with hierarchy-aware strategy
             self._hierarchy_aware_init(code2id, init_scale)
+        elif origin_init:
+            # Initialize all codes near origin
+            self._origin_init(init_scale)
         else:
             # Initialize all embeddings randomly
             nn.init.uniform_(self.emb.weight, a=-init_scale, b=init_scale)
@@ -138,6 +116,13 @@ class PoincareEmbedding(nn.Module):
                 
                 # Initialize with smaller scale for higher hierarchy levels
                 nn.init.uniform_(self.emb.weight[node_id], a=-scale, b=scale)
+    
+    def _origin_init(self, init_scale: float):
+        """Initialize all embeddings near the origin with small random values"""
+        with torch.no_grad():
+            # Use a smaller scale to keep all embeddings close to origin
+            origin_scale = init_scale * 0.1  # Much smaller than default
+            nn.init.uniform_(self.emb.weight, a=-origin_scale, b=origin_scale)
     
     def forward(self, idx):
         return mobius_proj(self.emb(idx))
@@ -269,6 +254,7 @@ def train_conditions_hyperbolic_embedding(
     batch_size: int = 256,
     lr: float = 1e-4,  # More conservative learning rate
     lambda_hierarchy: float = 0.5,  # Reduced hierarchy constraint weight
+    origin_init: bool = False,  # Initialize all codes near origin
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 ) -> Dict[str, torch.Tensor]:
     """
@@ -282,14 +268,13 @@ def train_conditions_hyperbolic_embedding(
         batch_size: Batch size for training
         lr: Learning rate
         lambda_hierarchy: Weight for hierarchy constraint loss
+        origin_init: If True, initialize all codes near origin instead of hierarchy-aware init
         device: Device to use for training
     
     Returns:
         Dictionary mapping condition codes to their hyperbolic embeddings
     """
-    import random
-    
-    # Build vocabulary - include original codes and all their parents/children
+   # Build vocabulary - include original codes and all their parents/children
     original_codes = sorted(list(set(conditions_codes)))
     
     # Get parent-child pairs to extract all related codes
@@ -311,7 +296,7 @@ def train_conditions_hyperbolic_embedding(
     
     if len(parent_child_pairs) == 0:
         print("Warning: No parent-child relationships found. Using random initialization.")
-        model = PoincareEmbedding(num_nodes, dim=dim, hierarchy_init=False).to(device)
+        model = PoincareEmbedding(num_nodes, dim=dim, hierarchy_init=False, origin_init=origin_init).to(device)
         with torch.no_grad():
             emb = mobius_proj(model.emb.weight.data).cpu()
         id2code = {i: c for c, i in code2id.items()}
@@ -322,8 +307,13 @@ def train_conditions_hyperbolic_embedding(
     
     loader = torch.utils.data.DataLoader(ds, batch_size=batch_size)
     
-    # Create model with hierarchy-aware initialization
-    model = PoincareEmbedding(num_nodes, dim=dim, hierarchy_init=True, code2id=code2id).to(device)
+    # Create model with specified initialization
+    if origin_init:
+        print("Using origin initialization: all codes initialized near origin")
+        model = PoincareEmbedding(num_nodes, dim=dim, origin_init=True).to(device)
+    else:
+        print("Using hierarchy-aware initialization")
+        model = PoincareEmbedding(num_nodes, dim=dim, hierarchy_init=True, code2id=code2id).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-8)  # Better numerical stability
     
     # Training loop
@@ -378,26 +368,30 @@ def train_conditions_hyperbolic_embedding(
         emb = mobius_proj(model.emb.weight.data).cpu()
     
     id2code = {i: c for c, i in code2id.items()}
-    return {id2code[i]: emb[i] for i in range(num_nodes)}
+    
+    # CRITICAL FIX: Use .clone() to avoid shared storage
+    # Without clone(), emb[i] creates a view that references the entire emb tensor
+    # This causes pickle to serialize the entire tensor for each dictionary entry (massive duplication!)
+    # Fixed: 772GB -> ~8MB by ensuring each embedding is independent
+    return {id2code[i]: emb[i].clone() for i in range(num_nodes)}
 
 # ---------------------------
 # Integration utilities
 # ---------------------------
 class ConditionsHyperbolicEmbedder:
-    """Wrapper class for using hyperbolic embeddings in the dialysis prediction pipeline"""
-    
     def __init__(self, conditions_codes: List[str], embedding_dim: int = 16):
         self.conditions_codes = conditions_codes
         self.embedding_dim = embedding_dim
         self.code2embedding = None
         self.trained = False
     
-    def train_embeddings(self, lambda_hierarchy: float = 1.0, **kwargs):
+    def train_embeddings(self, lambda_hierarchy: float = 1.0, origin_init: bool = False, **kwargs):
         """Train hyperbolic embeddings for conditions codes with hierarchy constraints"""
         self.code2embedding = train_conditions_hyperbolic_embedding(
             self.conditions_codes,
             dim=self.embedding_dim,
             lambda_hierarchy=lambda_hierarchy,
+            origin_init=origin_init,
             **kwargs
         )
         self.trained = True
