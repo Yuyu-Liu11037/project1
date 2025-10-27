@@ -6,8 +6,8 @@ import argparse
 import torch
 import pickle
 import json
-from typing import List
-from util.hyperbolic_conditions import ConditionsHyperbolicEmbedder
+from typing import List, Dict
+from util.hyperbolic_conditions import ConditionsHyperbolicEmbedder, get_icd_to_ccs_mapping
 
 
 def load_icd10_codes(icd10_file_path: str) -> List[str]:
@@ -35,7 +35,7 @@ def load_icd10_codes(icd10_file_path: str) -> List[str]:
 def train_and_save_embeddings(icd10_file_path: str, embedding_dim: int = 20, 
                              output_file: str = "hyperbolic_embeddings.pkl",
                              steps: int = 500, batch_size: int = 256, lr: float = 1e-4,
-                             lambda_hierarchy: float = 1.0, origin_init: bool = False):
+                             lambda_hierarchy: float = 1.0, lambda_cone: float = 1.0, origin_init: bool = False):
     print(f"Training hyperbolic embeddings for conditions codes...")
     
     # Load all ICD-10 condition codes from file
@@ -43,19 +43,38 @@ def train_and_save_embeddings(icd10_file_path: str, embedding_dim: int = 20,
     
     print(f"Loaded {len(all_conditions)} ICD-10 condition codes from file")
     
+    # Get CCS code mappings for all ICD codes
+    print("Mapping ICD codes to CCS codes...")
+    icd_to_ccs = get_icd_to_ccs_mapping(all_conditions)
+    
+    # Assign UNKNOWN_CCS to codes without mapping
+    mapped_count = len(icd_to_ccs)
+    unmapped_count = len(all_conditions) - mapped_count
+    for code in all_conditions:
+        if code not in icd_to_ccs:
+            icd_to_ccs[code] = "UNKNOWN_CCS"
+    
+    unique_ccs_codes = set(icd_to_ccs.values())
+    print(f"CCS mapping statistics:")
+    print(f"  - ICD codes with CCS mapping: {mapped_count}")
+    print(f"  - ICD codes without CCS mapping: {unmapped_count}")
+    print(f"  - Unique CCS codes: {len(unique_ccs_codes)}")
+    
     # Create and train hyperbolic embedder
     conditions_embedder = ConditionsHyperbolicEmbedder(
         all_conditions, 
-        embedding_dim=embedding_dim
+        embedding_dim=embedding_dim,
+        icd_to_ccs=icd_to_ccs
     )
     
     init_type = "origin" if origin_init else "hierarchy-aware"
-    print(f"Training embeddings with dim={embedding_dim}, steps={steps}, batch_size={batch_size}, lr={lr}, lambda_hierarchy={lambda_hierarchy}, init={init_type}")
+    print(f"Training embeddings with dim={embedding_dim}, steps={steps}, batch_size={batch_size}, lr={lr}, lambda_hierarchy={lambda_hierarchy}, lambda_cone={lambda_cone}, init={init_type}")
     conditions_embedder.train_embeddings(
         steps=steps,
         batch_size=batch_size,
         lr=lr,
         lambda_hierarchy=lambda_hierarchy,
+        lambda_cone=lambda_cone,
         origin_init=origin_init
     )
     
@@ -87,6 +106,15 @@ def load_embeddings(embedding_file: str) -> ConditionsHyperbolicEmbedder:
     print(f"Embedding dimension: {conditions_embedder.get_embedding_dim()}")
     print(f"Number of conditions: {len(conditions_embedder.conditions_codes)}")
     
+    # Display CCS code statistics if available
+    if conditions_embedder.icd_to_ccs is not None:
+        unique_ccs_codes = set(conditions_embedder.icd_to_ccs.values())
+        # Count codes that are actually CCS codes (not ICD codes in the embedding dict)
+        if conditions_embedder.code2embedding is not None:
+            ccs_count = sum(1 for code in conditions_embedder.code2embedding.keys() 
+                           if code not in conditions_embedder.conditions_codes)
+            print(f"Number of unique CCS codes in embeddings: {ccs_count}")
+    
     return conditions_embedder
 
 
@@ -114,6 +142,8 @@ def parse_args():
                        help='Learning rate for training (default: 1e-3)')
     parser.add_argument('--lambda_hierarchy', type=float, default=100,
                        help='Weight for hierarchy constraint loss')
+    parser.add_argument('--lambda_cone', type=float, default=1.0,
+                       help='Weight for cone cohesion loss (default: 1.0)')
     parser.add_argument('--origin_init', action='store_true', default=True,
                        help='Initialize all codes near origin instead of hierarchy-aware init')
     
@@ -134,6 +164,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         lr=args.lr,
         lambda_hierarchy=args.lambda_hierarchy,
+        lambda_cone=args.lambda_cone,
         origin_init=args.origin_init
     )
     

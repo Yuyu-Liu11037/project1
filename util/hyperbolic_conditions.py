@@ -33,12 +33,29 @@ def poincare_dist(u, v, eps=EPS):
     x = torch.clamp(x, min=1+eps, max=1e6)  # Upper bound to prevent overflow
     return torch.acosh(x)
 
-def extract_icd_parent_child_pair(code: str) -> List[Tuple[str, str]]:
+def get_icd_to_ccs_mapping(icd_codes: List[str]) -> Dict[str, str]:
+    """Map ICD-10-CM codes to their primary CCS codes using pyhealth"""
+    from pyhealth.medcode import CrossMap
+    mapping = CrossMap("ICD10CM", "CCSCM")
+    icd_to_ccs = {}
+    for icd_code in icd_codes:
+        ccs_result = mapping.map(icd_code)
+        if ccs_result:
+            icd_to_ccs[icd_code] = ccs_result[0]  # Use primary CCS code
+    return icd_to_ccs
+
+def extract_icd_parent_child_pair(code: str, ccs_code: str = None) -> List[Tuple[str, str]]:
     if not code or len(code) <= 3:
         return []
     
     pairs = []
     
+    # Add CCS → root ICD pair if CCS code is provided
+    if ccs_code is not None and len(code) >= 3:
+        root_icd = code[:3]
+        pairs.append((ccs_code, root_icd))
+    
+    # Add ICD hierarchy pairs
     if len(code) >= 4:
         for n in range(4, len(code) + 1):
             parent = code[:n-1]
@@ -47,12 +64,13 @@ def extract_icd_parent_child_pair(code: str) -> List[Tuple[str, str]]:
     
     return pairs
 
-def build_parent_child_pairs_from_codes(codes: List[str]) -> List[Tuple[str, str]]:
+def build_parent_child_pairs_from_codes(codes: List[str], icd_to_ccs: Dict[str, str] = None) -> List[Tuple[str, str]]:
     """
     Build parent-child pairs for all codes.
     
     Args:
         codes: List of ICD codes
+        icd_to_ccs: Optional mapping from ICD codes to CCS codes
         
     Returns:
         List of (parent, child) tuples representing hierarchy relationships
@@ -60,7 +78,9 @@ def build_parent_child_pairs_from_codes(codes: List[str]) -> List[Tuple[str, str
     pairs = []
     
     for code in codes:
-        code_pairs = extract_icd_parent_child_pair(code)
+        # Get CCS code for this ICD code if available
+        ccs_code = icd_to_ccs.get(code, None) if icd_to_ccs else None
+        code_pairs = extract_icd_parent_child_pair(code, ccs_code)
         pairs.extend(code_pairs)
     
     # Remove duplicates while preserving order
@@ -103,15 +123,27 @@ class PoincareEmbedding(nn.Module):
             for node_id in range(len(code2id)):
                 code = id2code[node_id]
                 
-                # Determine hierarchy level based on code length
-                if len(code) <= 3:
-                    # Top-level codes (e.g., "E11") - closest to origin
+                # Check if this is a CCS code
+                # CCS codes are either:
+                # 1. Numeric strings (e.g., "1", "2", "123")
+                # 2. "UNKNOWN_CCS" special code
+                # ICD codes always contain at least one letter followed by digits
+                # and may contain dots (e.g., "E11", "E11.6", "I25.110")
+                is_ccs_code = (code == "UNKNOWN_CCS" or 
+                               (len(code) > 0 and code[0].isdigit() and not any(c in code for c in "./-")))
+                
+                # Determine hierarchy level based on code type and length
+                if is_ccs_code:
+                    # CCS codes are at the root level - closest to origin
+                    scale = init_scale * 0.05
+                elif len(code) <= 3:
+                    # Top-level ICD codes (e.g., "E11") - close to origin
                     scale = init_scale * 0.1
                 elif len(code) <= 5:
-                    # Mid-level codes (e.g., "E11.6") - medium distance
+                    # Mid-level ICD codes (e.g., "E11.6") - medium distance
                     scale = init_scale * 0.5
                 else:
-                    # Leaf-level codes (e.g., "E11.65") - furthest from origin
+                    # Leaf-level ICD codes (e.g., "E11.65") - furthest from origin
                     scale = init_scale * 1.0
                 
                 # Initialize with smaller scale for higher hierarchy levels
@@ -243,6 +275,50 @@ def hierarchy_constraint_loss(model: PoincareEmbedding, p_idx, c_idx, lambda_hie
     
     return lambda_hierarchy * hierarchy_loss.mean()
 
+def cone_cohesion_loss(model: PoincareEmbedding, ccs_idx, children_indices, lambda_cone=1.0):
+    """
+    Cone cohesion loss to ensure children of the same CCS code are in the same cone.
+    
+    In hyperbolic space, a "cone" is the set of points that share the same direction from origin.
+    This loss encourages children to have similar normalized directions (same cone).
+    
+    Args:
+        model: PoincareEmbedding model
+        ccs_idx: CCS code index [B]
+        children_indices: List of child indices for each CCS [B, variable]
+        lambda_cone: Weight for cone cohesion constraint
+    
+    Returns:
+        Cone cohesion loss
+    """
+    ccs_emb = model(ccs_idx)  # [B, d]
+    
+    losses = []
+    for i in range(ccs_idx.size(0)):
+        ccs = ccs_emb[i]  # [d]
+        children = model(children_indices[i])  # [num_children, d]
+        
+        # Compute normalized direction vectors (unit vectors)
+        ccs_norm = torch.norm(ccs, dim=-1, keepdim=True).clamp_min(EPS)
+        ccs_direction = ccs / ccs_norm  # [d]
+        
+        children_norms = torch.norm(children, dim=-1, keepdim=True).clamp_min(EPS)
+        children_directions = children / children_norms  # [num_children, d]
+        
+        # Cosine similarity between CCS direction and each child direction
+        # Higher similarity means same cone
+        cos_sim = (ccs_direction.unsqueeze(0) * children_directions).sum(dim=-1)  # [num_children]
+        
+        # Loss = negative cosine similarity (we want high similarity)
+        # This encourages children to be in the same cone as the CCS
+        loss_per_ccs = (1 - cos_sim).mean()  # Average over children
+        losses.append(loss_per_ccs)
+    
+    if len(losses) == 0:
+        return torch.tensor(0.0, device=ccs_idx.device)
+    
+    return lambda_cone * torch.stack(losses).mean()
+
 # ---------------------------
 # Main training function
 # ---------------------------
@@ -252,9 +328,11 @@ def train_conditions_hyperbolic_embedding(
     neg_k: int = 10,
     steps: int = 100,
     batch_size: int = 256,
-    lr: float = 1e-4,  # More conservative learning rate
+    lr: float = 1e-4,  # More conservative penalty rate
     lambda_hierarchy: float = 0.5,  # Reduced hierarchy constraint weight
+    lambda_cone: float = 1.0,  # Weight for cone cohesion loss
     origin_init: bool = False,  # Initialize all codes near origin
+    icd_to_ccs: Dict[str, str] = None,  # Mapping from ICD codes to CCS codes
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 ) -> Dict[str, torch.Tensor]:
     """
@@ -268,7 +346,9 @@ def train_conditions_hyperbolic_embedding(
         batch_size: Batch size for training
         lr: Learning rate
         lambda_hierarchy: Weight for hierarchy constraint loss
+        lambda_cone: Weight for cone cohesion loss
         origin_init: If True, initialize all codes near origin instead of hierarchy-aware init
+        icd_to_ccs: Mapping from ICD codes to CCS codes
         device: Device to use for training
     
     Returns:
@@ -277,8 +357,8 @@ def train_conditions_hyperbolic_embedding(
    # Build vocabulary - include original codes and all their parents/children
     original_codes = sorted(list(set(conditions_codes)))
     
-    # Get parent-child pairs to extract all related codes
-    parent_child_pairs = build_parent_child_pairs_from_codes(original_codes)
+    # Get parent-child pairs to extract all related codes (includes CCS → ICD pairs)
+    parent_child_pairs = build_parent_child_pairs_from_codes(original_codes, icd_to_ccs=icd_to_ccs)
     
     # Collect all unique codes including parents and children
     all_codes = set(original_codes)  # Start with original codes
@@ -293,6 +373,18 @@ def train_conditions_hyperbolic_embedding(
     print(f"Original codes: {len(original_codes)}")
     print(f"Total codes (including parents/children): {len(codes)}")
     print(f"Parent-child pairs: {len(parent_child_pairs)}")
+    
+    # Build CCS to children mapping for cone cohesion loss
+    ccs_to_children = defaultdict(set)
+    if icd_to_ccs is not None:
+        for icd_code, ccs_code in icd_to_ccs.items():
+            if icd_code in code2id and ccs_code in code2id:
+                ccs_to_children[ccs_code].add(icd_code)
+        
+        # Convert to lists and filter out CCS with too few children
+        ccs_to_children = {ccs: list(children) for ccs, children in ccs_to_children.items() 
+                           if len(children) >= 2}  # Need at least 2 children for cone loss
+        print(f"CCS codes with children for cone loss: {len(ccs_to_children)}")
     
     if len(parent_child_pairs) == 0:
         print("Warning: No parent-child relationships found. Using random initialization.")
@@ -335,13 +427,32 @@ def train_conditions_hyperbolic_embedding(
             # Compute hierarchy constraint loss (parent closer to origin than child)
             hierarchy_loss = hierarchy_constraint_loss(model, p_idx, c_idx, lambda_hierarchy)
             
+            # Compute cone cohesion loss (if CCS mapping available)
+            cone_loss = torch.tensor(0.0, device=device)
+            if icd_to_ccs is not None and len(ccs_to_children) > 0 and lambda_cone > 0:
+                # Sample a few CCS codes for cone loss computation
+                sampled_ccs = random.sample(list(ccs_to_children.keys()), 
+                                           min(batch_size // 4, len(ccs_to_children)))
+                
+                for ccs_code in sampled_ccs:
+                    children_codes = ccs_to_children[ccs_code]
+                    ccs_idx = torch.tensor([code2id[ccs_code]], device=device)
+                    children_idx = torch.tensor([code2id[c] for c in children_codes], device=device)
+                    
+                    # Compute cone loss for this CCS (don't apply lambda_cone here, it's applied in the function)
+                    cone_loss += cone_cohesion_loss(model, ccs_idx, [children_idx], lambda_cone=1.0)
+                
+                # Average over sampled CCS codes and apply lambda_cone
+                if len(sampled_ccs) > 0:
+                    cone_loss = (cone_loss / len(sampled_ccs)) * lambda_cone
+            
             # Check for NaN values
-            if torch.isnan(recon_loss) or torch.isnan(hierarchy_loss):
+            if torch.isnan(recon_loss) or torch.isnan(hierarchy_loss) or torch.isnan(cone_loss):
                 print(f"Warning: NaN detected at step {step}. Stopping training.")
                 break
             
             # Total loss
-            total_loss = recon_loss + hierarchy_loss
+            total_loss = recon_loss + hierarchy_loss + cone_loss
             
             opt.zero_grad()
             total_loss.backward()
@@ -356,7 +467,7 @@ def train_conditions_hyperbolic_embedding(
                 model.emb.weight.copy_(mobius_proj(model.emb.weight))
             
             if step % 10 == 0:
-                print(f"Hyperbolic embedding step {step:6d}  recon_loss = {recon_loss.item():.4f}  hierarchy_loss = {hierarchy_loss.item():.4f}  total_loss = {total_loss.item():.4f}")
+                print(f"Step {step:6d}  recon_loss = {recon_loss.item():.4f}  hierarchy_loss = {hierarchy_loss.item():.4f}  cone_loss = {cone_loss.item():.4f}  total_loss = {total_loss.item():.4f}")
                 
         except StopIteration:
             # Restart iterator if it runs out
@@ -379,19 +490,22 @@ def train_conditions_hyperbolic_embedding(
 # Integration utilities
 # ---------------------------
 class ConditionsHyperbolicEmbedder:
-    def __init__(self, conditions_codes: List[str], embedding_dim: int = 16):
+    def __init__(self, conditions_codes: List[str], embedding_dim: int = 16, icd_to_ccs: Dict[str, str] = None):
         self.conditions_codes = conditions_codes
         self.embedding_dim = embedding_dim
+        self.icd_to_ccs = icd_to_ccs
         self.code2embedding = None
         self.trained = False
     
-    def train_embeddings(self, lambda_hierarchy: float = 1.0, origin_init: bool = False, **kwargs):
+    def train_embeddings(self, lambda_hierarchy: float = 1.0, lambda_cone: float = 1.0, origin_init: bool = False, **kwargs):
         """Train hyperbolic embeddings for conditions codes with hierarchy constraints"""
         self.code2embedding = train_conditions_hyperbolic_embedding(
             self.conditions_codes,
             dim=self.embedding_dim,
             lambda_hierarchy=lambda_hierarchy,
+            lambda_cone=lambda_cone,
             origin_init=origin_init,
+            icd_to_ccs=self.icd_to_ccs,
             **kwargs
         )
         self.trained = True
