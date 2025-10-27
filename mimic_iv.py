@@ -8,8 +8,8 @@ import numpy as np
 import warnings
 from pyhealth.datasets import MIMIC4Dataset
 
-from util.data_processing import diag_prediction_mimic4_fn, dialysis_prediction_mimic4_fn
-from training.training import train_diagnosis_model_on_samples, train_dialysis_model_on_samples
+from util.data_processing import diag_prediction_mimic4_fn
+from training.training import train_diagnosis_model_on_samples
 
 warnings.filterwarnings('ignore')
 
@@ -22,11 +22,6 @@ def parse_args():
     parser.add_argument('--model', type=str, default='transformer', 
                        choices=['mlp', 'transformer'],
                        help='Model type: mlp or transformer')
-    
-    # Task selection
-    parser.add_argument('--task_type', type=str, default='diagnosis',
-                       choices=['diagnosis', 'dialysis'],
-                       help='Task type: diagnosis prediction or dialysis prediction')
     
     # Training parameters
     parser.add_argument('--task', type=str, default='next',
@@ -91,18 +86,12 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     
-    # Validate train_percentage argument
-    if not 0.01 <= args.train_percentage <= 1.0:
-        raise ValueError("train_percentage must be between 0.01 and 1.0")
-    
     # Set random seed
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     
     print(f"Using model: {args.model}")
-    print(f"Task type: {args.task_type}")
-    if args.task_type == 'diagnosis':
-        print(f"Prediction task: {args.task}")
+    print(f"Prediction task: {args.task}")
     print(f"Hidden layer dimension: {args.hidden}")
     print(f"Learning rate: {args.lr}")
     print(f"Training epochs: {args.epochs}")
@@ -111,7 +100,7 @@ if __name__ == "__main__":
     print(f"Early stopping: {args.early_stopping}")
     if args.early_stopping:
         # Use appropriate monitor metric based on task type
-        actual_monitor = 'accuracy' if args.task_type == 'dialysis' else args.monitor_metric
+        actual_monitor = args.monitor_metric
         print(f"  Patience: {args.patience}, Min delta: {args.min_delta}, Monitor: {actual_monitor}")
     
     if args.model == 'transformer':
@@ -124,20 +113,14 @@ if __name__ == "__main__":
     
     print(f"Training with seed: {args.seed}")
     
-    print(f"\nLoading MIMIC-IV dataset for {args.task_type} prediction...")
+    print(f"\nLoading MIMIC-IV dataset for diagnosis prediction...")
     mimic4_base = MIMIC4Dataset(
         root=args.data_path,
         tables=["diagnoses_icd", "procedures_icd", "prescriptions"],
         code_mapping={"NDC": ("ATC", {"target_kwargs": {"level": 3}})},
     )
 
-    # Choose the appropriate task function based on task_type
-    if args.task_type == 'diagnosis':
-        mimic4_prediction = mimic4_base.set_task(diag_prediction_mimic4_fn)
-    elif args.task_type == 'dialysis':
-        mimic4_prediction = mimic4_base.set_task(dialysis_prediction_mimic4_fn)
-    else:
-        raise ValueError(f"Unknown task_type: {args.task_type}")
+    mimic4_prediction = mimic4_base.set_task(diag_prediction_mimic4_fn)
 
     # Prepare model parameters
     model_kwargs = {
@@ -150,8 +133,7 @@ if __name__ == "__main__":
             'num_layers': args.num_layers,
         })
     
-    if args.task_type == 'diagnosis':
-        model, vocabs, y_itos, test_metrics = train_diagnosis_model_on_samples(
+    model, vocabs, y_itos, test_metrics = train_diagnosis_model_on_samples(
                 mimic4_prediction.samples,
                 model_type=args.model,
                 task=args.task,
@@ -174,27 +156,6 @@ if __name__ == "__main__":
                 max_seq_length=args.max_seq_length,
                 **model_kwargs
             )
-    elif args.task_type == 'dialysis':
-        model, vocabs, test_metrics = train_dialysis_model_on_samples(
-                mimic4_prediction.samples,
-                model_type=args.model,
-                hidden=args.hidden,
-                lr=args.lr,
-                wd=args.wd,
-                epochs=args.epochs,
-                seed=args.seed,
-                train_percentage=args.train_percentage,
-                batch_size=args.batch_size,
-                early_stopping=args.early_stopping,
-                patience=args.patience,
-                min_delta=args.min_delta,
-                monitor_metric='accuracy',  # Use accuracy for dialysis prediction
-                use_gpu=args.use_gpu,
-                force_cpu=args.force_cpu,
-                **model_kwargs
-            )
-    else:
-        raise ValueError(f"Unknown task_type: {args.task_type}")
         
     print(f"\n[DONE] {args.model.upper()} model test results:")
     for metric, value in test_metrics.items():
