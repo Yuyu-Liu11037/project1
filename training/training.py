@@ -9,7 +9,7 @@ import random
 import numpy as np
 from collections import defaultdict
 from sklearn.model_selection import KFold
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Dataset
 
 from model.models import create_model
 from util.data_processing import (
@@ -19,7 +19,44 @@ from util.data_processing import (
     prepare_XY, 
     split_by_patient
 )
-from metrics.metrics import bce_pos_weight, evaluate
+from metrics.metrics import evaluate
+
+
+class VariableLengthDataset(Dataset):
+    """Dataset for variable-length tensors"""
+    def __init__(self, X_list, Y_list):
+        """
+        Args:
+            X_list: list of 1D tensors (variable length)
+            Y_list: list of 1D tensors (variable length)
+        """
+        self.X_list = X_list
+        self.Y_list = Y_list
+    
+    def __len__(self):
+        return len(self.X_list)
+    
+    def __getitem__(self, idx):
+        return self.X_list[idx], self.Y_list[idx]
+
+
+def collate_fn(batch):
+    """Custom collate function to pad variable-length sequences"""
+    X_batch, Y_batch = zip(*batch)
+    
+    # Pad X sequences
+    X_padded = torch.nn.utils.rnn.pad_sequence(X_batch, batch_first=True, padding_value=0)
+    
+    # For Y (multi-label), we need a different approach
+    # Find max length of Y sequences and pad
+    max_y_len = max(len(y) for y in Y_batch)
+    Y_padded_list = []
+    for y in Y_batch:
+        padded_y = torch.nn.functional.pad(y, (0, max_y_len - len(y)), value=0)
+        Y_padded_list.append(padded_y)
+    Y_padded = torch.stack(Y_padded_list)
+    
+    return X_padded, Y_padded
 
 
 def train_model_on_samples(samples,
@@ -73,9 +110,21 @@ def train_model_on_samples(samples,
     # 没事了，cond_hist字段就是之前所有的visits
     pairs = build_pairs(by_pid, task=task)   # (sample_t, label_t+1)
     # print(f"\nPairs: {pairs[10]}")
+    
+    # Filter out samples with empty cond_hist (first visits without history)
+    original_num_pairs = len(pairs)
+    pairs = [(s, y_codes) for s, y_codes in pairs if s.get('cond_hist', []) and len([x for x in s['cond_hist'] if x]) > 0]
+    filtered_num_pairs = len(pairs)
+    print(f"\nFiltered {original_num_pairs - filtered_num_pairs} samples with empty cond_hist")
+    print(f"Remaining samples: {filtered_num_pairs}/{original_num_pairs}")
 
     # 2) Patient-level split
     train_pairs, val_pairs, test_pairs = split_by_patient(pairs, seed=seed)
+    
+    # Check cond_hist lengths
+    cond_hist_lengths = [len(s.get('cond_hist', [])) for s, _ in train_pairs]
+    if cond_hist_lengths:
+        print(f"\ncond_hist length stats: min={min(cond_hist_lengths)}, max={max(cond_hist_lengths)}, avg={sum(cond_hist_lengths)/len(cond_hist_lengths):.2f}")
     
     # Apply few-shot sampling to training data
     if train_percentage < 1.0:
@@ -88,40 +137,39 @@ def train_model_on_samples(samples,
         print(f"Few-shot training: Using {len(train_pairs)}/{original_train_size} samples ({train_percentage:.1%} of training data)")
 
     # 3) Vocabulary
-    (diag_stoi,_), (proc_stoi,_), (drug_stoi,_), (y_stoi, y_itos) = build_vocab_from_pairs(train_pairs)
+    (diag_stoi,_), (proc_stoi,_), (drug_stoi,_), (y_stoi, y_itos) = build_vocab_from_pairs(train_pairs) # y_stoi = diag_stoi
     vocabs = (diag_stoi, proc_stoi, drug_stoi, y_stoi)
 
     # 4) Vectorization
-    Xtr, Ytr = prepare_XY(train_pairs, vocabs, use_current_step=use_current_step)   # X = torch.cat([x_diag, x_proc, x_drug], dim=0)
-    print(f"\nTrain data shape: {Xtr.shape}")   # 100% [34972, 19733]
-    print(f"\nTrain data: {Xtr[10]}")
-    print(f"\nTrain label shape: {Ytr.shape}")   # 100% [34972, 274]
-    print(f"\nTrain label: {Ytr[10]}")
+    Xtr, Ytr = prepare_XY(train_pairs, vocabs, use_current_step=use_current_step)
     Xva, Yva = prepare_XY(val_pairs,   vocabs, use_current_step=use_current_step)
     Xte, Yte = prepare_XY(test_pairs,   vocabs, use_current_step=use_current_step)
 
-    # 5) Create DataLoaders for batch training
-    train_dataset = TensorDataset(Xtr, Ytr)
-    print(f"\nTrain dataset: {train_dataset[0]}")
-    val_dataset = TensorDataset(Xva, Yva)
-    test_dataset = TensorDataset(Xte, Yte)
+    # 5) Create DataLoaders for batch training with custom collate function
+    train_dataset = VariableLengthDataset(Xtr, Ytr)
+    val_dataset = VariableLengthDataset(Xva, Yva)
+    test_dataset = VariableLengthDataset(Xte, Yte)
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
     # 6) Model and loss (multi-label)
-    # input: (batch_size, in_dim), in_dim = historical diagnosis codes (ICD)len(diag_stoi) + historical procedure codes (Procedures)len(proc_stoi) + historical drug codes (ATC-3)len(drug_stoi)
-    # output: (batch_size, out_dim), out_dim = label codes (CCS)len(y_stoi), size of label vocabulary
+    # Calculate vocabulary sizes for embedding layers
+    # X vocab size = diag_stoi + proc_stoi + drug_stoi + 1 (for padding)
+    # Y vocab size = diag_stoi + 1 (for padding) since Y and diag share the same vocab
+    diag_stoi, proc_stoi, drug_stoi, y_stoi = vocabs
+    x_vocab_size = len(diag_stoi) + len(proc_stoi) + len(drug_stoi) + 1  # +1 for padding
+    y_vocab_size = len(diag_stoi) + 1  # +1 for padding (Y shares vocab with diag)
     
     device = torch.device('cuda')
     print(f"Using device: {device}")
+    print(f"X vocab size: {x_vocab_size}, Y vocab size: {y_vocab_size}")
     
-    model = create_model(model_type, Xtr.size(1), hidden=hidden, out_dim=Ytr.size(1), **model_kwargs)
-    model = model.to(device)  # Move model to device
+    model = create_model(model_type, x_vocab_size=x_vocab_size, hidden=hidden, out_dim=y_vocab_size, **model_kwargs)
+    model = model.to(device) 
     
-    pw = bce_pos_weight(Ytr).to(device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pw)
+    # Loss will be computed in the training loop by converting indices to multi-hot
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
 
     # 7) Training loop with batches and early stopping
@@ -136,9 +184,25 @@ def train_model_on_samples(samples,
         
         # Training phase
         for batch_X, batch_Y in train_loader:
+            # print(batch_X[0])
+            # print(batch_Y[0])
             batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
-            logits = model(batch_X)
-            loss = criterion(logits, batch_Y)
+            logits = model(batch_X)  # (batch_size, y_vocab_size)
+            # print(logits[0])
+            
+            # Convert Y from padded index sequences to multi-hot vectors
+            # batch_Y shape: (batch_size, max_y_len) with indices (0 = padding)
+            batch_size = batch_Y.size(0)
+            max_y_len = batch_Y.size(1)
+            y_multi_hot = torch.zeros(batch_size, logits.size(1), device=device)
+            
+            for i in range(batch_size):
+                # Extract valid labels (non-zero indices) for this sample
+                valid_labels = batch_Y[i][batch_Y[i] != 0]  # Remove padding
+                y_multi_hot[i, valid_labels] = 1.0  # Set positions to 1
+            
+            # Calculate loss using BCE
+            loss = nn.functional.binary_cross_entropy_with_logits(logits, y_multi_hot)
             
             opt.zero_grad()
             loss.backward()
@@ -184,11 +248,6 @@ def train_model_on_samples(samples,
     return model, vocabs, y_itos, test_metrics
 
 
-def train_mlp_on_samples(samples, **kwargs):
-    """Backward compatible MLP training function"""
-    return train_model_on_samples(samples, model_type="mlp", **kwargs)
-
-
 def evaluate_batched(model, data_loader, ks=(10, 20, 30), device=None):
     """
     Evaluate model using batched data loader
@@ -220,7 +279,17 @@ def evaluate_batched(model, data_loader, ks=(10, 20, 30), device=None):
             batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
             logits = model(batch_X)
             all_logits.append(logits.cpu())
-            all_labels.append(batch_Y.cpu())
+            
+            # Convert padded index sequences to multi-hot vectors
+            batch_size = batch_Y.size(0)
+            num_labels = logits.size(1)
+            y_multi_hot = torch.zeros(batch_size, num_labels)
+            
+            for i in range(batch_size):
+                valid_labels = batch_Y[i][batch_Y[i] != 0].cpu()
+                y_multi_hot[i, valid_labels] = 1.0
+            
+            all_labels.append(y_multi_hot)
     
     # Concatenate all batches
     logits = torch.cat(all_logits, dim=0).numpy()

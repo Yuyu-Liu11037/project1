@@ -8,37 +8,45 @@ import math
 
 
 class MLP(nn.Module):
-    """Simple multi-label MLP model"""
+    """Simple multi-label MLP model with embedding layer for index-based inputs"""
     
-    def __init__(self, in_dim, hidden, out_dim, p=0.3):
+    def __init__(self, x_vocab_size, hidden, out_dim, embed_dim=256, p=0.3):
         super().__init__()
+        # Embedding layer to convert sparse indices to dense vectors
+        self.embedding = nn.Embedding(x_vocab_size, embed_dim, padding_idx=0)
+        
+        # Use EmbeddingBag for efficient handling of variable-length sequences
+        # This automatically handles padding and averaging
+        self.embedding_bag = nn.EmbeddingBag(x_vocab_size, embed_dim, padding_idx=0, mode='mean')
+        
         self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden), 
+            nn.Linear(embed_dim, hidden), 
             nn.ReLU(),
             nn.Dropout(p),
-            nn.Linear(hidden, out_dim)  # logits
+            nn.Linear(hidden, out_dim)  # logits for each class
         )
     
-    def forward(self, x): 
-        return self.net(x)
+    def forward(self, x):
+        # x shape: (batch_size, seq_len) where seq_len can vary
+        # Use embedding bag to aggregate variable-length sequences
+        x_embedded = self.embedding_bag(x)  # (batch_size, embed_dim)
+        return self.net(x_embedded)  # (batch_size, out_dim)
 
 
 class TransformerModel(nn.Module):
-    """Transformer-based multi-label classification model"""
+    """Transformer-based multi-label classification model with embedding layer"""
     
-    def __init__(self, in_dim, hidden, out_dim, num_heads=8, num_layers=3, p=0.3):
+    def __init__(self, x_vocab_size, hidden, out_dim, embed_dim=256, num_heads=8, num_layers=3, p=0.3):
         super().__init__()
-        self.in_dim = in_dim
+        self.x_vocab_size = x_vocab_size
         self.hidden = hidden
         self.out_dim = out_dim
         
-        # Input projection layer - project input features to hidden dimension
-        self.input_projection = nn.Linear(in_dim, hidden)
+        # Embedding layer for input indices
+        self.embedding = nn.Embedding(x_vocab_size, embed_dim, padding_idx=0)
         
-        # Create a learnable sequence of tokens for the transformer
-        # We'll use a fixed number of learnable tokens instead of reshaping input
-        self.num_tokens = 16  # Fixed number of learnable tokens
-        self.token_embeddings = nn.Parameter(torch.randn(self.num_tokens, hidden))
+        # Project embeddings to hidden dimension
+        self.input_projection = nn.Linear(embed_dim, hidden)
         
         # Positional encoding
         self.pos_encoding = PositionalEncoding(hidden, p)
@@ -53,37 +61,43 @@ class TransformerModel(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # Output layer
+        # Output layer - use a classification token approach
+        self.cls_token = nn.Parameter(torch.randn(1, 1, hidden))
         self.output_projection = nn.Linear(hidden, out_dim)
         
         # Dropout
         self.dropout = nn.Dropout(p)
         
     def forward(self, x):
-        # x shape: (batch_size, in_dim)
+        # x shape: (batch_size, seq_len) - variable length sequences of indices
         batch_size = x.size(0)
         
-        # Project input features to hidden dimension
-        # x: (batch_size, in_dim) -> (batch_size, hidden)
-        x_projected = self.input_projection(x)  # (batch_size, hidden)
+        # Convert padding to mask for transformer (0 = padding, 1 = valid)
+        padding_mask = (x != 0)  # (batch_size, seq_len)
         
-        # Create sequence by combining projected input with learnable tokens
-        # Expand learnable tokens for batch
-        tokens = self.token_embeddings.unsqueeze(0).expand(batch_size, -1, -1)  # (batch_size, num_tokens, hidden)
+        # Embedding: convert indices to dense vectors
+        x_embedded = self.embedding(x)  # (batch_size, seq_len, embed_dim)
         
-        # Add input as first token
-        x_input = x_projected.unsqueeze(1)  # (batch_size, 1, hidden)
+        # Project to hidden dimension
+        x_projected = self.input_projection(x_embedded)  # (batch_size, seq_len, hidden)
         
-        # Combine input with learnable tokens
-        x_seq = torch.cat([x_input, tokens], dim=1)  # (batch_size, num_tokens+1, hidden)
+        # Add CLS token at the beginning
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # (batch_size, 1, hidden)
+        x_seq = torch.cat([cls_tokens, x_projected], dim=1)  # (batch_size, seq_len+1, hidden)
+        
+        # Extend padding mask for CLS token (always valid)
+        cls_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=x.device)
+        padding_mask = torch.cat([cls_mask, padding_mask], dim=1)  # (batch_size, seq_len+1)
         
         # Positional encoding
         x_seq = self.pos_encoding(x_seq)
         
         # Transformer encoding
-        x_seq = self.transformer(x_seq)
+        # Create attention mask: True values will be ignored (padded positions)
+        src_key_padding_mask = ~padding_mask  # Invert: True = masked out
+        x_seq = self.transformer(x_seq, src_key_padding_mask=src_key_padding_mask)
         
-        # Use the first token (which contains input information) for prediction
+        # Use CLS token (first token) for prediction
         x_output = x_seq[:, 0, :]  # (batch_size, hidden)
         
         # Dropout
@@ -115,12 +129,12 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-def create_model(model_type, in_dim, hidden, out_dim, **kwargs):
+def create_model(model_type, x_vocab_size, hidden, out_dim, **kwargs):
     """Model factory function"""
     if model_type.lower() == 'mlp':
-        return MLP(in_dim, hidden, out_dim, **kwargs)
+        return MLP(x_vocab_size, hidden, out_dim, **kwargs)
     elif model_type.lower() == 'transformer':
-        return TransformerModel(in_dim, hidden, out_dim, **kwargs)
+        return TransformerModel(x_vocab_size, hidden, out_dim, **kwargs)
     else:
         raise ValueError(f"Unsupported model type: {model_type}. Supported types: 'mlp', 'transformer'")
 

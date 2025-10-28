@@ -39,10 +39,10 @@ def parse_args():
                        help='Number of training epochs (default: 10)')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed (default: 42)')
-    parser.add_argument('--train_percentage', type=float, default=0.05,
-                       help='Percentage of training data to use for few-shot training (0.01-1.0, default: 1.0)')
-    parser.add_argument('--batch_size', type=int, default=256,
-                       help='Batch size for training (default: 256)')
+    parser.add_argument('--train_percentage', type=float, default=1.0,
+                       help='Percentage of training data to use for few-shot training')
+    parser.add_argument('--batch_size', type=int, default=24,
+                       help='Batch size for training')
 
     # Early stopping parameters
     parser.add_argument('--early_stopping', action='store_true', default=True,

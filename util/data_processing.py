@@ -106,8 +106,12 @@ def build_pairs(samples_by_pid, task="current"):
 
 
 def build_vocab_from_pairs(pairs):
-    """Build vocabulary from training pairs"""
-    diag_c, proc_c, drug_c, y_c = Counter(), Counter(), Counter(), Counter()
+    """Build vocabulary from training pairs
+    
+    Note: Y (labels) and diagnosis share the same vocab. 
+    Labels (CCS codes) are merged into diagnosis vocab.
+    """
+    diag_c, proc_c, drug_c = Counter(), Counter(), Counter()
     
     for s, y in pairs:
         for visit_codes in s["cond_hist"]:   # Historical ICD diagnoses (last step is empty to prevent leakage)
@@ -116,28 +120,117 @@ def build_vocab_from_pairs(pairs):
             proc_c.update(visit_codes)
         for visit_codes in s["drugs"]:       # Each step is an ATC3 list
             drug_c.update(visit_codes)
-        y_c.update(y)                        # Labels (CCS)
+        # Merge labels into diagnosis vocab since they share the same tokenizer
+        diag_c.update(y)                     # Labels (CCS) added to diagnosis vocab
     
     def mk_vocab(cnt):
         itos = [c for c, _ in cnt.most_common()]
         stoi = {c:i for i,c in enumerate(itos)}
         return stoi, itos
     
-    return mk_vocab(diag_c), mk_vocab(proc_c), mk_vocab(drug_c), mk_vocab(y_c)
+    # Y vocab is now the same as diag vocab
+    diag_stoi, diag_itos = mk_vocab(diag_c)
+    proc_stoi, proc_itos = mk_vocab(proc_c)
+    drug_stoi, drug_itos = mk_vocab(drug_c)
+    
+    # Return diag_vocab as both diag_stoi and y_stoi since they share the same tokenizer
+    return (diag_stoi, diag_itos), (proc_stoi, proc_itos), (drug_stoi, drug_itos), (diag_stoi, diag_itos)
 
 
-def multihot_from_sequence(seq_of_lists, stoi):
-    """Convert sequence to multi-hot vector"""
-    x = torch.zeros(len(stoi), dtype=torch.float32)
+class CodeTokenizer:
+    """Tokenizer for medical codes (diagnosis, procedure, drug)"""
+    
+    def __init__(self, stoi, offset=0):
+        """
+        Args:
+            stoi: String to index mapping dictionary
+            offset: Starting index for this tokenizer (to reserve 0 for padding)
+        """
+        self.stoi = stoi
+        self.itos = {i: code for code, i in stoi.items()}  # Index to string mapping
+        self.offset = offset
+        self.vocab_size = len(stoi)
+    
+    def encode(self, seq_of_lists):
+        """
+        Convert code sequences to indices
+        
+        Args:
+            seq_of_lists: List of lists of codes (e.g., [[code1, code2], [code3]])
+        
+        Returns:
+            List of indices
+        """
+        indices = []
+        for codes in seq_of_lists:
+            for c in codes:
+                if c in self.stoi:
+                    indices.append(self.stoi[c] + self.offset)
+        return indices
+    
+    def decode(self, indices, remove_padding=True):
+        """
+        Convert indices back to code strings
+        
+        Args:
+            indices: List of indices
+            remove_padding: Whether to remove 0 (padding) indices
+        
+        Returns:
+            List of code strings
+        """
+        codes = []
+        for idx in indices:
+            if remove_padding and idx == 0:
+                continue
+            idx_without_offset = idx - self.offset
+            if idx_without_offset in self.itos:
+                codes.append(self.itos[idx_without_offset])
+        return codes
+
+
+def indices_from_sequence(seq_of_lists, stoi, offset=0):
+    """Convert sequence to list of indices (with optional offset to reserve 0 for padding)
+    
+    DEPRECATED: Use CodeTokenizer.encode() instead
+    """
+    indices = []
     for codes in seq_of_lists:
         for c in codes:
             if c in stoi: 
-                x[stoi[c]] = 1.0
-    return x
+                indices.append(stoi[c] + offset)  # Add offset to reserve 0 for padding
+    return indices
+
+
+def create_tokenizers(vocabs):
+    """
+    Create tokenizers for diagnosis, procedure, drug codes, and labels
+    
+    Args:
+        vocabs: Tuple of (diag_stoi, proc_stoi, drug_stoi, y_stoi)
+        Note: y_stoi is the same as diag_stoi (they share the same vocab)
+    
+    Returns:
+        Tuple of (diag_tokenizer, proc_tokenizer, drug_tokenizer, y_tokenizer)
+    """
+    diag_stoi, proc_stoi, drug_stoi, y_stoi = vocabs
+    
+    # Reserve 0 for padding, so start at 1
+    # Y (labels) shares the same tokenizer as diagnosis since they use the same vocab
+    diag_tokenizer = CodeTokenizer(diag_stoi, offset=1)
+    y_tokenizer = diag_tokenizer  # Same tokenizer for Y and diagnosis
+    
+    # Procedure codes come after diagnosis codes
+    proc_tokenizer = CodeTokenizer(proc_stoi, offset=len(diag_stoi) + 1)
+    
+    # Drug codes come after procedure codes
+    drug_tokenizer = CodeTokenizer(drug_stoi, offset=len(diag_stoi) + len(proc_stoi) + 1)
+    
+    return diag_tokenizer, proc_tokenizer, drug_tokenizer, y_tokenizer
 
 
 def vectorize_pair(s, y_codes, vocabs, use_current_step=False):
-    """Vectorize sample pair"""
+    """Vectorize sample pair - returns indices instead of multi-hot vectors"""
     diag_stoi, proc_stoi, drug_stoi, y_stoi = vocabs
     
     # Admission prediction: don't look at current step's proc/drug; discharge prediction can look
@@ -148,26 +241,33 @@ def vectorize_pair(s, y_codes, vocabs, use_current_step=False):
         proc_hist = s["procedures"][:-1] if len(s["procedures"])>0 else []
         drug_hist = s["drugs"][:-1] if len(s["drugs"])>0 else []
 
-    x_diag = multihot_from_sequence(s["cond_hist"], diag_stoi)  # Historical ICD (current step is empty)
-    x_proc = multihot_from_sequence(proc_hist, proc_stoi)
-    x_drug = multihot_from_sequence(drug_hist, drug_stoi)
-    X = torch.cat([x_diag, x_proc, x_drug], dim=0)
+    # Create tokenizers (Y shares the same tokenizer as diagnosis)
+    diag_tokenizer, proc_tokenizer, drug_tokenizer, y_tokenizer = create_tokenizers(vocabs)
+    
+    # Tokenize each type of code
+    x_diag_indices = diag_tokenizer.encode(s["cond_hist"])
+    x_proc_indices = proc_tokenizer.encode(proc_hist)
+    x_drug_indices = drug_tokenizer.encode(drug_hist)
+    
+    # Flatten all indices into a single list
+    X_indices = x_diag_indices + x_proc_indices + x_drug_indices
+    X = torch.tensor(X_indices, dtype=torch.long) if len(X_indices) > 0 else torch.tensor([0], dtype=torch.long)
 
-    y = torch.zeros(len(y_stoi), dtype=torch.float32)
-    for c in y_codes:
-        if c in y_stoi: 
-            y[y_stoi[c]] = 1.0
+    # For Y, use the shared diag_tokenizer (they use the same vocab)
+    y_indices = y_tokenizer.encode([y_codes])
+    y = torch.tensor(y_indices, dtype=torch.long) if len(y_indices) > 0 else torch.tensor([0], dtype=torch.long)
+    
     return X, y
 
 
 def prepare_XY(pairs, vocabs, use_current_step=False):
-    """Prepare training data X and Y"""
+    """Prepare training data X and Y as variable-length sequences"""
     Xs, Ys = [], []
     for s, y_codes in pairs:
         X, y = vectorize_pair(s, y_codes, vocabs, use_current_step=use_current_step)
         Xs.append(X)
         Ys.append(y)
-    return torch.stack(Xs), torch.stack(Ys)
+    return Xs, Ys
 
 
 def split_by_patient(pairs, test_size=0.2, val_size=0.1, seed=42):
