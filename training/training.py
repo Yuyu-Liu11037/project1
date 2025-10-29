@@ -11,6 +11,7 @@ import geoopt
 from collections import defaultdict
 from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader, TensorDataset, Dataset
+from functools import partial
 
 from model.models import create_model
 from util.data_processing import (
@@ -18,7 +19,8 @@ from util.data_processing import (
     build_pairs, 
     build_vocab_from_pairs,
     prepare_XY, 
-    split_by_patient
+    split_by_patient,
+    build_icd_hierarchy
 )
 from metrics.metrics import evaluate, precision_at_k_visit, accuracy_at_k_code, recall_at_k_micro
 
@@ -83,6 +85,118 @@ def collate_fn(batch, max_diag_len=None, max_proc_len=None, max_drug_len=None):
     return (X_diag_padded, X_proc_padded, X_drug_padded), Y_padded
 
 
+def compute_hierarchical_loss(model, icd_hierarchy, ccs_groups, diag_stoi, diag_itos, device='cuda', relevant_codes=None):
+    """
+    Compute hierarchical constraint loss in hyperbolic space.
+    
+    Args:
+        model: The model with hyperbolic embeddings
+        icd_hierarchy: Dictionary {icd_code: [parent]} for prefix hierarchy
+        ccs_groups: Dictionary {ccs_code: [icd_code1, icd_code2, ...]} for CCS grouping
+        diag_stoi: Dictionary mapping ICD codes to indices
+        diag_itos: Dictionary mapping indices to ICD codes
+        device: Device for computation
+        relevant_codes: Set of codes to compute constraints for (if None, compute for all)
+    
+    Returns:
+        hierarchical_loss: Scalar tensor with hyperbolic distance constraints
+    """
+    total_loss = 0.0
+    count = 0
+    
+    # Get the hyperbolic embedding layer for diagnosis codes
+    emb_diag = model.emb_diag
+    ball = emb_diag.ball
+    
+    # Build set of relevant codes and their ancestors for batch-based optimization
+    if relevant_codes is not None:
+        # Collect all ancestors of relevant codes
+        processed = set()
+        codes_to_process = relevant_codes.copy()
+        
+        while codes_to_process:
+            code = codes_to_process.pop()
+            if code in processed or code not in icd_hierarchy:
+                continue
+            processed.add(code)
+            # Add parent codes to be processed recursively
+            for parent in icd_hierarchy[code]:
+                if parent not in processed and parent in diag_stoi:
+                    codes_to_process.add(parent)
+        
+        relevant_codes_set = processed
+    else:
+        relevant_codes_set = None  # Process all codes
+    
+    # Constraint 1: ICD tree hierarchy (child close to parent + child deeper than parent)
+    for child_code, parent_codes in icd_hierarchy.items():
+        if child_code not in diag_stoi:
+            continue
+        
+        # Only process if relevant_codes is None (all) or child_code is in relevant set
+        if relevant_codes_set is not None and child_code not in relevant_codes_set:
+            continue
+        
+        child_idx = diag_stoi[child_code]
+        child_emb = emb_diag.weight[child_idx]  # Hyperbolic embedding
+        
+        for parent_code in parent_codes:
+            if parent_code not in diag_stoi:
+                continue
+            
+            parent_idx = diag_stoi[parent_code]
+            parent_emb = emb_diag.weight[parent_idx]
+            
+            # Constraint 1a: Child should be close to parent (distance constraint)
+            dist_parent_child = ball.dist(child_emb.unsqueeze(0), parent_emb.unsqueeze(0))
+            
+            # Constraint 1b: Child should be deeper than parent (closer to boundary)
+            # In hyperbolic space, distance from origin represents depth in the tree
+            dist_child_origin = torch.norm(child_emb)
+            dist_parent_origin = torch.norm(parent_emb)
+            
+            # Child should be further from origin than parent
+            # Use relu to penalize when child is NOT deeper than parent
+            depth_penalty = torch.relu(dist_parent_origin - dist_child_origin)
+            
+            # Total constraint loss for this pair
+            pair_loss = dist_parent_child + depth_penalty
+            total_loss += pair_loss
+            count += 1
+    
+    # Constraint 2: CCS grouping (ICDs mapped to same CCS should be close)
+    for ccs_code, icd_codes in ccs_groups.items():
+        if len(icd_codes) < 2:  # Need at least 2 codes to form a constraint
+            continue
+        
+        # Compute pairwise distances between all ICDs in this CCS group
+        # Only include codes in relevant set if filtering is enabled
+        if relevant_codes_set is not None:
+            valid_icd_indices = [diag_stoi[code] for code in icd_codes 
+                               if code in diag_stoi and code in relevant_codes_set]
+        else:
+            valid_icd_indices = [diag_stoi[code] for code in icd_codes if code in diag_stoi]
+        
+        if len(valid_icd_indices) < 2:
+            continue
+        
+        for i in range(len(valid_icd_indices)):
+            for j in range(i + 1, len(valid_icd_indices)):
+                idx1, idx2 = valid_icd_indices[i], valid_icd_indices[j]
+                emb1 = emb_diag.weight[idx1]
+                emb2 = emb_diag.weight[idx2]
+                
+                # Compute hyperbolic distance
+                dist = ball.dist(emb1.unsqueeze(0), emb2.unsqueeze(0))
+                total_loss += dist
+                count += 1
+    
+    if count > 0:
+        return total_loss / count
+    else:
+        return torch.tensor(0.0, device=device)
+
+
 def train_model_on_samples(samples,
                            model_type="mlp",      # "mlp" or "transformer"
                            task="next",          # "next" aligns with paper; "current" uses existing labels
@@ -94,6 +208,7 @@ def train_model_on_samples(samples,
                            patience=10,           # Number of epochs to wait before stopping
                            min_delta=0.001,      # Minimum change to qualify as improvement
                            monitor_metric='Acc@10', # Metric to monitor for early stopping
+                           hierarchical_loss_weight=0.1,  # Weight for hierarchical constraint loss
                            **model_kwargs):
     """
     Train model for diagnosis prediction
@@ -114,6 +229,7 @@ def train_model_on_samples(samples,
         patience: Number of epochs to wait before stopping (default: 10)
         min_delta: Minimum change to qualify as improvement (default: 0.001)
         monitor_metric: Metric to monitor for early stopping (default: 'Acc@10')
+        hierarchical_loss_weight: Weight for hierarchical constraint loss (default: 0.1)
         **model_kwargs: Model-specific parameters (e.g., num_heads, num_layers, etc.)
     
     Returns:
@@ -161,8 +277,25 @@ def train_model_on_samples(samples,
         print(f"Few-shot training: Using {len(train_pairs)}/{original_train_size} samples ({train_percentage:.1%} of training data)")
 
     # 3) Vocabulary
-    (diag_stoi,_), (proc_stoi,_), (drug_stoi,_), (ccs_stoi, ccs_itos) = build_vocab_from_pairs(train_pairs) # diag_stoi=ICD, ccs_stoi=CCS for labels
+    (diag_stoi, diag_itos), (proc_stoi,_), (drug_stoi,_), (ccs_stoi, ccs_itos) = build_vocab_from_pairs(train_pairs) # diag_stoi=ICD, ccs_stoi=CCS for labels
     vocabs = (diag_stoi, proc_stoi, drug_stoi, ccs_stoi)
+    
+    # 3.5) Build ICD hierarchy structure
+    icd_hierarchy, ccs_groups, icd_to_ccs, additional_codes = build_icd_hierarchy(diag_stoi, ccs_stoi)
+    print(f"\nBuilt ICD hierarchy: {len(icd_hierarchy)} codes with parent-child relationships")
+    print(f"CCS groups: {len(ccs_groups)} distinct CCS codes mapped from ICD codes")
+    
+    # Expand vocab with additional parent codes
+    if additional_codes:
+        print(f"Expanding vocabulary with {len(additional_codes)} additional parent codes")
+        start_idx = len(diag_itos)
+        for code in additional_codes:
+            diag_itos.append(code)
+            diag_stoi[code] = start_idx
+            start_idx += 1
+        # Update vocabs tuple with expanded diag vocab
+        vocabs = (diag_stoi, proc_stoi, drug_stoi, ccs_stoi)
+        print(f"Expanded diag vocab size: {len(diag_stoi)}")
 
     # 4) Vectorization
     (Xtr_diag, Xtr_proc, Xtr_drug), Ytr = prepare_XY(train_pairs, vocabs, use_current_step=use_current_step)
@@ -182,7 +315,6 @@ def train_model_on_samples(samples,
     test_dataset = VariableLengthDataset(Xte_diag, Xte_proc, Xte_drug, Yte)
     
     # Create collate function with max lengths
-    from functools import partial
     collate_fn_with_max = partial(collate_fn, max_diag_len=max_diag_len, max_proc_len=max_proc_len, max_drug_len=max_drug_len)
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_with_max)
@@ -222,6 +354,7 @@ def train_model_on_samples(samples,
     patience_counter = 0
     best_model_state = None
     
+    print(f"Training for {epochs} epochs")
     for ep in range(1, epochs+1):
         model.train()
         epoch_loss = 0.0
@@ -237,7 +370,6 @@ def train_model_on_samples(samples,
             # print(f"batch_X_proc: {batch_X_proc[0]}")
             # print(f"batch_X_drug: {batch_X_drug.shape}")
             # print(f"batch_X_drug: {batch_X_drug[0]}")
-            # exit()
             batch_X_diag = batch_X_diag.to(device)
             batch_X_proc = batch_X_proc.to(device)
             batch_X_drug = batch_X_drug.to(device)
@@ -259,8 +391,27 @@ def train_model_on_samples(samples,
             # Calculate loss using BCE
             loss = nn.functional.binary_cross_entropy_with_logits(logits, y_multi_hot)
             
+            # Add hierarchical loss if weight > 0
+            if hierarchical_loss_weight > 0:
+                # Extract relevant codes from batch for optimized hierarchical loss computation
+                # batch_X_diag uses offset=1 (indices 1 to len(diag_stoi)), 0 is padding
+                unique_indices = torch.unique(batch_X_diag[batch_X_diag != 0])
+                # Convert from 1-indexed to 0-indexed (remove offset)
+                adjusted_indices = unique_indices - 1
+                # Filter valid indices and convert to codes
+                batch_codes = set()
+                for idx in adjusted_indices:
+                    if 0 <= idx < len(diag_itos):
+                        code = diag_itos[idx]
+                        batch_codes.add(code)
+                
+                hier_loss = compute_hierarchical_loss(model, icd_hierarchy, ccs_groups, diag_stoi, diag_itos, device, relevant_codes=batch_codes)
+                total_loss = loss + hierarchical_loss_weight * hier_loss
+            else:
+                total_loss = loss
+            
             opt.zero_grad()
-            loss.backward()
+            total_loss.backward()
             with torch.no_grad():
                 model.reproject_hyperbolic_()  # Reproject all three hyperbolic embeddings
             opt.step()

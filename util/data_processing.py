@@ -13,6 +13,63 @@ from pyhealth.medcode import CrossMap
 mapping = CrossMap("ICD10CM", "CCSCM")
 
 
+def build_icd_hierarchy(diag_stoi, ccs_stoi):
+    """
+    Build ICD-10 hierarchy structure based on prefix rules and CCS mapping.
+    
+    For codes with len > 3, creates direct parent-child pairs where each code 
+    connects only to its immediate parent (code[:-1], code).
+    
+    Args:
+        diag_stoi: Dictionary mapping ICD codes to indices
+        ccs_stoi: Dictionary mapping CCS codes to indices (for reference)
+    
+    Returns:
+        hierarchy: Dictionary {icd_code: [parent]} for direct parent-child relationship
+        ccs_groups: Dictionary {ccs_code: [icd_code1, icd_code2, ...]} for CCS grouping
+        icd_to_ccs: Dictionary {icd_code: ccs_code} for mapping
+        additional_codes: Set of parent codes that need to be added to vocab
+    
+    Example:
+        For "E1090": hierarchy["E1090"] = ["E109"] (only direct parent)
+        For "E109": hierarchy["E109"] = ["E10"] (only direct parent)
+        ccs_groups = {"249.0": ["E109", "E101"], ...}
+    """
+    hierarchy = {}
+    icd_to_ccs = {}
+    ccs_groups = defaultdict(list)
+    additional_codes = set()  # Collect parent codes not in vocab
+    
+    # Build prefix hierarchy for each ICD code
+    for icd_code in diag_stoi.keys():
+        parents = []
+        
+        # Extract direct parent (immediate ancestor)
+        # ICD-10 in MIMIC-IV: no decimals (e.g., "E109", "I100")
+        # For codes with len > 3, create direct parent-child pairs (code[:len-1], code)
+        
+        if len(icd_code) > 3:
+            # Only connect to immediate parent (removing last character)
+            parent_code = icd_code[:-1]
+            parents.append(parent_code)  # Add direct parent code
+            if parent_code not in diag_stoi:
+                additional_codes.add(parent_code)
+        
+        if parents:
+            hierarchy[icd_code] = parents
+        
+        # Map ICD to CCS using CrossMap
+        try:
+            ccs_code = mapping.map(icd_code)
+            if ccs_code and ccs_code[0] in ccs_stoi:
+                icd_to_ccs[icd_code] = ccs_code[0]
+                ccs_groups[ccs_code[0]].append(icd_code)
+        except:
+            pass  # If mapping fails, skip
+    
+    return hierarchy, dict(ccs_groups), icd_to_ccs, additional_codes
+
+
 def diag_prediction_mimic4_fn(patient: Patient):
     """Data processing function for MIMIC-IV diagnosis prediction task"""
     samples = []

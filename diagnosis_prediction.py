@@ -63,6 +63,10 @@ def parse_args():
     parser.add_argument('--dropout', type=float, default=0.3,
                        help='Dropout rate (default: 0.3)')
     
+    # Hierarchical loss parameter
+    parser.add_argument('--hierarchical_loss_weight', type=float, default=0.1,
+                       help='Weight for hierarchical constraint loss (default: 0.1)')
+    
     # Data path
     parser.add_argument('--data_path', type=str, 
                        default="/data/yuyu/data/MIMIC_IV/hosp",
@@ -134,6 +138,7 @@ if __name__ == "__main__":
             patience=args.patience,
             min_delta=args.min_delta,
             monitor_metric=args.monitor_metric,
+            hierarchical_loss_weight=args.hierarchical_loss_weight,
             **model_kwargs
         )
         
