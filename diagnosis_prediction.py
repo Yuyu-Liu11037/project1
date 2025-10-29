@@ -39,7 +39,7 @@ def parse_args():
                        help='Number of training epochs (default: 10)')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed (default: 42)')
-    parser.add_argument('--train_percentage', type=float, default=1.0,
+    parser.add_argument('--train_percentage', type=float, default=0.05,
                        help='Percentage of training data to use for few-shot training')
     parser.add_argument('--batch_size', type=int, default=24,
                        help='Batch size for training')
@@ -118,7 +118,7 @@ if __name__ == "__main__":
             'num_layers': args.num_layers,
         })
      
-    model, vocabs, y_itos, test_metrics = train_model_on_samples(
+    model, vocabs, ccs_itos, test_metrics = train_model_on_samples(
             mimic4_prediction.samples,
             model_type=args.model,
             task=args.task,

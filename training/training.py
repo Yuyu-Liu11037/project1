@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 import random
 import numpy as np
+import geoopt
 from collections import defaultdict
 from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader, TensorDataset, Dataset
@@ -19,36 +20,59 @@ from util.data_processing import (
     prepare_XY, 
     split_by_patient
 )
-from metrics.metrics import evaluate
+from metrics.metrics import evaluate, precision_at_k_visit, accuracy_at_k_code, recall_at_k_micro
 
 
 class VariableLengthDataset(Dataset):
-    """Dataset for variable-length tensors"""
-    def __init__(self, X_list, Y_list):
+    """Dataset for variable-length tensors with three separate code types"""
+    def __init__(self, X_list_diag, X_list_proc, X_list_drug, Y_list):
         """
         Args:
-            X_list: list of 1D tensors (variable length)
-            Y_list: list of 1D tensors (variable length)
+            X_list_diag: list of 1D tensors for diagnosis codes (variable length)
+            X_list_proc: list of 1D tensors for procedure codes (variable length)
+            X_list_drug: list of 1D tensors for drug codes (variable length)
+            Y_list: list of 1D tensors for labels (variable length)
         """
-        self.X_list = X_list
+        self.X_list_diag = X_list_diag
+        self.X_list_proc = X_list_proc
+        self.X_list_drug = X_list_drug
         self.Y_list = Y_list
     
     def __len__(self):
-        return len(self.X_list)
+        return len(self.Y_list)
     
     def __getitem__(self, idx):
-        return self.X_list[idx], self.Y_list[idx]
+        return (self.X_list_diag[idx], self.X_list_proc[idx], self.X_list_drug[idx]), self.Y_list[idx]
 
 
-def collate_fn(batch):
-    """Custom collate function to pad variable-length sequences"""
+def collate_fn(batch, max_diag_len=None, max_proc_len=None, max_drug_len=None):
+    """Custom collate function to pad variable-length sequences for three code types"""
     X_batch, Y_batch = zip(*batch)
     
-    # Pad X sequences
-    X_padded = torch.nn.utils.rnn.pad_sequence(X_batch, batch_first=True, padding_value=0)
+    # Unpack three types of X
+    X_diag_batch = [x[0] for x in X_batch]
+    X_proc_batch = [x[1] for x in X_batch]
+    X_drug_batch = [x[2] for x in X_batch]
     
-    # For Y (multi-label), we need a different approach
-    # Find max length of Y sequences and pad
+    # Pad each type separately to their respective max lengths
+    if max_diag_len is None:
+        max_diag_len = max(len(x) for x in X_diag_batch) if X_diag_batch else 0
+    if max_proc_len is None:
+        max_proc_len = max(len(x) for x in X_proc_batch) if X_proc_batch else 0
+    if max_drug_len is None:
+        max_drug_len = max(len(x) for x in X_drug_batch) if X_drug_batch else 0
+    
+    # Pad each type
+    X_diag_padded = torch.nn.utils.rnn.pad_sequence(X_diag_batch, batch_first=True, padding_value=0)
+    X_diag_padded = X_diag_padded[:, :max_diag_len]  # Truncate if necessary
+    
+    X_proc_padded = torch.nn.utils.rnn.pad_sequence(X_proc_batch, batch_first=True, padding_value=0)
+    X_proc_padded = X_proc_padded[:, :max_proc_len]
+    
+    X_drug_padded = torch.nn.utils.rnn.pad_sequence(X_drug_batch, batch_first=True, padding_value=0)
+    X_drug_padded = X_drug_padded[:, :max_drug_len]
+    
+    # For Y (multi-label), pad to max length
     max_y_len = max(len(y) for y in Y_batch)
     Y_padded_list = []
     for y in Y_batch:
@@ -56,7 +80,7 @@ def collate_fn(batch):
         Y_padded_list.append(padded_y)
     Y_padded = torch.stack(Y_padded_list)
     
-    return X_padded, Y_padded
+    return (X_diag_padded, X_proc_padded, X_drug_padded), Y_padded
 
 
 def train_model_on_samples(samples,
@@ -95,7 +119,7 @@ def train_model_on_samples(samples,
     Returns:
         model: Trained model
         vocabs: Vocabulary dictionaries
-        y_itos: Label index to string mapping
+        ccs_itos: Label index to string mapping (CCS codes)
         test_metrics: Test set evaluation metrics
     """
     # 1) Sort and assemble (current/next)
@@ -137,40 +161,61 @@ def train_model_on_samples(samples,
         print(f"Few-shot training: Using {len(train_pairs)}/{original_train_size} samples ({train_percentage:.1%} of training data)")
 
     # 3) Vocabulary
-    (diag_stoi,_), (proc_stoi,_), (drug_stoi,_), (y_stoi, y_itos) = build_vocab_from_pairs(train_pairs) # y_stoi = diag_stoi
-    vocabs = (diag_stoi, proc_stoi, drug_stoi, y_stoi)
+    (diag_stoi,_), (proc_stoi,_), (drug_stoi,_), (ccs_stoi, ccs_itos) = build_vocab_from_pairs(train_pairs) # diag_stoi=ICD, ccs_stoi=CCS for labels
+    vocabs = (diag_stoi, proc_stoi, drug_stoi, ccs_stoi)
 
     # 4) Vectorization
-    Xtr, Ytr = prepare_XY(train_pairs, vocabs, use_current_step=use_current_step)
-    Xva, Yva = prepare_XY(val_pairs,   vocabs, use_current_step=use_current_step)
-    Xte, Yte = prepare_XY(test_pairs,   vocabs, use_current_step=use_current_step)
+    (Xtr_diag, Xtr_proc, Xtr_drug), Ytr = prepare_XY(train_pairs, vocabs, use_current_step=use_current_step)
+    (Xva_diag, Xva_proc, Xva_drug), Yva = prepare_XY(val_pairs,   vocabs, use_current_step=use_current_step)
+    (Xte_diag, Xte_proc, Xte_drug), Yte = prepare_XY(test_pairs,   vocabs, use_current_step=use_current_step)
+
+    # Calculate max sequence lengths for each code type
+    max_diag_len = max(max(len(x) for x in Xtr_diag), max(len(x) for x in Xva_diag), max(len(x) for x in Xte_diag))
+    max_proc_len = max(max(len(x) for x in Xtr_proc), max(len(x) for x in Xva_proc), max(len(x) for x in Xte_proc))
+    max_drug_len = max(max(len(x) for x in Xtr_drug), max(len(x) for x in Xva_drug), max(len(x) for x in Xte_drug))
+    
+    print(f"Max sequence lengths - Diag: {max_diag_len}, Proc: {max_proc_len}, Drug: {max_drug_len}")
 
     # 5) Create DataLoaders for batch training with custom collate function
-    train_dataset = VariableLengthDataset(Xtr, Ytr)
-    val_dataset = VariableLengthDataset(Xva, Yva)
-    test_dataset = VariableLengthDataset(Xte, Yte)
+    train_dataset = VariableLengthDataset(Xtr_diag, Xtr_proc, Xtr_drug, Ytr)
+    val_dataset = VariableLengthDataset(Xva_diag, Xva_proc, Xva_drug, Yva)
+    test_dataset = VariableLengthDataset(Xte_diag, Xte_proc, Xte_drug, Yte)
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    # Create collate function with max lengths
+    from functools import partial
+    collate_fn_with_max = partial(collate_fn, max_diag_len=max_diag_len, max_proc_len=max_proc_len, max_drug_len=max_drug_len)
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_with_max)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_with_max)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_with_max)
 
     # 6) Model and loss (multi-label)
     # Calculate vocabulary sizes for embedding layers
     # X vocab size = diag_stoi + proc_stoi + drug_stoi + 1 (for padding)
-    # Y vocab size = diag_stoi + 1 (for padding) since Y and diag share the same vocab
-    diag_stoi, proc_stoi, drug_stoi, y_stoi = vocabs
+    # Y vocab size = ccs_stoi + 1 (for padding) - now uses CCS codes only for output
+    diag_stoi, proc_stoi, drug_stoi, ccs_stoi = vocabs
     x_vocab_size = len(diag_stoi) + len(proc_stoi) + len(drug_stoi) + 1  # +1 for padding
-    y_vocab_size = len(diag_stoi) + 1  # +1 for padding (Y shares vocab with diag)
+    y_vocab_size = len(ccs_stoi) + 1  # +1 for padding (Y uses CCS vocab, separate from diag)
     
     device = torch.device('cuda')
     print(f"Using device: {device}")
     print(f"X vocab size: {x_vocab_size}, Y vocab size: {y_vocab_size}")
     
-    model = create_model(model_type, x_vocab_size=x_vocab_size, hidden=hidden, out_dim=y_vocab_size, **model_kwargs)
+    # Add max sequence lengths and vocab sizes to model kwargs
+    model_kwargs_with_max = {**model_kwargs, 
+                             'diag_size': len(diag_stoi),
+                             'proc_size': len(proc_stoi),
+                            }
+    model = create_model(model_type, x_vocab_size=x_vocab_size, hidden=hidden, out_dim=y_vocab_size, **model_kwargs_with_max)
     model = model.to(device) 
     
-    # Loss will be computed in the training loop by converting indices to multi-hot
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    mani_params = [p for p in model.parameters() if isinstance(p, geoopt.ManifoldParameter)]
+    euc_params  = [p for p in model.parameters() if not isinstance(p, geoopt.ManifoldParameter)]
+
+    opt = geoopt.optim.RiemannianAdam([
+        {"params": mani_params, "lr": lr, "weight_decay": wd},
+        {"params": euc_params,  "lr": lr, "weight_decay": wd},
+    ])
 
     # 7) Training loop with batches and early stopping
     best_metric = -float('inf')
@@ -184,11 +229,21 @@ def train_model_on_samples(samples,
         
         # Training phase
         for batch_X, batch_Y in train_loader:
-            # print(batch_X[0])
-            # print(batch_Y[0])
-            batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
-            logits = model(batch_X)  # (batch_size, y_vocab_size)
-            # print(logits[0])
+            # batch_X is a tuple of (batch_X_diag, batch_X_proc, batch_X_drug)
+            batch_X_diag, batch_X_proc, batch_X_drug = batch_X
+            # print(f"batch_X_diag: {batch_X_diag.shape}")
+            # print(f"batch_X_diag: {batch_X_diag[0]}")  # a lot of 0s
+            # print(f"batch_X_proc: {batch_X_proc.shape}")
+            # print(f"batch_X_proc: {batch_X_proc[0]}")
+            # print(f"batch_X_drug: {batch_X_drug.shape}")
+            # print(f"batch_X_drug: {batch_X_drug[0]}")
+            # exit()
+            batch_X_diag = batch_X_diag.to(device)
+            batch_X_proc = batch_X_proc.to(device)
+            batch_X_drug = batch_X_drug.to(device)
+            batch_Y = batch_Y.to(device)
+            
+            logits = model(batch_X_diag, batch_X_proc, batch_X_drug)  # (batch_size, y_vocab_size)
             
             # Convert Y from padded index sequences to multi-hot vectors
             # batch_Y shape: (batch_size, max_y_len) with indices (0 = padding)
@@ -206,6 +261,8 @@ def train_model_on_samples(samples,
             
             opt.zero_grad()
             loss.backward()
+            with torch.no_grad():
+                model.reproject_hyperbolic_()  # Reproject all three hyperbolic embeddings
             opt.step()
             
             epoch_loss += loss.item()
@@ -245,7 +302,7 @@ def train_model_on_samples(samples,
     test_metrics = evaluate_batched(model, test_loader, ks=(10, 20, 30), device=device)
     print("[TEST]", test_metrics)
     
-    return model, vocabs, y_itos, test_metrics
+    return model, vocabs, ccs_itos, test_metrics
 
 
 def evaluate_batched(model, data_loader, ks=(10, 20, 30), device=None):
@@ -262,9 +319,6 @@ def evaluate_batched(model, data_loader, ks=(10, 20, 30), device=None):
     Returns:
         Dictionary containing evaluation metrics
     """
-    import torch
-    import numpy as np
-    from metrics.metrics import precision_at_k_visit, accuracy_at_k_code, recall_at_k_micro
     
     model.eval()
     all_logits = []
@@ -276,8 +330,13 @@ def evaluate_batched(model, data_loader, ks=(10, 20, 30), device=None):
     
     with torch.no_grad():
         for batch_X, batch_Y in data_loader:
-            batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
-            logits = model(batch_X)
+            batch_X_diag, batch_X_proc, batch_X_drug = batch_X
+            batch_X_diag = batch_X_diag.to(device)
+            batch_X_proc = batch_X_proc.to(device)
+            batch_X_drug = batch_X_drug.to(device)
+            batch_Y = batch_Y.to(device)
+            
+            logits = model(batch_X_diag, batch_X_proc, batch_X_drug)
             all_logits.append(logits.cpu())
             
             # Convert padded index sequences to multi-hot vectors
@@ -309,4 +368,3 @@ def evaluate_batched(model, data_loader, ks=(10, 20, 30), device=None):
         metrics[f"Recall@{k}"] = r_at_k
     
     return metrics
-

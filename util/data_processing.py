@@ -108,10 +108,12 @@ def build_pairs(samples_by_pid, task="current"):
 def build_vocab_from_pairs(pairs):
     """Build vocabulary from training pairs
     
-    Note: Y (labels) and diagnosis share the same vocab. 
-    Labels (CCS codes) are merged into diagnosis vocab.
+    Note: 
+    - cond_hist uses ICD codes (for input features)
+    - Labels use CCS codes (for output)
+    - These are now kept separate: ICD vocab for diag, CCS vocab for labels
     """
-    diag_c, proc_c, drug_c = Counter(), Counter(), Counter()
+    diag_c, proc_c, drug_c, ccs_c = Counter(), Counter(), Counter(), Counter()
     
     for s, y in pairs:
         for visit_codes in s["cond_hist"]:   # Historical ICD diagnoses (last step is empty to prevent leakage)
@@ -120,21 +122,21 @@ def build_vocab_from_pairs(pairs):
             proc_c.update(visit_codes)
         for visit_codes in s["drugs"]:       # Each step is an ATC3 list
             drug_c.update(visit_codes)
-        # Merge labels into diagnosis vocab since they share the same tokenizer
-        diag_c.update(y)                     # Labels (CCS) added to diagnosis vocab
+        # Labels are CCS codes - keep separate from ICD diag vocab
+        ccs_c.update(y)                      # Labels (CCS) for output only
     
     def mk_vocab(cnt):
         itos = [c for c, _ in cnt.most_common()]
         stoi = {c:i for i,c in enumerate(itos)}
         return stoi, itos
     
-    # Y vocab is now the same as diag vocab
-    diag_stoi, diag_itos = mk_vocab(diag_c)
+    # Separate vocabularies: ICD for input, CCS for output
+    diag_stoi, diag_itos = mk_vocab(diag_c)  # ICD codes for cond_hist
     proc_stoi, proc_itos = mk_vocab(proc_c)
     drug_stoi, drug_itos = mk_vocab(drug_c)
+    ccs_stoi, ccs_itos = mk_vocab(ccs_c)     # CCS codes for labels
     
-    # Return diag_vocab as both diag_stoi and y_stoi since they share the same tokenizer
-    return (diag_stoi, diag_itos), (proc_stoi, proc_itos), (drug_stoi, drug_itos), (diag_stoi, diag_itos)
+    return (diag_stoi, diag_itos), (proc_stoi, proc_itos), (drug_stoi, drug_itos), (ccs_stoi, ccs_itos)
 
 
 class CodeTokenizer:
@@ -207,31 +209,30 @@ def create_tokenizers(vocabs):
     Create tokenizers for diagnosis, procedure, drug codes, and labels
     
     Args:
-        vocabs: Tuple of (diag_stoi, proc_stoi, drug_stoi, y_stoi)
-        Note: y_stoi is the same as diag_stoi (they share the same vocab)
+        vocabs: Tuple of (diag_stoi, proc_stoi, drug_stoi, ccs_stoi)
+        - diag_stoi: ICD codes for cond_hist (input)
+        - ccs_stoi: CCS codes for labels (output)
     
     Returns:
-        Tuple of (diag_tokenizer, proc_tokenizer, drug_tokenizer, y_tokenizer)
+        Tuple of (diag_tokenizer, proc_tokenizer, drug_tokenizer, ccs_tokenizer)
     """
-    diag_stoi, proc_stoi, drug_stoi, y_stoi = vocabs
+    diag_stoi, proc_stoi, drug_stoi, ccs_stoi = vocabs
     
     # Reserve 0 for padding, so start at 1
-    # Y (labels) shares the same tokenizer as diagnosis since they use the same vocab
-    diag_tokenizer = CodeTokenizer(diag_stoi, offset=1)
-    y_tokenizer = diag_tokenizer  # Same tokenizer for Y and diagnosis
+    # With separate embeddings, each type uses local indexing (0-indexed in its own vocab)
+    diag_tokenizer = CodeTokenizer(diag_stoi, offset=1)  # ICD codes for input
+    ccs_tokenizer = CodeTokenizer(ccs_stoi, offset=1)    # CCS codes for output
     
-    # Procedure codes come after diagnosis codes
-    proc_tokenizer = CodeTokenizer(proc_stoi, offset=len(diag_stoi) + 1)
+    # Each code type now uses local indexing
+    proc_tokenizer = CodeTokenizer(proc_stoi, offset=1)
+    drug_tokenizer = CodeTokenizer(drug_stoi, offset=1)
     
-    # Drug codes come after procedure codes
-    drug_tokenizer = CodeTokenizer(drug_stoi, offset=len(diag_stoi) + len(proc_stoi) + 1)
-    
-    return diag_tokenizer, proc_tokenizer, drug_tokenizer, y_tokenizer
+    return diag_tokenizer, proc_tokenizer, drug_tokenizer, ccs_tokenizer
 
 
 def vectorize_pair(s, y_codes, vocabs, use_current_step=False):
     """Vectorize sample pair - returns indices instead of multi-hot vectors"""
-    diag_stoi, proc_stoi, drug_stoi, y_stoi = vocabs
+    diag_stoi, proc_stoi, drug_stoi, ccs_stoi = vocabs
     
     # Admission prediction: don't look at current step's proc/drug; discharge prediction can look
     if use_current_step:
@@ -241,33 +242,36 @@ def vectorize_pair(s, y_codes, vocabs, use_current_step=False):
         proc_hist = s["procedures"][:-1] if len(s["procedures"])>0 else []
         drug_hist = s["drugs"][:-1] if len(s["drugs"])>0 else []
 
-    # Create tokenizers (Y shares the same tokenizer as diagnosis)
-    diag_tokenizer, proc_tokenizer, drug_tokenizer, y_tokenizer = create_tokenizers(vocabs)
+    # Create tokenizers (CCS for labels, ICD for input)
+    diag_tokenizer, proc_tokenizer, drug_tokenizer, ccs_tokenizer = create_tokenizers(vocabs)
     
     # Tokenize each type of code
-    x_diag_indices = diag_tokenizer.encode(s["cond_hist"])
+    x_diag_indices = diag_tokenizer.encode(s["cond_hist"])  # ICD codes for input
     x_proc_indices = proc_tokenizer.encode(proc_hist)
     x_drug_indices = drug_tokenizer.encode(drug_hist)
     
-    # Flatten all indices into a single list
-    X_indices = x_diag_indices + x_proc_indices + x_drug_indices
-    X = torch.tensor(X_indices, dtype=torch.long) if len(X_indices) > 0 else torch.tensor([0], dtype=torch.long)
+    # Return three separate tensors (use 0 as padding)
+    X_diag = torch.tensor(x_diag_indices, dtype=torch.long) if len(x_diag_indices) > 0 else torch.tensor([0], dtype=torch.long)
+    X_proc = torch.tensor(x_proc_indices, dtype=torch.long) if len(x_proc_indices) > 0 else torch.tensor([0], dtype=torch.long)
+    X_drug = torch.tensor(x_drug_indices, dtype=torch.long) if len(x_drug_indices) > 0 else torch.tensor([0], dtype=torch.long)
 
-    # For Y, use the shared diag_tokenizer (they use the same vocab)
-    y_indices = y_tokenizer.encode([y_codes])
+    # For Y, use CCS tokenizer (separate vocab from ICD diag)
+    y_indices = ccs_tokenizer.encode([y_codes])
     y = torch.tensor(y_indices, dtype=torch.long) if len(y_indices) > 0 else torch.tensor([0], dtype=torch.long)
     
-    return X, y
+    return (X_diag, X_proc, X_drug), y
 
 
 def prepare_XY(pairs, vocabs, use_current_step=False):
     """Prepare training data X and Y as variable-length sequences"""
-    Xs, Ys = [], []
+    Xs_diag, Xs_proc, Xs_drug, Ys = [], [], [], []
     for s, y_codes in pairs:
-        X, y = vectorize_pair(s, y_codes, vocabs, use_current_step=use_current_step)
-        Xs.append(X)
+        (X_diag, X_proc, X_drug), y = vectorize_pair(s, y_codes, vocabs, use_current_step=use_current_step)
+        Xs_diag.append(X_diag)
+        Xs_proc.append(X_proc)
+        Xs_drug.append(X_drug)
         Ys.append(y)
-    return Xs, Ys
+    return (Xs_diag, Xs_proc, Xs_drug), Ys
 
 
 def split_by_patient(pairs, test_size=0.2, val_size=0.1, seed=42):
