@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import geoopt
 import math
+from model.hierarchical_embedding import HierarchicalHyperbolicEmbedding
 
 
 class HyperbolicEmbedding(nn.Module):
@@ -48,15 +49,35 @@ class TransformerModel(nn.Module):
                  diag_size, proc_size, embed_dim=256,
                  num_heads=8, num_layers=3, p=0.3,
                  c_diag=1.0, c_proc=1.0, c_third=1.0,
-                 max_diag_len=None, max_proc_len=None, max_drug_len=None):
+                 max_diag_len=None, max_proc_len=None, max_drug_len=None,
+                 use_hierarchical_structure=False,
+                 ancestors_dict=None, diag_itos=None,
+                 hierarchical_mode="weighted_sum", max_depth=None):
         super().__init__()
         V = x_vocab_size
         D = diag_size
         P = proc_size
         T = V - (D + P)  # 第三段大小
 
-        # 三段各一套 hyperbolic embedding（局部索引0留给padding）
-        self.emb_diag  = HyperbolicEmbedding(D + 1, embed_dim, c=c_diag,  padding_idx=0)
+        # Conditional hierarchical embedding for diagnosis codes
+        self.use_hierarchical_structure = use_hierarchical_structure
+        if use_hierarchical_structure and ancestors_dict is not None and diag_itos is not None:
+            # Build itos mapping: index 0 = padding, index 1+ = codes from diag_itos
+            # diag_itos is a list where diag_itos[i] is the code string at vocab index i
+            # In the model, index 0 is padding, index 1 maps to diag_itos[0], etc.
+            itos = {0: "<pad>"}
+            for i in range(len(diag_itos)):
+                itos[i + 1] = diag_itos[i]
+            self.emb_diag = HierarchicalHyperbolicEmbedding(
+                D + 1, embed_dim, ancestors_dict=ancestors_dict,
+                itos=itos, c=c_diag, padding_idx=0,
+                mode=hierarchical_mode, max_depth=max_depth
+            )
+        else:
+            # Standard hyperbolic embedding
+            self.emb_diag = HyperbolicEmbedding(D + 1, embed_dim, c=c_diag, padding_idx=0)
+        
+        # Procedure and drug codes remain standard
         self.emb_proc  = HyperbolicEmbedding(P + 1, embed_dim, c=c_proc,  padding_idx=0)
         self.emb_third = HyperbolicEmbedding(T + 1, embed_dim, c=c_third, padding_idx=0)
 
@@ -130,7 +151,9 @@ class TransformerModel(nn.Module):
 
     @torch.no_grad()
     def reproject_hyperbolic_(self):
-        self.emb_diag.reproject_()
+        # Handle both standard and hierarchical embeddings
+        if hasattr(self.emb_diag, 'reproject_'):
+            self.emb_diag.reproject_()
         self.emb_proc.reproject_()
         self.emb_third.reproject_()
 
