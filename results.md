@@ -1,5 +1,6 @@
+Euclidean embedding:
 100%:
-
+5%:
 
 Hyperbolic embedding w/o prior:
 100%:

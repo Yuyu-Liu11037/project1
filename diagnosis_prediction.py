@@ -64,8 +64,8 @@ def parse_args():
                        help='Dropout rate (default: 0.3)')
     
     # Hierarchical loss parameter
-    parser.add_argument('--hierarchical_loss_weight', type=float, default=0.1,
-                       help='Weight for hierarchical constraint loss (default: 0.1)')
+    parser.add_argument('--hierarchical_loss_weight', type=float, default=0.5,
+                       help='Weight for hierarchical constraint loss')
     
     # Data path
     parser.add_argument('--data_path', type=str, 
@@ -107,6 +107,7 @@ if __name__ == "__main__":
         root=args.data_path,
         tables=["diagnoses_icd", "procedures_icd", "prescriptions"],
         code_mapping={"NDC": ("ATC", {"target_kwargs": {"level": 3}})},
+        # refresh_cache=True,
     )
 
     mimic4_prediction = mimic4_base.set_task(diag_prediction_mimic4_fn)

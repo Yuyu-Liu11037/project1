@@ -37,14 +37,6 @@ class HyperbolicEmbedding(nn.Module):
 
 
 class TransformerModel(nn.Module):
-    """
-    三段区间分别做 hyperbolic embedding 的多标签分类模型
-    区间：
-      1) 1..D
-      2) D+1..D+P
-      3) D+P+1..V
-    其余补0
-    """
     def __init__(self, x_vocab_size, hidden, out_dim, *,
                  diag_size, proc_size, embed_dim=256,
                  num_heads=8, num_layers=3, p=0.3,

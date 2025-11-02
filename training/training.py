@@ -2,6 +2,7 @@
 Training module
 Contains main model training functions
 """
+from itertools import combinations
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -88,7 +89,7 @@ def collate_fn(batch, max_diag_len=None, max_proc_len=None, max_drug_len=None):
 def compute_hierarchical_loss(model, icd_hierarchy, ccs_groups, diag_stoi, diag_itos, device='cuda', relevant_codes=None):
     """
     Compute hierarchical constraint loss in hyperbolic space.
-    
+
     Args:
         model: The model with hyperbolic embeddings
         icd_hierarchy: Dictionary {icd_code: [parent]} for prefix hierarchy
@@ -97,104 +98,113 @@ def compute_hierarchical_loss(model, icd_hierarchy, ccs_groups, diag_stoi, diag_
         diag_itos: Dictionary mapping indices to ICD codes
         device: Device for computation
         relevant_codes: Set of codes to compute constraints for (if None, compute for all)
-    
+
     Returns:
         hierarchical_loss: Scalar tensor with hyperbolic distance constraints
     """
-    total_loss = 0.0
-    count = 0
-    
-    # Get the hyperbolic embedding layer for diagnosis codes
+    # ---- Setup & defaults ----
     emb_diag = model.emb_diag
     ball = emb_diag.ball
-    
-    # Build set of relevant codes and their ancestors for batch-based optimization
+    emb_weight = emb_diag.weight  # (V, D)
+    emb_device = emb_weight.device
+    emb_dtype = emb_weight.dtype
+
+    total_loss = torch.tensor(0.0, device=emb_device, dtype=emb_dtype)
+    count = 0
+
+    # ---- Build relevant set (include ancestors) ----
     if relevant_codes is not None:
-        # Collect all ancestors of relevant codes
         processed = set()
-        codes_to_process = relevant_codes.copy()
-        
-        while codes_to_process:
-            code = codes_to_process.pop()
-            if code in processed or code not in icd_hierarchy:
+        stack = set(relevant_codes)  # copy to mutate
+        while stack:
+            code = stack.pop()
+            if code in processed:
                 continue
             processed.add(code)
-            # Add parent codes to be processed recursively
-            for parent in icd_hierarchy[code]:
-                if parent not in processed and parent in diag_stoi:
-                    codes_to_process.add(parent)
-        
+            # Only expand if we have hierarchy info for this code
+            parents = icd_hierarchy.get(code, [])
+            for p in parents:
+                # Only explore known/embeddable parents
+                if p in diag_stoi and p not in processed:
+                    stack.add(p)
         relevant_codes_set = processed
     else:
-        relevant_codes_set = None  # Process all codes
-    
-    # Constraint 1: ICD tree hierarchy (child close to parent + child deeper than parent)
+        relevant_codes_set = None
+
+    # ======================
+    # Constraint 1: ICD tree
+    # ======================
+    child_parent_pairs = []
     for child_code, parent_codes in icd_hierarchy.items():
         if child_code not in diag_stoi:
             continue
-        
-        # Only process if relevant_codes is None (all) or child_code is in relevant set
         if relevant_codes_set is not None and child_code not in relevant_codes_set:
             continue
-        
-        child_idx = diag_stoi[child_code]
-        child_emb = emb_diag.weight[child_idx]  # Hyperbolic embedding
-        
+
         for parent_code in parent_codes:
             if parent_code not in diag_stoi:
                 continue
-            
-            parent_idx = diag_stoi[parent_code]
-            parent_emb = emb_diag.weight[parent_idx]
-            
-            # Constraint 1a: Child should be close to parent (distance constraint)
-            dist_parent_child = ball.dist(child_emb.unsqueeze(0), parent_emb.unsqueeze(0))
-            
-            # Constraint 1b: Child should be deeper than parent (closer to boundary)
-            # In hyperbolic space, distance from origin represents depth in the tree
-            dist_child_origin = torch.norm(child_emb)
-            dist_parent_origin = torch.norm(parent_emb)
-            
-            # Child should be further from origin than parent
-            # Use relu to penalize when child is NOT deeper than parent
-            depth_penalty = torch.relu(dist_parent_origin - dist_child_origin)
-            
-            # Total constraint loss for this pair
-            pair_loss = dist_parent_child + depth_penalty
-            total_loss += pair_loss
-            count += 1
-    
-    # Constraint 2: CCS grouping (ICDs mapped to same CCS should be close)
-    for ccs_code, icd_codes in ccs_groups.items():
-        if len(icd_codes) < 2:  # Need at least 2 codes to form a constraint
+            if relevant_codes_set is not None and parent_code not in relevant_codes_set:
+                # parent may still be needed for depth/close constraint; include even if not in set?
+                # The original code required parent in diag_stoi only; keep identical semantics:
+                pass
+            child_parent_pairs.append((diag_stoi[child_code], diag_stoi[parent_code]))
+
+    if child_parent_pairs:
+        idx_child = torch.tensor([c for c, _ in child_parent_pairs], device=emb_device)
+        idx_parent = torch.tensor([p for _, p in child_parent_pairs], device=emb_device)
+
+        child_emb = emb_weight.index_select(0, idx_child)  # (N, D)
+        parent_emb = emb_weight.index_select(0, idx_parent)  # (N, D)
+
+        # 1a) hyperbolic distance child-parent
+        dist_cp = ball.dist(child_emb, parent_emb)  # (N,)
+
+        # 1b) depth penalty: child should be deeper than parent (euclidean norm as in original)
+        # Keep identical semantics to original implementation
+        child_r = torch.linalg.vector_norm(child_emb, dim=-1)
+        parent_r = torch.linalg.vector_norm(parent_emb, dim=-1)
+        depth_penalty = torch.relu(parent_r - child_r)
+
+        total_loss = total_loss + (dist_cp + depth_penalty).sum()
+        count += dist_cp.numel()
+
+    # ==========================
+    # Constraint 2: CCS grouping
+    # ==========================
+    # We'll batch by CCS group but compute all pairwise distances per group in one shot.
+    for _, icd_codes in ccs_groups.items():
+        if len(icd_codes) < 2:
             continue
-        
-        # Compute pairwise distances between all ICDs in this CCS group
-        # Only include codes in relevant set if filtering is enabled
+
         if relevant_codes_set is not None:
-            valid_icd_indices = [diag_stoi[code] for code in icd_codes 
-                               if code in diag_stoi and code in relevant_codes_set]
+            valid_idx = [diag_stoi[c] for c in icd_codes if c in diag_stoi and c in relevant_codes_set]
         else:
-            valid_icd_indices = [diag_stoi[code] for code in icd_codes if code in diag_stoi]
-        
-        if len(valid_icd_indices) < 2:
+            valid_idx = [diag_stoi[c] for c in icd_codes if c in diag_stoi]
+
+        if len(valid_idx) < 2:
             continue
-        
-        for i in range(len(valid_icd_indices)):
-            for j in range(i + 1, len(valid_icd_indices)):
-                idx1, idx2 = valid_icd_indices[i], valid_icd_indices[j]
-                emb1 = emb_diag.weight[idx1]
-                emb2 = emb_diag.weight[idx2]
-                
-                # Compute hyperbolic distance
-                dist = ball.dist(emb1.unsqueeze(0), emb2.unsqueeze(0))
-                total_loss += dist
-                count += 1
-    
+
+        # Build all pair indices once
+        pair_idx = list(combinations(valid_idx, 2))
+        if not pair_idx:
+            continue
+
+        idx1 = torch.tensor([i for i, _ in pair_idx], device=emb_device)
+        idx2 = torch.tensor([j for _, j in pair_idx], device=emb_device)
+
+        emb1 = emb_weight.index_select(0, idx1)
+        emb2 = emb_weight.index_select(0, idx2)
+
+        dist_pairs = ball.dist(emb1, emb2)  # (M,)
+        total_loss = total_loss + dist_pairs.sum()
+        count += dist_pairs.numel()
+
     if count > 0:
+        # Match original return type/device/dtype behavior
         return total_loss / count
     else:
-        return torch.tensor(0.0, device=device)
+        return torch.tensor(0.0, device=emb_device, dtype=emb_dtype)
 
 
 def train_model_on_samples(samples,
@@ -358,6 +368,7 @@ def train_model_on_samples(samples,
     for ep in range(1, epochs+1):
         model.train()
         epoch_loss = 0.0
+        epoch_hier_loss = 0.0
         num_batches = 0
         
         # Training phase
@@ -404,11 +415,12 @@ def train_model_on_samples(samples,
                     if 0 <= idx < len(diag_itos):
                         code = diag_itos[idx]
                         batch_codes.add(code)
-                
                 hier_loss = compute_hierarchical_loss(model, icd_hierarchy, ccs_groups, diag_stoi, diag_itos, device, relevant_codes=batch_codes)
                 total_loss = loss + hierarchical_loss_weight * hier_loss
+                epoch_hier_loss += hier_loss.item()
             else:
                 total_loss = loss
+                epoch_hier_loss += 0.0
             
             opt.zero_grad()
             total_loss.backward()
@@ -420,13 +432,14 @@ def train_model_on_samples(samples,
             num_batches += 1
 
         avg_loss = epoch_loss / num_batches
+        avg_hier_loss = epoch_hier_loss / num_batches
 
         # Validation phase
         if ep % 1 == 0:
             val_metrics = evaluate_batched(model, val_loader, ks=(10, 20, 30), device=device)
             current_metric = val_metrics[monitor_metric]
             
-            print(f"Epoch {ep:02d} | avg_loss={avg_loss:.4f} | "
+            print(f"Epoch {ep:02d} | avg_loss={avg_loss:.4f} | hier_loss={avg_hier_loss:.4f} | "
                   f"val P@10={val_metrics['P@10']:.4f} Acc@10={val_metrics['Acc@10']:.4f} "
                   f"P@20={val_metrics['P@20']:.4f} Acc@20={val_metrics['Acc@20']:.4f} "
                   f"P@30={val_metrics['P@30']:.4f} Acc@30={val_metrics['Acc@30']:.4f}")
