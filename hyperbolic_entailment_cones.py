@@ -132,6 +132,243 @@ class PoincareOps:
         
         return torch.acosh(x)
 
+    @staticmethod
+    def log_map(x: torch.Tensor, y: torch.Tensor, c: float = 1.0, eps: float = 1e-15) -> torch.Tensor:
+        """
+        Logarithmic map: maps point y in Poincaré ball to tangent space at x.
+        log_x(y) = (2/λ_x) * artanh(||-x ⊕_c y||) * (-x ⊕_c y) / ||-x ⊕_c y||
+        
+        Args:
+            x: Base point in Poincaré ball (..., d)
+            y: Point to map to tangent space (..., d)
+            c: Curvature parameter (default: 1.0)
+            eps: Small epsilon for numerical stability
+            
+        Returns:
+            Vector in tangent space at x (..., d)
+        """
+        # Compute -x ⊕_c y (Möbius addition of -x and y)
+        # Direct computation to avoid circular dependency
+        neg_x = -x
+        neg_x2 = (neg_x * neg_x).sum(dim=-1, keepdim=True)
+        y2 = (y * y).sum(dim=-1, keepdim=True)
+        neg_xy = (neg_x * y).sum(dim=-1, keepdim=True)
+        
+        denominator = 1.0 + 2.0 * c * neg_xy + c * c * neg_x2 * y2
+        denominator = denominator.clamp(min=1e-15)
+        
+        numerator_x = (1.0 + 2.0 * c * neg_xy + c * y2) * neg_x
+        numerator_y = (1.0 - c * neg_x2) * y
+        mobius_sum = (numerator_x + numerator_y) / denominator
+        mobius_sum = PoincareOps.proj_to_ball(mobius_sum, max_norm=1.0 - 1e-5)
+        
+        # Compute norm of Möbius sum
+        mobius_norm = mobius_sum.norm(dim=-1, keepdim=True).clamp(min=eps)
+        
+        # Compute artanh of norm
+        artanh_arg = (mobius_norm).clamp(min=eps, max=1.0 - eps)
+        artanh_val = torch.atanh(artanh_arg)
+        
+        # Get λ_x
+        lam = PoincareOps.lambda_x(x)
+        
+        # Compute log map
+        log_map_result = (2.0 / lam) * artanh_val * (mobius_sum / mobius_norm)
+        
+        # Safety check
+        if torch.isnan(log_map_result).any() or torch.isinf(log_map_result).any():
+            return torch.zeros_like(y)
+        
+        return log_map_result
+
+    @staticmethod
+    def mobius_add(x: torch.Tensor, y: torch.Tensor, c: float = 1.0) -> torch.Tensor:
+        """
+        Möbius addition in Poincaré ball: x ⊕_c y
+        Formula: ((1 + 2c<x,y> + c||y||²)x + (1 - c||x||²)y) / (1 + 2c<x,y> + c²||x||²||y||²)
+        
+        Args:
+            x: First point (..., d)
+            y: Second point (..., d)
+            c: Curvature parameter (default: 1.0)
+            
+        Returns:
+            Möbius sum x ⊕_c y (..., d)
+        """
+        x2 = (x * x).sum(dim=-1, keepdim=True)
+        y2 = (y * y).sum(dim=-1, keepdim=True)
+        xy = (x * y).sum(dim=-1, keepdim=True)
+        
+        denominator = 1.0 + 2.0 * c * xy + c * c * x2 * y2
+        denominator = denominator.clamp(min=1e-15)
+        
+        numerator_x = (1.0 + 2.0 * c * xy + c * y2) * x
+        numerator_y = (1.0 - c * x2) * y
+        
+        result = (numerator_x + numerator_y) / denominator
+        
+        # Project back to ball for numerical stability
+        result = PoincareOps.proj_to_ball(result, max_norm=1.0 - 1e-5)
+        
+        # Safety check
+        if torch.isnan(result).any() or torch.isinf(result).any():
+            return x
+        
+        return result
+
+    @staticmethod
+    def mobius_matvec(M: torch.Tensor, x: torch.Tensor, c: float = 1.0) -> torch.Tensor:
+        """
+        Möbius matrix-vector multiplication: M ⊗_c x
+        Formula: (1/√c) * tanh(||M·artanh(√c·||x||)·x/||x||||) * M·artanh(√c·||x||)·x/||x|| / ||M·artanh(√c·||x||)·x/||x||||
+        
+        Simplified version for c=1: tanh(||M·v||) * M·v / ||M·v|| where v = artanh(||x||) * x / ||x||
+        
+        Args:
+            M: Matrix (..., out_dim, in_dim) or (out_dim, in_dim)
+            x: Vector in Poincaré ball (..., in_dim)
+            c: Curvature parameter (default: 1.0)
+            
+        Returns:
+            Result of Möbius matrix-vector multiplication (..., out_dim)
+        """
+        # Handle batched case
+        x_norm = x.norm(dim=-1, keepdim=True).clamp(min=1e-15, max=1.0 - 1e-5)
+        
+        # Compute artanh(||x||) * x / ||x|| (unit direction scaled by artanh of norm)
+        artanh_norm = torch.atanh(x_norm.clamp(min=1e-15, max=1.0 - 1e-5))
+        v = artanh_norm * (x / x_norm)
+        
+        # Apply matrix multiplication M·v
+        # Handle different shapes of M
+        if len(M.shape) == 2:
+            # M is (out_dim, in_dim), x is (..., in_dim)
+            Mv = torch.matmul(v, M.t())  # (..., out_dim)
+        else:
+            # M is (..., out_dim, in_dim)
+            Mv = torch.matmul(v.unsqueeze(-2), M.transpose(-2, -1)).squeeze(-2)  # (..., out_dim)
+        
+        # Compute norm of Mv
+        Mv_norm = Mv.norm(dim=-1, keepdim=True).clamp(min=1e-15)
+        
+        # Apply tanh and normalize
+        result = (torch.tanh(Mv_norm) / Mv_norm) * Mv
+        
+        # Project back to ball
+        result = PoincareOps.proj_to_ball(result, max_norm=1.0 - 1e-5)
+        
+        # Safety check
+        if torch.isnan(result).any() or torch.isinf(result).any():
+            return x
+        
+        return result
+
+    @staticmethod
+    def einstein_midpoint(x: torch.Tensor, weights: torch.Tensor = None, mask: torch.Tensor = None, c: float = 1.0, eps: float = 1e-15) -> torch.Tensor:
+        """
+        Einstein midpoint (weighted average in hyperbolic space).
+        Uses iterative computation based on Möbius addition.
+        
+        Args:
+            x: Points in Poincaré ball (batch_size, seq_len, dim) or (seq_len, dim)
+            weights: Optional weights (batch_size, seq_len) or (seq_len,)
+            mask: Optional mask indicating valid points (batch_size, seq_len) or (seq_len,)
+            c: Curvature parameter (default: 1.0)
+            eps: Small epsilon for numerical stability
+            
+        Returns:
+            Einstein midpoint (batch_size, dim) or (dim,)
+        """
+        # Handle different input shapes
+        if len(x.shape) == 2:
+            # (seq_len, dim) -> add batch dimension
+            x = x.unsqueeze(0)
+            needs_squeeze = True
+        else:
+            needs_squeeze = False
+        
+        batch_size, seq_len, dim = x.shape
+        
+        # Initialize weights
+        if weights is None:
+            weights = torch.ones(batch_size, seq_len, device=x.device, dtype=x.dtype)
+        
+        # Apply mask if provided
+        if mask is not None:
+            if len(mask.shape) == 1:
+                mask = mask.unsqueeze(0)
+            weights = weights * mask.float()
+        
+        # Normalize weights
+        weight_sum = weights.sum(dim=-1, keepdim=True).clamp(min=eps)
+        weights = weights / weight_sum
+        
+        # Initialize midpoint as weighted average (in tangent space)
+        # First, map all points to tangent space at origin, then average
+        # For simplicity, use iterative Möbius addition
+        # Start with first weighted point
+        valid_indices = (weights > eps).any(dim=0)
+        if not valid_indices.any():
+            # All weights are zero, return zero vector
+            midpoint = torch.zeros(batch_size, dim, device=x.device, dtype=x.dtype)
+            if needs_squeeze:
+                return midpoint.squeeze(0)
+            return midpoint
+        
+        # Use weighted combination: iterate with Möbius addition
+        # Simplified: use weighted average in tangent space
+        # Map points to tangent space at origin, average, then map back
+        midpoints = []
+        for b in range(batch_size):
+            # Get valid points for this batch
+            batch_weights = weights[b]  # (seq_len,)
+            batch_x = x[b]  # (seq_len, dim)
+            
+            # Find non-zero weights
+            valid = batch_weights > eps
+            if not valid.any():
+                midpoints.append(torch.zeros(dim, device=x.device, dtype=x.dtype))
+                continue
+            
+            valid_x = batch_x[valid]  # (num_valid, dim)
+            valid_weights = batch_weights[valid]  # (num_valid,)
+            valid_weights = valid_weights / valid_weights.sum()
+            
+            # Map to tangent space at origin, then weighted average
+            # For each point: log_0(x) = artanh(||x||) * x / ||x||
+            log_points = []
+            for i in range(len(valid_x)):
+                point = valid_x[i]
+                point_norm = point.norm().clamp(min=eps, max=1.0 - 1e-5)
+                if point_norm < eps:
+                    log_point = torch.zeros_like(point)
+                else:
+                    artanh_norm = torch.atanh(point_norm.clamp(min=1e-15, max=1.0 - 1e-5))
+                    log_point = artanh_norm * (point / point_norm)
+                log_points.append(valid_weights[i] * log_point)
+            
+            # Sum in tangent space
+            log_midpoint = sum(log_points)
+            
+            # Map back to Poincaré ball: exp_0(v) = tanh(||v||) * v / ||v||
+            log_norm = log_midpoint.norm().clamp(min=eps)
+            midpoint = torch.tanh(log_norm) * (log_midpoint / log_norm)
+            
+            # Project to ball
+            midpoint = PoincareOps.proj_to_ball(midpoint.unsqueeze(0), max_norm=1.0 - 1e-5).squeeze(0)
+            midpoints.append(midpoint)
+        
+        result = torch.stack(midpoints)  # (batch_size, dim)
+        
+        if needs_squeeze:
+            result = result.squeeze(0)
+        
+        # Safety check
+        if torch.isnan(result).any() or torch.isinf(result).any():
+            return torch.zeros_like(result)
+        
+        return result
+
 
 # =========================
 # Hyperbolic Entailment Cones model

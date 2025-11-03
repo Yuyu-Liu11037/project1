@@ -132,19 +132,20 @@ def train_diagnosis_model_on_samples(samples,
 
     # 4) Vectorization
     if use_hyperbolic_embeddings:
-        print(f"Using hyperbolic embeddings with max_seq_length={max_seq_length}")
-        Xtr, mask_tr, Ytr = prepare_XY(train_pairs, vocabs, use_current_step=use_current_step, 
-                                      use_hyperbolic_embeddings=True, embedding_file=embedding_file, 
-                                      max_seq_length=max_seq_length)
-        Xva, mask_va, Yva = prepare_XY(val_pairs, vocabs, use_current_step=use_current_step,
-                                      use_hyperbolic_embeddings=True, embedding_file=embedding_file,
-                                      max_seq_length=max_seq_length)
-        Xte, mask_te, Yte = prepare_XY(test_pairs, vocabs, use_current_step=use_current_step,
-                                     use_hyperbolic_embeddings=True, embedding_file=embedding_file,
-                                     max_seq_length=max_seq_length)
-        print(f"\nTrain data shape: {Xtr.shape}")  # (batch_size, max_seq_length, embedding_dim)
-        print(f"Train mask shape: {mask_tr.shape}")  # (batch_size, max_seq_length)
+        print(f"Using hyperbolic embeddings with variable-length sequences")
+        Xtr, Ytr = prepare_XY(train_pairs, vocabs, use_current_step=use_current_step, 
+                              use_hyperbolic_embeddings=True, embedding_file=embedding_file)
+        Xva, Yva = prepare_XY(val_pairs, vocabs, use_current_step=use_current_step,
+                              use_hyperbolic_embeddings=True, embedding_file=embedding_file)
+        Xte, Yte = prepare_XY(test_pairs, vocabs, use_current_step=use_current_step,
+                             use_hyperbolic_embeddings=True, embedding_file=embedding_file)
+        # Xtr is a list of tensors, Ytr is a tensor
+        print(f"\nTrain data: list of {len(Xtr)} tensors with variable lengths")
         print(f"Train label shape: {Ytr.shape}")  # (batch_size, num_labels)
+        # Create list dataset for variable-length sequences
+        train_dataset = list(zip(Xtr, Ytr))
+        val_dataset = list(zip(Xva, Yva))
+        test_dataset = list(zip(Xte, Yte))
     else:
         Xtr, Ytr = prepare_XY(train_pairs, vocabs, use_current_step=use_current_step, 
                             use_hyperbolic_embeddings=False)
@@ -154,20 +155,28 @@ def train_diagnosis_model_on_samples(samples,
                             use_hyperbolic_embeddings=False)
         print(f"\nTrain data shape: {Xtr.shape}")   # 100% [34972, 19733]
         print(f"\nTrain label shape: {Ytr.shape}")   # 100% [34972, 274]
-
-    # 5) Create DataLoaders for batch training
-    if use_hyperbolic_embeddings:
-        train_dataset = TensorDataset(Xtr, mask_tr, Ytr)
-        val_dataset = TensorDataset(Xva, mask_va, Yva)
-        test_dataset = TensorDataset(Xte, mask_te, Yte)
-    else:
         train_dataset = TensorDataset(Xtr, Ytr)
         val_dataset = TensorDataset(Xva, Yva)
         test_dataset = TensorDataset(Xte, Yte)
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    # 5) Create DataLoaders for batch training
+    # Custom collate function for variable-length sequences when using hyperbolic embeddings
+    if use_hyperbolic_embeddings:
+        def collate_fn(batch):
+            """Collate function for variable-length sequences"""
+            X_batch, Y_batch = zip(*batch)
+            # X_batch is a list of tensors with variable shapes (num_codes_i, embedding_dim)
+            # Y_batch is a list of label tensors (num_labels,)
+            # Return as list of X tensors and stacked Y tensor
+            return list(X_batch), torch.stack(Y_batch)
+        
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     # 6) Model and loss (multi-label)
     # input: (batch_size, in_dim), in_dim = historical diagnosis codes (ICD)len(diag_stoi) + historical procedure codes (Procedures)len(proc_stoi) + historical drug codes (ATC-3)len(drug_stoi)
@@ -176,7 +185,18 @@ def train_diagnosis_model_on_samples(samples,
     device = torch.device('cuda')
     
     # Create model with automatic input dimension detection
-    model = create_model_from_data(model_type, Xtr, hidden=hidden, out_dim=Ytr.size(1), **model_kwargs)
+    # For hyperbolic embeddings, use first sample to determine embedding_dim
+    if use_hyperbolic_embeddings:
+        # Xtr is a list, get embedding_dim from first sample
+        sample_X = Xtr[0]  # (num_codes, embedding_dim)
+        embedding_dim = sample_X.shape[1]
+        # Create a dummy 3D tensor for model creation
+        dummy_X = sample_X.unsqueeze(0)  # (1, num_codes, embedding_dim)
+        model = create_model_from_data(model_type, dummy_X, hidden=hidden, out_dim=Ytr.size(1), 
+                                      use_hyperbolic_embeddings=True, **model_kwargs)
+    else:
+        model = create_model_from_data(model_type, Xtr, hidden=hidden, out_dim=Ytr.size(1), 
+                                      use_hyperbolic_embeddings=False, **model_kwargs)
     model = model.to(device)  # Move model to device
     
     pw = bce_pos_weight(Ytr).to(device)
@@ -194,36 +214,30 @@ def train_diagnosis_model_on_samples(samples,
         num_batches = 0
         
         # Training phase
-        if use_hyperbolic_embeddings:
-            for batch_X, batch_mask, batch_Y in train_loader:
-                batch_X, batch_mask, batch_Y = batch_X.to(device), batch_mask.to(device), batch_Y.to(device)
-                logits = model(batch_X, attention_mask=batch_mask)
-                loss = criterion(logits, batch_Y)
-                
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
-                
-                epoch_loss += loss.item()
-                num_batches += 1
-        else:
-            for batch_X, batch_Y in train_loader:
-                batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
-                logits = model(batch_X)
-                loss = criterion(logits, batch_Y)
-                
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
-                
-                epoch_loss += loss.item()
-                num_batches += 1
+        for batch_X, batch_Y in train_loader:
+            batch_Y = batch_Y.to(device)
+            # batch_X is either a tensor (regular) or list of tensors (hyperbolic embeddings)
+            if use_hyperbolic_embeddings:
+                # batch_X is a list of tensors, move each to device
+                batch_X = [x.to(device) for x in batch_X]
+            else:
+                batch_X = batch_X.to(device)
+            
+            logits = model(batch_X)
+            loss = criterion(logits, batch_Y)
+            
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            
+            epoch_loss += loss.item()
+            num_batches += 1
 
         avg_loss = epoch_loss / num_batches
 
         # Validation phase
         if ep % 1 == 0:
-            val_metrics = evaluate_batched(model, val_loader, ks=(10, 20, 30), device=device, use_hyperbolic_embeddings=use_hyperbolic_embeddings)
+            val_metrics = evaluate_batched(model, val_loader, ks=(10, 20, 30), device=device)
             current_metric = val_metrics[monitor_metric]
             
             print(f"Epoch {ep:02d} | avg_loss={avg_loss:.4f} | "
@@ -249,7 +263,7 @@ def train_diagnosis_model_on_samples(samples,
                     break
 
     # 8) Test set evaluation (consistent with paper: Visit-level P@k, Code-level Acc@k)
-    test_metrics = evaluate_batched(model, test_loader, ks=(10, 20, 30), device=device, use_hyperbolic_embeddings=use_hyperbolic_embeddings)
+    test_metrics = evaluate_batched(model, test_loader, ks=(10, 20, 30), device=device)
     print("[TEST]", test_metrics)
     
     return model, vocabs, y_itos, test_metrics
@@ -260,17 +274,16 @@ def train_mlp_on_samples(samples, **kwargs):
     return train_diagnosis_model_on_samples(samples, model_type="mlp", **kwargs)
 
 
-def evaluate_batched(model, data_loader, ks=(10, 20, 30), device=None, use_hyperbolic_embeddings=False):
+def evaluate_batched(model, data_loader, ks=(10, 20, 30), device=None):
     """
     Evaluate model using batched data loader
     Compatible with the original evaluate function but works with DataLoader
     
     Args:
         model: Trained model
-        data_loader: DataLoader containing (X, Y) or (X, mask, Y) batches
+        data_loader: DataLoader containing (X, Y) batches
         ks: List of k values for evaluation metrics
         device: Device to use for evaluation (if None, uses model's device)
-        use_hyperbolic_embeddings: Whether data loader contains attention masks
     
     Returns:
         Dictionary containing evaluation metrics
@@ -288,18 +301,17 @@ def evaluate_batched(model, data_loader, ks=(10, 20, 30), device=None, use_hyper
         device = next(model.parameters()).device
     
     with torch.no_grad():
-        if use_hyperbolic_embeddings:
-            for batch_X, batch_mask, batch_Y in data_loader:
-                batch_X, batch_mask, batch_Y = batch_X.to(device), batch_mask.to(device), batch_Y.to(device)
-                logits = model(batch_X, attention_mask=batch_mask)
-                all_logits.append(logits.cpu())
-                all_labels.append(batch_Y.cpu())
-        else:
-            for batch_X, batch_Y in data_loader:
-                batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
-                logits = model(batch_X)
-                all_logits.append(logits.cpu())
-                all_labels.append(batch_Y.cpu())
+        for batch_X, batch_Y in data_loader:
+            batch_Y = batch_Y.to(device)
+            # batch_X is either a tensor (regular) or list of tensors (hyperbolic embeddings)
+            # Check if it's a list (hyperbolic embeddings case)
+            if isinstance(batch_X, list):
+                batch_X = [x.to(device) for x in batch_X]
+            else:
+                batch_X = batch_X.to(device)
+            logits = model(batch_X)
+            all_logits.append(logits.cpu())
+            all_labels.append(batch_Y.cpu())
     
     # Concatenate all batches
     logits = torch.cat(all_logits, dim=0).numpy()

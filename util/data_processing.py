@@ -404,21 +404,34 @@ def multihot_from_sequence(seq_of_lists, stoi):
     return x
 
 
-def vectorize_pair(s, y_codes, vocabs, use_current_step=False, use_hyperbolic_embeddings=False, embedding_file="hyperbolic_embeddings.pkl", max_seq_length=200):
+def vectorize_pair(s, y_codes, vocabs, use_current_step=False, use_hyperbolic_embeddings=False, embedding_file="hyperbolic_embeddings.pkl"):
     """Vectorize sample pair"""
     diag_stoi, proc_stoi, drug_stoi, y_stoi = vocabs
     
     if use_hyperbolic_embeddings:
         # Load hyperbolic embeddings if not already cached
         embeddings_cache = load_hyperbolic_embeddings(embedding_file)
+        embedding_dim = embeddings_cache.get_embedding_dim()
         
-        # Create embedding sequence with visit markers
-        X, attention_mask = create_embedding_sequence_with_visit_markers(
-            s["cond_hist"], embeddings_cache, max_seq_length
-        )
+        # Collect all ICD code embeddings from condition history (except last empty visit)
+        code_embeddings = []
+        for visit_idx, visit_codes in enumerate(s["cond_hist"][:-1]):  # Skip last empty visit
+            for code in visit_codes:
+                if code in embeddings_cache.code2embedding:
+                    code_embeddings.append(embeddings_cache.code2embedding[code])
+                else:
+                    # Use zero embedding for unknown codes
+                    code_embeddings.append(torch.zeros(embedding_dim))
         
-        # Return both sequence and attention mask
-        return X, attention_mask, y_codes
+        # Handle case where no conditions exist
+        if len(code_embeddings) == 0:
+            code_embeddings = [torch.zeros(embedding_dim)]
+        
+        # Return list of embeddings (variable length), will be stacked in prepare_XY
+        # Shape will be (num_codes, embedding_dim) for each patient
+        X = torch.stack(code_embeddings)  # (num_codes, embedding_dim) - variable num_codes per patient
+        
+        return X, y_codes
     else:
         # Original multi-hot implementation
         # Admission prediction: don't look at current step's proc/drug; discharge prediction can look
@@ -442,22 +455,19 @@ def vectorize_pair(s, y_codes, vocabs, use_current_step=False, use_hyperbolic_em
         return X, y
 
 
-def prepare_XY(pairs, vocabs, use_current_step=False, use_hyperbolic_embeddings=False, embedding_file="hyperbolic_embeddings.pkl", max_seq_length=200):
+def prepare_XY(pairs, vocabs, use_current_step=False, use_hyperbolic_embeddings=False, embedding_file="hyperbolic_embeddings.pkl"):
     """Prepare training data X and Y"""
     if use_hyperbolic_embeddings:
-        # Sequential data preparation
-        Xs, masks, Ys = [], [], []
+        # Collect ICD code embeddings for each patient (variable length per patient)
+        Xs, Ys = [], []
         for s, y_codes in pairs:
-            X, attention_mask, y_codes_list = vectorize_pair(s, y_codes, vocabs, use_current_step=use_current_step, 
-                                                           use_hyperbolic_embeddings=True, embedding_file=embedding_file, 
-                                                           max_seq_length=max_seq_length)
-            Xs.append(X)
-            masks.append(attention_mask)
+            X, y_codes_list = vectorize_pair(s, y_codes, vocabs, use_current_step=use_current_step, 
+                                             use_hyperbolic_embeddings=True, embedding_file=embedding_file)
+            Xs.append(X)  # Each X is (num_codes, embedding_dim) with variable num_codes
             Ys.append(y_codes_list)
         
-        # Convert to tensors
-        X_tensor = torch.stack(Xs)  # (batch_size, max_seq_length, embedding_dim)
-        mask_tensor = torch.stack(masks)  # (batch_size, max_seq_length)
+        # Return as list of tensors (variable length), will use custom collate in DataLoader
+        # Xs is a list of tensors with shapes [(num_codes_i, embedding_dim), ...]
         
         # Convert y_codes to multi-hot vectors
         diag_stoi, proc_stoi, drug_stoi, y_stoi = vocabs
@@ -467,7 +477,7 @@ def prepare_XY(pairs, vocabs, use_current_step=False, use_hyperbolic_embeddings=
                 if c in y_stoi: 
                     Y_tensor[i, y_stoi[c]] = 1.0
         
-        return X_tensor, mask_tensor, Y_tensor
+        return Xs, Y_tensor  # Return list of X tensors and Y tensor
     else:
         # Original multi-hot implementation
         Xs, Ys = [], []

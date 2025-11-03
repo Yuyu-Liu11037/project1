@@ -7,30 +7,87 @@ import torch.nn as nn
 import math
 
 
-class MLP(nn.Module):
-    """Simple multi-label MLP model"""
+class EmbeddingCombinerMLP(nn.Module):
+    """MLP to combine multiple embeddings into a single embedding vector
     
-    def __init__(self, in_dim, hidden, out_dim, p=0.3):
+    Supports variable-length sequences by processing each embedding and then aggregating.
+    """
+    
+    def __init__(self, embedding_dim, hidden_dim=None, p=0.3):
+        """
+        Args:
+            embedding_dim: Dimension of each embedding vector
+            hidden_dim: Hidden dimension for the MLP (default: embedding_dim * 2)
+            p: Dropout probability
+        """
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden), 
+        self.embedding_dim = embedding_dim
+        if hidden_dim is None:
+            hidden_dim = embedding_dim * 2
+        
+        # Process each embedding through shared MLP
+        self.per_embedding_mlp = nn.Sequential(
+            nn.Linear(embedding_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(p),
-            nn.Linear(hidden, out_dim)  # logits
+            nn.Linear(hidden_dim, embedding_dim)
         )
+        
+        # Final aggregation layer
+        self.aggregation = nn.Linear(embedding_dim, embedding_dim)
     
-    def forward(self, x): 
-        return self.net(x)
+    def forward(self, x):
+        """
+        Args:
+            x: List of tensors, each of shape (num_codes_i, embedding_dim) where num_codes_i can vary
+        
+        Returns:
+            (batch_size, embedding_dim)
+        """
+        if isinstance(x, list):
+            # Handle variable-length sequences in a batch
+            batch_size = len(x)
+            batch_outputs = []
+            
+            for i, patient_embeddings in enumerate(x):
+                # patient_embeddings: (num_codes_i, embedding_dim)
+                # Process each embedding through shared MLP
+                processed = self.per_embedding_mlp(patient_embeddings)  # (num_codes_i, embedding_dim)
+                # Aggregate: mean pooling
+                aggregated = processed.mean(dim=0)  # (embedding_dim,)
+                # Final transformation
+                output = self.aggregation(aggregated)  # (embedding_dim,)
+                batch_outputs.append(output)
+            
+            # Stack to (batch_size, embedding_dim)
+            return torch.stack(batch_outputs, dim=0)
+        else:
+            # Handle fixed-length sequences: (batch_size, num_codes, embedding_dim)
+            batch_size, num_codes, embedding_dim = x.shape
+            
+            # Process each embedding through shared MLP
+            # Reshape to process all embeddings at once: (batch_size * num_codes, embedding_dim)
+            x_flat = x.view(batch_size * num_codes, embedding_dim)
+            x_processed = self.per_embedding_mlp(x_flat)
+            # Reshape back: (batch_size, num_codes, embedding_dim)
+            x_processed = x_processed.view(batch_size, num_codes, embedding_dim)
+            
+            # Aggregate: mean pooling followed by linear transformation
+            x_aggregated = x_processed.mean(dim=1)  # (batch_size, embedding_dim)
+            x_output = self.aggregation(x_aggregated)  # (batch_size, embedding_dim)
+            
+            return x_output
 
 
 class TransformerModel(nn.Module):
     """Transformer-based multi-label classification model"""
     
-    def __init__(self, in_dim, hidden, out_dim, num_heads=8, num_layers=3, p=0.3):
+    def __init__(self, in_dim, hidden, out_dim, num_heads=8, num_layers=3, p=0.3, embedding_combiner=None):
         super().__init__()
         self.in_dim = in_dim
         self.hidden = hidden
         self.out_dim = out_dim
+        self.embedding_combiner = embedding_combiner
         
         # Input projection layer - project input features to hidden dimension
         self.input_projection = nn.Linear(in_dim, hidden)
@@ -58,8 +115,13 @@ class TransformerModel(nn.Module):
         
         # Dropout
         self.dropout = nn.Dropout(p)
-        
+    
     def forward(self, x):
+        # If embedding_combiner is provided, apply it first
+        # x would be (batch_size, num_codes, embedding_dim) in this case
+        if self.embedding_combiner is not None:
+            x = self.embedding_combiner(x)  # (batch_size, embedding_dim)
+        
         # x shape: (batch_size, in_dim)
         batch_size = x.size(0)
         
@@ -109,122 +171,58 @@ class PositionalEncoding(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0).transpose(0, 1)
         self.register_buffer('pe', pe)
-        
+    
     def forward(self, x):
         x = x + self.pe[:x.size(1), :].transpose(0, 1)
         return self.dropout(x)
 
 
-class SequentialTransformerModel(nn.Module):
-    """Transformer model for sequential input (batch_size, seq_len, embedding_dim)"""
-    
-    def __init__(self, embedding_dim, hidden, out_dim, num_heads=8, num_layers=3, p=0.3):
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.hidden = hidden
-        self.out_dim = out_dim
-        
-        # Project embedding dimension to hidden dimension
-        self.input_projection = nn.Linear(embedding_dim, hidden)
-        
-        # Positional encoding
-        self.pos_encoding = PositionalEncoding(hidden, p)
-        
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden,
-            nhead=num_heads,
-            dim_feedforward=hidden * 4,
-            dropout=p,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        # Output layer
-        self.output_projection = nn.Linear(hidden, out_dim)
-        
-        # Dropout
-        self.dropout = nn.Dropout(p)
-        
-    def forward(self, x, attention_mask=None):
-        # x shape: (batch_size, seq_len, embedding_dim)
-        batch_size, seq_len, embedding_dim = x.size()
-        
-        # Project embeddings to hidden dimension
-        x_projected = self.input_projection(x)  # (batch_size, seq_len, hidden)
-        
-        # Positional encoding
-        x_projected = self.pos_encoding(x_projected)
-        
-        # Transformer encoding
-        # If attention mask is provided, convert to the format expected by PyTorch transformer
-        if attention_mask is not None:
-            # PyTorch transformer expects attention_mask where True means "ignore"
-            # Our mask has 1 for "attend" and 0 for "ignore", so we need to invert it
-            attention_mask = (attention_mask == 0)
-        
-        x_encoded = self.transformer(x_projected, src_key_padding_mask=attention_mask)
-        
-        # Global average pooling over sequence dimension
-        # Use attention mask to ignore padding tokens
-        if attention_mask is not None:
-            # Create mask for valid tokens (invert the attention mask)
-            valid_mask = ~attention_mask  # True for valid tokens
-            # Set invalid positions to 0
-            x_encoded = x_encoded * valid_mask.unsqueeze(-1).float()
-            # Sum over sequence dimension
-            x_pooled = x_encoded.sum(dim=1)
-            # Divide by number of valid tokens per sample
-            valid_counts = valid_mask.sum(dim=1, keepdim=True).float()
-            x_pooled = x_pooled / valid_counts.clamp(min=1)
-        else:
-            # Simple average pooling
-            x_pooled = x_encoded.mean(dim=1)
-        
-        # Dropout
-        x_pooled = self.dropout(x_pooled)
-        
-        # Output projection
-        return self.output_projection(x_pooled)
-
-
 def create_model(model_type, in_dim, hidden, out_dim, **kwargs):
-    """Model factory function"""
-    if model_type.lower() == 'mlp':
-        return MLP(in_dim, hidden, out_dim, **kwargs)
-    elif model_type.lower() == 'transformer':
-        return TransformerModel(in_dim, hidden, out_dim, **kwargs)
-    elif model_type.lower() == 'sequential_transformer':
-        return SequentialTransformerModel(in_dim, hidden, out_dim, **kwargs)
-    else:
-        raise ValueError(f"Unsupported model type: {model_type}. Supported types: 'mlp', 'transformer', 'sequential_transformer'")
+    return TransformerModel(in_dim, hidden, out_dim, **kwargs)
 
 
-def create_model_from_data(model_type, X_sample, hidden, out_dim, **kwargs):
+def create_model_from_data(model_type, X_sample, hidden, out_dim, use_hyperbolic_embeddings=False, **kwargs):
     """
     Create model with automatic input dimension detection
     
     Args:
-        model_type: Type of model ('mlp', 'transformer', 'sequential_transformer')
+        model_type: Type of model ('mlp', 'transformer')
         X_sample: Sample input tensor to determine input dimensions
         hidden: Hidden layer dimension
         out_dim: Output dimension
+        use_hyperbolic_embeddings: If True and input is 3D, create embedding combiner
         **kwargs: Additional model parameters
         
     Returns:
         Model instance
     """
     if len(X_sample.shape) == 3:
-        # Sequential input: (batch_size, seq_len, embedding_dim)
+        # Input is 3D: (batch_size, max_num_codes, embedding_dim)
+        # This happens when use_hyperbolic_embeddings=True
         embedding_dim = X_sample.shape[2]
-        if model_type.lower() == 'transformer':
-            # Auto-convert transformer to sequential_transformer for 3D input
-            print(f"Auto-converting transformer to sequential_transformer for 3D input")
-            return SequentialTransformerModel(embedding_dim, hidden, out_dim, **kwargs)
-        elif model_type.lower() == 'sequential_transformer':
-            return SequentialTransformerModel(embedding_dim, hidden, out_dim, **kwargs)
+        
+        if use_hyperbolic_embeddings:
+            # Extract parameters for EmbeddingCombinerMLP
+            # EmbeddingCombinerMLP only accepts: embedding_dim, hidden_dim, p
+            combiner_kwargs = {}
+            if 'hidden_dim' in kwargs:
+                combiner_kwargs['hidden_dim'] = kwargs.pop('hidden_dim')
+            if 'p' in kwargs:
+                combiner_kwargs['p'] = kwargs.pop('p')
+            elif 'dropout' in kwargs:
+                combiner_kwargs['p'] = kwargs.pop('dropout')
+            
+            # Create embedding combiner MLP with only relevant parameters
+            embedding_combiner = EmbeddingCombinerMLP(embedding_dim, **combiner_kwargs)
+            # Create base model with embedding_dim as in_dim (after combiner)
+            # Remaining kwargs (num_heads, num_layers, etc.) go to base model
+            model = create_model(model_type, embedding_dim, hidden, out_dim, **kwargs)
+            # Attach combiner to the model
+            model.embedding_combiner = embedding_combiner
+            print(f"Created {model_type} model with EmbeddingCombinerMLP for hyperbolic embeddings")
+            return model
         else:
-            raise ValueError(f"Model type '{model_type}' not supported for 3D sequential input")
+            raise ValueError(f"3D input detected but use_hyperbolic_embeddings=False. Expected 2D input for regular models.")
     elif len(X_sample.shape) == 2:
         # Flat input: (batch_size, feature_dim)
         in_dim = X_sample.shape[1]

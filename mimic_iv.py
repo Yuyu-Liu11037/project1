@@ -109,7 +109,6 @@ if __name__ == "__main__":
     print(f"Hyperbolic embeddings: {args.use_hyperbolic_embeddings}")
     if args.use_hyperbolic_embeddings:
         print(f"  Embedding file: {args.embedding_file}")
-        print(f"  Max sequence length: {args.max_seq_length}")
     
     print(f"Training with seed: {args.seed}")
     
