@@ -32,7 +32,7 @@ def parse_args():
     parser.add_argument('--hidden', type=int, default=512,
                        help='Hidden layer dimension (default: 512)')
     parser.add_argument('--lr', type=float, default=1e-4,
-                       help='Learning rate (default: 1e-4)')
+                       help='Learning rate')
     parser.add_argument('--wd', type=float, default=1e-5,
                        help='Weight decay (default: 1e-5)')
     parser.add_argument('--epochs', type=int, default=500,
@@ -76,7 +76,7 @@ def parse_args():
     parser.add_argument('--use_hyperbolic_embeddings', action='store_true',
                        help='Use hyperbolic embeddings instead of multi-hot vectors (default: False)')
     parser.add_argument('--embedding_file', type=str, default='hyperbolic_embeddings.pkl',
-                       help='Path to hyperbolic embeddings file (default: hyperbolic_embeddings.pkl)')
+                       help='Path to hyperbolic embeddings file')
     parser.add_argument('--max_seq_length', type=int, default=200,
                        help='Maximum sequence length for sequential data (default: 200)')
     

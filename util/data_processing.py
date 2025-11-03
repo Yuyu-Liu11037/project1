@@ -11,6 +11,13 @@ from pyhealth.data import Patient
 from pyhealth.medcode import CrossMap
 from util.hyperbolic_conditions import ConditionsHyperbolicEmbedder
 
+# Import HyperbolicEntailmentCones for pickle loading
+try:
+    from hyperbolic_entailment_cones import HyperbolicEntailmentCones
+except ImportError:
+    # If import fails, we'll handle it dynamically during loading
+    HyperbolicEntailmentCones = None
+
 
 mapping = CrossMap("ICD10CM", "CCSCM")
 
@@ -19,30 +26,192 @@ _hyperbolic_embeddings_cache = None
 _visit_sep_embedding = None
 
 
+class HyperbolicEntailmentConesAdapter:
+    """
+    Adapter class to wrap hyperbolic_entailment_cones.py saved data
+    and provide the same interface as ConditionsHyperbolicEmbedder
+    """
+    def __init__(self, save_data):
+        """
+        Initialize adapter from hyperbolic_entailment_cones.py saved data
+        
+        Args:
+            save_data: Dictionary containing 'model', 'id_map', 'codes', 'dim', etc.
+        """
+        self.model = save_data['model']
+        self.id_map = save_data['id_map']  # code -> id mapping
+        self.codes = save_data['codes']  # List of all codes
+        self.dim = save_data['dim']
+        self.conditions_codes = save_data.get('original_codes', self.codes)
+        
+        # Build code2embedding dictionary from model.emb and id_map
+        # model.emb is a Parameter tensor of shape (num_codes, dim)
+        self.code2embedding = {}
+        with torch.no_grad():
+            emb_tensor = self.model.emb.data.cpu()  # (num_codes, dim)
+            # Create reverse mapping: id -> code
+            id_to_code = {idx: code for code, idx in self.id_map.items()}
+            
+            # Build code2embedding dictionary
+            for code, code_id in self.id_map.items():
+                if code_id < emb_tensor.shape[0]:
+                    self.code2embedding[code] = emb_tensor[code_id].clone()
+    
+    def get_embedding_dim(self) -> int:
+        """Get the total embedding dimension for a single condition"""
+        return self.dim
+    
+    def get_embedding_vector(self, conditions_list):
+        """
+        Get hyperbolic embedding vector for a list of conditions
+        
+        Args:
+            conditions_list: List of condition codes
+            
+        Returns:
+            Fixed-size embedding vector by averaging all condition embeddings
+        """
+        embeddings = []
+        for cond in conditions_list:
+            if cond in self.code2embedding:
+                embeddings.append(self.code2embedding[cond])
+            else:
+                # Use zero embedding for unknown codes
+                embeddings.append(torch.zeros(self.dim))
+        
+        if len(embeddings) == 0:
+            # Return zero vector if no conditions
+            return torch.zeros(self.dim)
+        
+        # Average all embeddings to get a fixed-size representation
+        return torch.stack(embeddings).mean(dim=0)
+    
+    def get_embedding_sequences(self, conditions_list):
+        """
+        Get hyperbolic embedding sequences for a list of conditions (for transformer)
+        
+        Args:
+            conditions_list: List of condition codes
+            
+        Returns:
+            Embedding tensor of shape [n, embedding_dim] where n is the number of conditions
+        """
+        embeddings = []
+        for cond in conditions_list:
+            if cond in self.code2embedding:
+                embeddings.append(self.code2embedding[cond])
+            else:
+                # Use zero embedding for unknown codes
+                embeddings.append(torch.zeros(self.dim))
+        
+        if len(embeddings) == 0:
+            # Return empty tensor with correct shape
+            return torch.zeros(0, self.dim)
+        
+        # Return sequence of embeddings without averaging
+        return torch.stack(embeddings)
+
+
 def load_hyperbolic_embeddings(embedding_file="hyperbolic_embeddings.pkl"):
     """
-    Load hyperbolic embeddings from file and cache globally
+    Load hyperbolic embeddings from file and cache globally.
+    Supports two formats:
+    1. ConditionsHyperbolicEmbedder instance (from train_hyperbolic_embeddings_icd10.py)
+    2. Dictionary format (from hyperbolic_entailment_cones.py)
     
     Args:
         embedding_file: Path to the hyperbolic embeddings pickle file
         
     Returns:
-        ConditionsHyperbolicEmbedder instance
+        ConditionsHyperbolicEmbedder instance or HyperbolicEntailmentConesAdapter instance
     """
     global _hyperbolic_embeddings_cache, _visit_sep_embedding
     
     if _hyperbolic_embeddings_cache is None:
+        # Import HyperbolicEntailmentCones if not already imported
+        # This is needed for pickle to deserialize the model object
+        import sys
+        import importlib.util
+        
+        if HyperbolicEntailmentCones is None:
+            try:
+                # Try direct import first
+                import hyperbolic_entailment_cones
+                sys.modules['hyperbolic_entailment_cones'] = hyperbolic_entailment_cones
+                # Make HyperbolicEntailmentCones available in this module's namespace
+                globals()['HyperbolicEntailmentCones'] = hyperbolic_entailment_cones.HyperbolicEntailmentCones
+            except ImportError:
+                # If direct import fails, try using importlib
+                try:
+                    spec = importlib.util.find_spec("hyperbolic_entailment_cones")
+                    if spec is not None:
+                        hyperbolic_module = importlib.util.module_from_spec(spec)
+                        sys.modules['hyperbolic_entailment_cones'] = hyperbolic_module
+                        spec.loader.exec_module(hyperbolic_module)
+                        # Make HyperbolicEntailmentCones available in this module's namespace
+                        globals()['HyperbolicEntailmentCones'] = hyperbolic_module.HyperbolicEntailmentCones
+                except Exception as e:
+                    print(f"Warning: Could not import HyperbolicEntailmentCones: {e}")
+                    print("This may cause issues if loading hyperbolic_entailment_cones.py format files")
+        
         print(f"Loading hyperbolic embeddings from: {embedding_file}")
+        
+        # Create a custom unpickler that can find the class
+        class CustomUnpickler(pickle.Unpickler):
+            def find_class(self, module, name):
+                # Try to find HyperbolicEntailmentCones class
+                if name == 'HyperbolicEntailmentCones':
+                    # First try the hyperbolic_entailment_cones module
+                    if 'hyperbolic_entailment_cones' in sys.modules:
+                        mod = sys.modules['hyperbolic_entailment_cones']
+                        if hasattr(mod, 'HyperbolicEntailmentCones'):
+                            return mod.HyperbolicEntailmentCones
+                    # Also try importing it if not already imported
+                    try:
+                        import hyperbolic_entailment_cones
+                        if hasattr(hyperbolic_entailment_cones, 'HyperbolicEntailmentCones'):
+                            return hyperbolic_entailment_cones.HyperbolicEntailmentCones
+                    except:
+                        pass
+                    # Fall back to default behavior (try original module path)
+                # Use default behavior for other classes
+                try:
+                    return super().find_class(module, name)
+                except AttributeError:
+                    # If class is not found in original module, try hyperbolic_entailment_cones
+                    if module == '__main__' and name == 'HyperbolicEntailmentCones':
+                        if 'hyperbolic_entailment_cones' in sys.modules:
+                            mod = sys.modules['hyperbolic_entailment_cones']
+                            if hasattr(mod, 'HyperbolicEntailmentCones'):
+                                return mod.HyperbolicEntailmentCones
+                    raise
+        
         with open(embedding_file, 'rb') as f:
-            _hyperbolic_embeddings_cache = pickle.load(f)
+            unpickler = CustomUnpickler(f)
+            loaded_data = unpickler.load()
+        
+        # Check if it's a dictionary format (from hyperbolic_entailment_cones.py)
+        if isinstance(loaded_data, dict) and 'model' in loaded_data and 'id_map' in loaded_data:
+            print("Detected hyperbolic_entailment_cones.py format")
+            _hyperbolic_embeddings_cache = HyperbolicEntailmentConesAdapter(loaded_data)
+            embedding_dim = _hyperbolic_embeddings_cache.get_embedding_dim()
+            print(f"Loaded hyperbolic entailment cones embeddings with dimension: {embedding_dim}")
+            print(f"Number of codes: {len(_hyperbolic_embeddings_cache.codes)}")
+            print(f"Number of condition codes: {len(_hyperbolic_embeddings_cache.conditions_codes)}")
+        # Check if it's a ConditionsHyperbolicEmbedder instance
+        elif isinstance(loaded_data, ConditionsHyperbolicEmbedder):
+            print("Detected ConditionsHyperbolicEmbedder format")
+            _hyperbolic_embeddings_cache = loaded_data
+            embedding_dim = _hyperbolic_embeddings_cache.get_embedding_dim()
+            print(f"Loaded hyperbolic embeddings with dimension: {embedding_dim}")
+            print(f"Number of condition codes: {len(_hyperbolic_embeddings_cache.conditions_codes)}")
+        else:
+            raise ValueError(f"Unknown embedding file format. Expected ConditionsHyperbolicEmbedder or dict with 'model' and 'id_map' keys, got {type(loaded_data)}")
         
         # Create visit separator embedding (same dimension as condition embeddings)
         embedding_dim = _hyperbolic_embeddings_cache.get_embedding_dim()
         # Initialize with small random values (similar to hyperbolic embedding init)
         _visit_sep_embedding = torch.randn(embedding_dim) * 0.01
-        
-        print(f"Loaded hyperbolic embeddings with dimension: {embedding_dim}")
-        print(f"Number of condition codes: {len(_hyperbolic_embeddings_cache.conditions_codes)}")
     
     return _hyperbolic_embeddings_cache
 
