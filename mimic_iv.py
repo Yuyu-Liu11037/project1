@@ -24,14 +24,11 @@ def parse_args():
                        help='Model type: mlp or transformer')
     
     # Training parameters
-    parser.add_argument('--task', type=str, default='next',
-                       choices=['current', 'next'],
-                       help='Prediction task: current or next (default: next)')
     parser.add_argument('--use_current_step', action='store_true',
                        help='Whether to use current step information (default: False)')
-    parser.add_argument('--hidden', type=int, default=512,
-                       help='Hidden layer dimension (default: 512)')
-    parser.add_argument('--lr', type=float, default=1e-4,
+    parser.add_argument('--hidden', type=int, default=100,
+                       help='Hidden layer dimension')
+    parser.add_argument('--lr', type=float, default=1e-3,
                        help='Learning rate')
     parser.add_argument('--wd', type=float, default=1e-5,
                        help='Weight decay (default: 1e-5)')
@@ -60,8 +57,8 @@ def parse_args():
                        help='Metric to monitor for early stopping (default: Acc@10)')
     
     # Transformer specific parameters
-    parser.add_argument('--num_heads', type=int, default=8,
-                       help='Number of Transformer attention heads (default: 8)')
+    parser.add_argument('--num_heads', type=int, default=5,
+                       help='Number of Transformer attention heads')
     parser.add_argument('--num_layers', type=int, default=3,
                        help='Number of Transformer layers (default: 3)')
     parser.add_argument('--dropout', type=float, default=0.3,
@@ -75,7 +72,7 @@ def parse_args():
     # Hyperbolic embeddings
     parser.add_argument('--use_hyperbolic_embeddings', action='store_true',
                        help='Use hyperbolic embeddings instead of multi-hot vectors (default: False)')
-    parser.add_argument('--embedding_file', type=str, default='hyperbolic_embeddings.pkl',
+    parser.add_argument('--embedding_file', type=str, default='lr10_margin05_2.pkl',
                        help='Path to hyperbolic embeddings file')
     parser.add_argument('--max_seq_length', type=int, default=200,
                        help='Maximum sequence length for sequential data (default: 200)')
@@ -91,7 +88,6 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     
     print(f"Using model: {args.model}")
-    print(f"Prediction task: {args.task}")
     print(f"Hidden layer dimension: {args.hidden}")
     print(f"Learning rate: {args.lr}")
     print(f"Training epochs: {args.epochs}")
@@ -135,7 +131,6 @@ if __name__ == "__main__":
     model, vocabs, y_itos, test_metrics = train_diagnosis_model_on_samples(
                 mimic4_prediction.samples,
                 model_type=args.model,
-                task=args.task,
                 use_current_step=args.use_current_step,
                 hidden=args.hidden,
                 lr=args.lr,

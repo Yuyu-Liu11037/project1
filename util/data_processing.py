@@ -10,6 +10,7 @@ from sklearn.model_selection import train_test_split
 from pyhealth.data import Patient
 from pyhealth.medcode import CrossMap
 from util.hyperbolic_conditions import ConditionsHyperbolicEmbedder
+from eval_embedding import load_pkl_file
 
 # Import HyperbolicEntailmentCones for pickle loading
 try:
@@ -24,6 +25,8 @@ mapping = CrossMap("ICD10CM", "CCSCM")
 # Global cache for hyperbolic embeddings
 _hyperbolic_embeddings_cache = None
 _visit_sep_embedding = None
+# Cache for load_pkl_file results (keyed by file path)
+_pkl_file_cache = {}
 
 
 class HyperbolicEntailmentConesAdapter:
@@ -115,6 +118,9 @@ class HyperbolicEntailmentConesAdapter:
 def load_hyperbolic_embeddings(embedding_file="hyperbolic_embeddings.pkl"):
     """
     Load hyperbolic embeddings from file and cache globally.
+    DEPRECATED: This function now uses load_pkl_file internally.
+    For new code, use load_pkl_file directly.
+    
     Supports two formats:
     1. ConditionsHyperbolicEmbedder instance (from train_hyperbolic_embeddings_icd10.py)
     2. Dictionary format (from hyperbolic_entailment_cones.py)
@@ -128,67 +134,8 @@ def load_hyperbolic_embeddings(embedding_file="hyperbolic_embeddings.pkl"):
     global _hyperbolic_embeddings_cache, _visit_sep_embedding
     
     if _hyperbolic_embeddings_cache is None:
-        # Import HyperbolicEntailmentCones if not already imported
-        # This is needed for pickle to deserialize the model object
-        import sys
-        import importlib.util
-        
-        if HyperbolicEntailmentCones is None:
-            try:
-                # Try direct import first
-                import hyperbolic_entailment_cones
-                sys.modules['hyperbolic_entailment_cones'] = hyperbolic_entailment_cones
-                # Make HyperbolicEntailmentCones available in this module's namespace
-                globals()['HyperbolicEntailmentCones'] = hyperbolic_entailment_cones.HyperbolicEntailmentCones
-            except ImportError:
-                # If direct import fails, try using importlib
-                try:
-                    spec = importlib.util.find_spec("hyperbolic_entailment_cones")
-                    if spec is not None:
-                        hyperbolic_module = importlib.util.module_from_spec(spec)
-                        sys.modules['hyperbolic_entailment_cones'] = hyperbolic_module
-                        spec.loader.exec_module(hyperbolic_module)
-                        # Make HyperbolicEntailmentCones available in this module's namespace
-                        globals()['HyperbolicEntailmentCones'] = hyperbolic_module.HyperbolicEntailmentCones
-                except Exception as e:
-                    print(f"Warning: Could not import HyperbolicEntailmentCones: {e}")
-                    print("This may cause issues if loading hyperbolic_entailment_cones.py format files")
-        
-        print(f"Loading hyperbolic embeddings from: {embedding_file}")
-        
-        # Create a custom unpickler that can find the class
-        class CustomUnpickler(pickle.Unpickler):
-            def find_class(self, module, name):
-                # Try to find HyperbolicEntailmentCones class
-                if name == 'HyperbolicEntailmentCones':
-                    # First try the hyperbolic_entailment_cones module
-                    if 'hyperbolic_entailment_cones' in sys.modules:
-                        mod = sys.modules['hyperbolic_entailment_cones']
-                        if hasattr(mod, 'HyperbolicEntailmentCones'):
-                            return mod.HyperbolicEntailmentCones
-                    # Also try importing it if not already imported
-                    try:
-                        import hyperbolic_entailment_cones
-                        if hasattr(hyperbolic_entailment_cones, 'HyperbolicEntailmentCones'):
-                            return hyperbolic_entailment_cones.HyperbolicEntailmentCones
-                    except:
-                        pass
-                    # Fall back to default behavior (try original module path)
-                # Use default behavior for other classes
-                try:
-                    return super().find_class(module, name)
-                except AttributeError:
-                    # If class is not found in original module, try hyperbolic_entailment_cones
-                    if module == '__main__' and name == 'HyperbolicEntailmentCones':
-                        if 'hyperbolic_entailment_cones' in sys.modules:
-                            mod = sys.modules['hyperbolic_entailment_cones']
-                            if hasattr(mod, 'HyperbolicEntailmentCones'):
-                                return mod.HyperbolicEntailmentCones
-                    raise
-        
-        with open(embedding_file, 'rb') as f:
-            unpickler = CustomUnpickler(f)
-            loaded_data = unpickler.load()
+        # Use load_pkl_file to load the data
+        loaded_data = load_pkl_file(embedding_file)
         
         # Check if it's a dictionary format (from hyperbolic_entailment_cones.py)
         if isinstance(loaded_data, dict) and 'model' in loaded_data and 'id_map' in loaded_data:
@@ -216,14 +163,14 @@ def load_hyperbolic_embeddings(embedding_file="hyperbolic_embeddings.pkl"):
     return _hyperbolic_embeddings_cache
 
 
-def create_embedding_sequence_with_visit_markers(cond_hist, embeddings_cache, max_seq_length=200):
+def create_embedding_sequence_with_visit_markers(cond_hist, loaded_data, max_seq_length=200):
     """
     Create embedding sequence from condition history with visit boundary markers
     
     Args:
         cond_hist: List of lists, each inner list contains codes for one visit
                   Last visit is empty to prevent leakage
-        embeddings_cache: ConditionsHyperbolicEmbedder instance
+        loaded_data: Dictionary format (with 'model' and 'id_map') or ConditionsHyperbolicEmbedder instance
         max_seq_length: Maximum sequence length (for padding)
         
     Returns:
@@ -236,15 +183,16 @@ def create_embedding_sequence_with_visit_markers(cond_hist, embeddings_cache, ma
     if _visit_sep_embedding is None:
         raise ValueError("Visit separator embedding not initialized. Call load_hyperbolic_embeddings() first.")
     
-    embedding_dim = embeddings_cache.get_embedding_dim()
+    embedding_dim = get_embedding_dim_from_data(loaded_data)
     sequence_embeddings = []
     
     # Process each visit (except the last empty one)
     for visit_idx, visit_codes in enumerate(cond_hist[:-1]):  # Skip last empty visit
         # Add embeddings for each code in this visit
         for code in visit_codes:
-            if code in embeddings_cache.code2embedding:
-                sequence_embeddings.append(embeddings_cache.code2embedding[code])
+            embedding = get_embedding_from_data(loaded_data, code)
+            if embedding is not None:
+                sequence_embeddings.append(embedding)
             else:
                 # Use zero embedding for unknown codes
                 sequence_embeddings.append(torch.zeros(embedding_dim))
@@ -350,26 +298,11 @@ def sort_samples_within_patient(samples):
     return by_pid
 
 
-def build_pairs(samples_by_pid, task="current"):
-    """
-    Build training pairs
-    task="current": Use sample's own conditions as labels
-    task="next":    Strictly follow paper, features from time t, labels from time t+1 conditions
-    Returns pairs: list of (X_sample_dict, y_codes_list)
-    """
+def build_pairs(samples_by_pid):
     pairs = []
     for pid, seq in samples_by_pid.items():
-        if task == "current":
-            for s in seq:
-                pairs.append((s, s["conditions"]))
-        elif task == "next":
-            # Must have at least t and t+1
-            for i in range(len(seq) - 1):
-                s_t = seq[i]
-                y_next = seq[i + 1]["conditions"]
-                pairs.append((s_t, y_next))
-        else:
-            raise ValueError("task must be 'current' or 'next'")
+        for i in range(1, len(seq)):
+                pairs.append((seq[i], seq[i]["conditions"]))
     return pairs
 
 
@@ -404,91 +337,6 @@ def multihot_from_sequence(seq_of_lists, stoi):
     return x
 
 
-def vectorize_pair(s, y_codes, vocabs, use_current_step=False, use_hyperbolic_embeddings=False, embedding_file="hyperbolic_embeddings.pkl"):
-    """Vectorize sample pair"""
-    diag_stoi, proc_stoi, drug_stoi, y_stoi = vocabs
-    
-    if use_hyperbolic_embeddings:
-        # Load hyperbolic embeddings if not already cached
-        embeddings_cache = load_hyperbolic_embeddings(embedding_file)
-        embedding_dim = embeddings_cache.get_embedding_dim()
-        
-        # Collect all ICD code embeddings from condition history (except last empty visit)
-        code_embeddings = []
-        for visit_idx, visit_codes in enumerate(s["cond_hist"][:-1]):  # Skip last empty visit
-            for code in visit_codes:
-                if code in embeddings_cache.code2embedding:
-                    code_embeddings.append(embeddings_cache.code2embedding[code])
-                else:
-                    # Use zero embedding for unknown codes
-                    code_embeddings.append(torch.zeros(embedding_dim))
-        
-        # Handle case where no conditions exist
-        if len(code_embeddings) == 0:
-            code_embeddings = [torch.zeros(embedding_dim)]
-        
-        # Return list of embeddings (variable length), will be stacked in prepare_XY
-        # Shape will be (num_codes, embedding_dim) for each patient
-        X = torch.stack(code_embeddings)  # (num_codes, embedding_dim) - variable num_codes per patient
-        
-        return X, y_codes
-    else:
-        # Original multi-hot implementation
-        # Admission prediction: don't look at current step's proc/drug; discharge prediction can look
-        # if use_current_step:
-        #     proc_hist = s["procedures"]
-        #     drug_hist = s["drugs"]
-        # else:
-        #     proc_hist = s["procedures"][:-1] if len(s["procedures"])>0 else []
-        #     drug_hist = s["drugs"][:-1] if len(s["drugs"])>0 else []
-
-        x_diag = multihot_from_sequence(s["cond_hist"], diag_stoi)  # Historical ICD (current step is empty)
-        # x_proc = multihot_from_sequence(proc_hist, proc_stoi)
-        # x_drug = multihot_from_sequence(drug_hist, drug_stoi)
-        # X = torch.cat([x_diag, x_proc, x_drug], dim=0)
-        X = x_diag
-
-        y = torch.zeros(len(y_stoi), dtype=torch.float32)
-        for c in y_codes:
-            if c in y_stoi: 
-                y[y_stoi[c]] = 1.0
-        return X, y
-
-
-def prepare_XY(pairs, vocabs, use_current_step=False, use_hyperbolic_embeddings=False, embedding_file="hyperbolic_embeddings.pkl"):
-    """Prepare training data X and Y"""
-    if use_hyperbolic_embeddings:
-        # Collect ICD code embeddings for each patient (variable length per patient)
-        Xs, Ys = [], []
-        for s, y_codes in pairs:
-            X, y_codes_list = vectorize_pair(s, y_codes, vocabs, use_current_step=use_current_step, 
-                                             use_hyperbolic_embeddings=True, embedding_file=embedding_file)
-            Xs.append(X)  # Each X is (num_codes, embedding_dim) with variable num_codes
-            Ys.append(y_codes_list)
-        
-        # Return as list of tensors (variable length), will use custom collate in DataLoader
-        # Xs is a list of tensors with shapes [(num_codes_i, embedding_dim), ...]
-        
-        # Convert y_codes to multi-hot vectors
-        diag_stoi, proc_stoi, drug_stoi, y_stoi = vocabs
-        Y_tensor = torch.zeros(len(Ys), len(y_stoi), dtype=torch.float32)
-        for i, y_codes_list in enumerate(Ys):
-            for c in y_codes_list:
-                if c in y_stoi: 
-                    Y_tensor[i, y_stoi[c]] = 1.0
-        
-        return Xs, Y_tensor  # Return list of X tensors and Y tensor
-    else:
-        # Original multi-hot implementation
-        Xs, Ys = [], []
-        for s, y_codes in pairs:
-            X, y = vectorize_pair(s, y_codes, vocabs, use_current_step=use_current_step, 
-                                use_hyperbolic_embeddings=False)
-            Xs.append(X)
-            Ys.append(y)
-        return torch.stack(Xs), torch.stack(Ys)
-
-
 def split_by_patient(pairs, test_size=0.2, val_size=0.1, seed=42):
     """Split dataset by patient ID to avoid data leakage"""
     pid2pairs = defaultdict(list)
@@ -506,198 +354,3 @@ def split_by_patient(pairs, test_size=0.2, val_size=0.1, seed=42):
         return out
     
     return collect(tr_pids), collect(va_pids), collect(te_pids)
-
-
-def dialysis_prediction_mimic4_fn(patient: Patient):
-    """
-    Data processing function for MIMIC-IV dialysis prediction task for AKI patients
-    Based on the approach from aki.ipynb but adapted for MIMIC-IV structure
-    """
-    samples = []
-    
-    # AKI ICD codes for MIMIC-IV (ICD-9 format)
-    # Based on debug analysis: 5849, 5845, 5848 are the most common AKI codes
-    aki_codes = ["584", "584.5", "584.6", "584.7", "584.8", "584.9", "5849", "5845", "5848"]
-    
-    # Dialysis procedure codes for MIMIC-IV (ICD-9 format)
-    # Based on debug analysis: 3995 is the main dialysis procedure code
-    dialysis_codes_cpt = ['3995', '3996']  # Hemodialysis and peritoneal dialysis
-    dialysis_codes_icd = ['585', '585.1', '585.2', '585.3', '585.4', '585.5', '585.6', '585.9',  # Chronic kidney disease
-                         '586', 'V45.1', 'V45.11', 'V45.12', 'V58.61', 'V58.66', 'V58.67']  # Dialysis-related codes
-    dialysis_codes_hcpcs = ['6909', '0SP909Z']  # Other dialysis-related procedures
-    
-    # Sort visits by encounter time
-    visit_ls = sorted(patient.visits.keys(), key=lambda vid: patient.visits[vid].encounter_time)
-    
-    # Check if patient has AKI diagnosis
-    has_aki = False
-    aki_first_date = None
-    
-    for visit_id in visit_ls:
-        visit = patient.visits[visit_id]
-        conditions = visit.get_code_list(table="diagnoses_icd")
-        
-        # Check for AKI diagnosis
-        for condition in conditions:
-            if condition in aki_codes:
-                has_aki = True
-                if aki_first_date is None:
-                    aki_first_date = visit.encounter_time
-                break
-        
-        if has_aki:
-            break
-    
-    if not has_aki:
-        return []
-    
-    # Check for dialysis procedures after AKI diagnosis
-    has_dialysis = False
-    dialysis_date = None
-    
-    for visit_id in visit_ls:
-        visit = patient.visits[visit_id]
-        
-        # Skip visits before AKI diagnosis
-        if visit.encounter_time < aki_first_date:
-            continue
-            
-        procedures = visit.get_code_list(table="procedures_icd")
-        
-        # Check for dialysis procedures
-        for procedure in procedures:
-            if (procedure in dialysis_codes_cpt or 
-                procedure in dialysis_codes_icd or 
-                procedure in dialysis_codes_hcpcs):
-                has_dialysis = True
-                dialysis_date = visit.encounter_time
-                break
-        
-        if has_dialysis:
-            break
-    
-    # Collect medication data for AKI patients
-    # We'll use all medications from visits around AKI diagnosis
-    medications = []
-    conditions_history = []
-    procedures_history = []
-    visit_times = []
-    
-    for visit_id in visit_ls:
-        visit = patient.visits[visit_id]
-        
-        # Include medications from visits within a reasonable timeframe around AKI
-        # (e.g., 30 days before AKI to 30 days after AKI)
-        time_diff = (visit.encounter_time - aki_first_date).days
-        
-        if -30 <= time_diff <= 30:  # 30 days before and after AKI
-            drugs = visit.get_code_list(table="prescriptions")
-            # Convert to ATC 3 level (first 4 characters)
-            drugs_atc3 = [drug[:4] for drug in drugs if len(drug) >= 4]
-            
-            conditions = visit.get_code_list(table="diagnoses_icd")
-            procedures = visit.get_code_list(table="procedures_icd")
-            
-            medications.extend(drugs_atc3)
-            conditions_history.extend(conditions)
-            procedures_history.extend(procedures)
-            visit_times.append(visit.encounter_time)
-    
-    # Remove duplicates while preserving order
-    medications = list(dict.fromkeys(medications))
-    conditions_history = list(dict.fromkeys(conditions_history))
-    procedures_history = list(dict.fromkeys(procedures_history))
-    
-    if len(medications) == 0:
-        return []
-    
-    # Create sample for dialysis prediction
-    sample = {
-        "patient_id": patient.patient_id,
-        "visit_id": f"{patient.patient_id}_aki_visit",
-        "medications": medications,
-        "conditions": conditions_history,
-        "procedures": procedures_history,
-        "aki_date": aki_first_date.strftime("%Y-%m-%d %H:%M"),
-        "dialysis_date": dialysis_date.strftime("%Y-%m-%d %H:%M") if dialysis_date else "None",
-        "dialysis_label": int(has_dialysis)
-    }
-    
-    return [sample]
-
-
-def build_dialysis_pairs(samples):
-    """
-    Build training pairs for dialysis prediction
-    Returns pairs: list of (X_sample_dict, y_label)
-    """
-    pairs = []
-    for sample in samples:
-        # Create feature vector from medications, conditions, and procedures
-        features = {
-            "patient_id": sample["patient_id"],
-            "medications": sample["medications"],
-            "conditions": sample["conditions"], 
-            "procedures": sample["procedures"]
-        }
-        label = sample["dialysis_label"]
-        pairs.append((features, label))
-    
-    return pairs
-
-
-def build_dialysis_vocab_from_pairs(pairs):
-    """Build vocabulary from dialysis prediction training pairs"""
-    med_c, cond_c, proc_c = Counter(), Counter(), Counter()
-    
-    for features, label in pairs:
-        med_c.update(features["medications"])
-        cond_c.update(features["conditions"])
-        proc_c.update(features["procedures"])
-    
-    def mk_vocab(cnt):
-        itos = [c for c, _ in cnt.most_common()]
-        stoi = {c: i for i, c in enumerate(itos)}
-        return stoi, itos
-    
-    return mk_vocab(med_c), mk_vocab(cond_c), mk_vocab(proc_c)
-
-
-def vectorize_dialysis_pair(features, label, vocabs):
-    """Vectorize dialysis prediction sample pair"""
-    med_stoi, cond_stoi, proc_stoi = vocabs
-    
-    # Create multi-hot vectors for each modality
-    x_med = torch.zeros(len(med_stoi), dtype=torch.float32)
-    for med in features["medications"]:
-        if med in med_stoi:
-            x_med[med_stoi[med]] = 1.0
-    
-    x_cond = torch.zeros(len(cond_stoi), dtype=torch.float32)
-    for cond in features["conditions"]:
-        if cond in cond_stoi:
-            x_cond[cond_stoi[cond]] = 1.0
-    
-    x_proc = torch.zeros(len(proc_stoi), dtype=torch.float32)
-    for proc in features["procedures"]:
-        if proc in proc_stoi:
-            x_proc[proc_stoi[proc]] = 1.0
-    
-    # Concatenate all features
-    X = torch.cat([x_med, x_cond, x_proc], dim=0)
-    
-    # Binary label
-    y = torch.tensor(label, dtype=torch.float32)
-    
-    return X, y
-
-
-def prepare_dialysis_XY(pairs, vocabs):
-    """Prepare dialysis prediction training data X and Y"""
-    Xs, Ys = [], []
-    for features, label in pairs:
-        X, y = vectorize_dialysis_pair(features, label, vocabs)
-        Xs.append(X)
-        Ys.append(y)
-    return torch.stack(Xs), torch.stack(Ys)
-

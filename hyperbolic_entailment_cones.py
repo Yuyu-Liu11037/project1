@@ -445,6 +445,52 @@ class HyperbolicEntailmentCones(nn.Module):
 # Training helper
 # =========================
 
+def get_learning_rate(epoch: int, initial_lr: float, lr_decay_type: str = "none", 
+                     lr_decay_rate: float = 0.1, lr_decay_step: int = 50,
+                     lr_min: float = 1e-6, lr_warmup_epochs: int = 0) -> float:
+    """
+    Calculate learning rate with decay schedule.
+    
+    Args:
+        epoch: Current epoch (1-indexed)
+        initial_lr: Initial learning rate
+        lr_decay_type: Type of decay ("none", "step", "exponential", "cosine")
+        lr_decay_rate: Decay rate (for step/exponential) or T_max (for cosine)
+        lr_decay_step: Step size for step decay
+        lr_min: Minimum learning rate
+        lr_warmup_epochs: Number of warmup epochs (linear warmup)
+    
+    Returns:
+        Current learning rate
+    """
+    # Warmup phase
+    if epoch <= lr_warmup_epochs and lr_warmup_epochs > 0:
+        return initial_lr * (epoch / lr_warmup_epochs)
+    
+    # Adjust epoch for decay calculation (after warmup)
+    effective_epoch = epoch - lr_warmup_epochs
+    
+    if lr_decay_type == "none":
+        return initial_lr
+    elif lr_decay_type == "step":
+        # Step decay: lr = initial_lr * (decay_rate ^ floor(epoch / decay_step))
+        steps = effective_epoch // lr_decay_step
+        current_lr = initial_lr * (lr_decay_rate ** steps)
+    elif lr_decay_type == "exponential":
+        # Exponential decay: lr = initial_lr * (decay_rate ^ epoch)
+        current_lr = initial_lr * (lr_decay_rate ** effective_epoch)
+    elif lr_decay_type == "cosine":
+        # Cosine annealing: lr = lr_min + (initial_lr - lr_min) * (1 + cos(π * epoch / T_max)) / 2
+        # lr_decay_rate is used as T_max (period)
+        if effective_epoch >= lr_decay_rate:
+            current_lr = lr_min
+        else:
+            current_lr = lr_min + (initial_lr - lr_min) * (1 + math.cos(math.pi * effective_epoch / lr_decay_rate)) / 2
+    else:
+        raise ValueError(f"Unknown lr_decay_type: {lr_decay_type}")
+    
+    return max(current_lr, lr_min)
+
 def make_id_map(codes: List[str]) -> Dict[str, int]:
     return {c: i for i, c in enumerate(codes)}
 
@@ -521,11 +567,23 @@ def train_hyperbolic_cones(
     eps: float = 0.1,
     K_scale: float = 0.9,
     seed: int = 42,
-    device: str = "cpu"
+    device: str = "cpu",
+    lr_decay_type: str = "none",
+    lr_decay_rate: float = 0.1,
+    lr_decay_step: int = 50,
+    lr_min: float = 1e-6,
+    lr_warmup_epochs: int = 0
 ):
     """
     parent_child_edges: list of (parent_code, child_code), meaning parent entails child.
     Returns: trained model and code->id mapping
+    
+    Args:
+        lr_decay_type: Type of learning rate decay ("none", "step", "exponential", "cosine")
+        lr_decay_rate: Decay rate (for step/exponential) or T_max (for cosine)
+        lr_decay_step: Step size for step decay
+        lr_min: Minimum learning rate
+        lr_warmup_epochs: Number of warmup epochs (linear warmup)
     """
     random.seed(seed)
     torch.manual_seed(seed)
@@ -656,13 +714,24 @@ def train_hyperbolic_cones(
                 grad_max = grad_mean = grad_norm = 0.0
         # ========== END DEBUG ==========
         
-        model.riemannian_step(lr)
+        # Calculate current learning rate with decay
+        current_lr = get_learning_rate(
+            epoch=ep,
+            initial_lr=lr,
+            lr_decay_type=lr_decay_type,
+            lr_decay_rate=lr_decay_rate,
+            lr_decay_step=lr_decay_step,
+            lr_min=lr_min,
+            lr_warmup_epochs=lr_warmup_epochs
+        )
+        
+        model.riemannian_step(current_lr)
 
         if ep % 20 == 0 or ep == 1:
             with torch.no_grad():
                 # simple monitoring: fraction of satisfied positives (E ~ 0) on current batch
                 sat = (pos_energy < 1e-1).float().mean().item()
-            print(f"[epoch {ep:4d}] loss={loss.item():.6f}  pos_satisfied(batch)={sat*100:.2f}%")
+            print(f"[epoch {ep:4d}] loss={loss.item():.6f}  pos_satisfied(batch)={sat*100:.2f}%  lr={current_lr:.6f}")
         
         # Evaluate on all data every 1000 epochs
         if ep % 1000 == 0 and len(edges_id) > 0:
@@ -721,7 +790,7 @@ def train_hyperbolic_cones(
                 emb_norms = model.emb.data.norm(dim=1)
                 print(f"  Embedding norms: min={emb_norms.min().item():.4f}, max={emb_norms.max().item():.4f}, mean={emb_norms.mean().item():.4f}")
                 print(f"\nModel parameters:")
-                print(f"  K={model.K:.6f}, eps={model.eps:.6f}, lr={lr:.6f}")
+                print(f"  K={model.K:.6f}, eps={model.eps:.6f}, initial_lr={lr:.6f}, current_lr={current_lr:.6f}")
                 print(f"\nGradient stats (before update):")
                 print(f"  grad_norm={grad_norm:.8f}, grad_max={grad_max:.8f}, grad_mean={grad_mean:.8f}")
                 
@@ -916,7 +985,12 @@ def train_and_save_cones(
     eps: float = 0.1,
     K_scale: float = 0.9,
     seed: int = 42,
-    device: str = "cpu"
+    device: str = "cpu",
+    lr_decay_type: str = "none",
+    lr_decay_rate: float = 0.1,
+    lr_decay_step: int = 50,
+    lr_min: float = 1e-6,
+    lr_warmup_epochs: int = 0
 ):
     """
     Train hyperbolic entailment cones model and save to file.
@@ -934,6 +1008,11 @@ def train_and_save_cones(
         K_scale: K scale parameter
         seed: Random seed
         device: Device to use for training
+        lr_decay_type: Type of learning rate decay ("none", "step", "exponential", "cosine")
+        lr_decay_rate: Decay rate (for step/exponential) or T_max (for cosine)
+        lr_decay_step: Step size for step decay
+        lr_min: Minimum learning rate
+        lr_warmup_epochs: Number of warmup epochs (linear warmup)
     """
     print(f"Loading ICD-10 codes from: {icd10_file_path}")
     codes = load_icd10_codes(icd10_file_path)
@@ -962,6 +1041,8 @@ def train_and_save_cones(
     print(f"Training hyperbolic entailment cones model...")
     print(f"  dim={dim}, epochs={epochs}, batch_size={batch_size}, lr={lr}")
     print(f"  neg_ratio={neg_ratio}, margin={margin}, eps={eps}, K_scale={K_scale}")
+    if lr_decay_type != "none":
+        print(f"  lr_decay: type={lr_decay_type}, rate={lr_decay_rate}, step={lr_decay_step}, min={lr_min}, warmup={lr_warmup_epochs}")
     
     model, id_map = train_hyperbolic_cones(
         codes=all_codes,  # Use all_codes including generated parents
@@ -975,7 +1056,12 @@ def train_and_save_cones(
         eps=eps,
         K_scale=K_scale,
         seed=seed,
-        device=device
+        device=device,
+        lr_decay_type=lr_decay_type,
+        lr_decay_rate=lr_decay_rate,
+        lr_decay_step=lr_decay_step,
+        lr_min=lr_min,
+        lr_warmup_epochs=lr_warmup_epochs
     )
     
     print(f"Training completed!")
@@ -999,28 +1085,6 @@ def train_and_save_cones(
     print(f"Model parameters: dim={dim}, num_codes={len(codes)}, K={model.K:.6f}")
     
     return model, id_map
-
-
-def load_cones_model(model_file: str):
-    """
-    Load trained hyperbolic entailment cones model from file.
-    
-    Args:
-        model_file: Path to the saved model file
-        
-    Returns:
-        Dictionary containing model, id_map, and other metadata
-    """
-    with open(model_file, 'rb') as f:
-        save_data = pickle.load(f)
-    
-    print(f"Loaded hyperbolic cones model from: {model_file}")
-    print(f"  Dimension: {save_data['dim']}")
-    print(f"  Number of codes: {save_data['num_codes']}")
-    print(f"  Epsilon: {save_data['eps']}")
-    print(f"  K: {save_data['K']:.6f}")
-    
-    return save_data
 
 
 def parse_args():
@@ -1053,6 +1117,19 @@ def parse_args():
                        help='Negative sampling ratio (default: 10)')
     parser.add_argument('--margin', type=float, default=2.0,
                        help='Margin for max-margin loss')
+    
+    # Learning rate decay parameters
+    parser.add_argument('--lr_decay_type', type=str, default='none',
+                       choices=['none', 'step', 'exponential', 'cosine'],
+                       help='Type of learning rate decay: none, step, exponential, or cosine')
+    parser.add_argument('--lr_decay_rate', type=float, default=100000,
+                       help='Decay rate for step/exponential decay, or T_max for cosine decay')
+    parser.add_argument('--lr_decay_step', type=int, default=50,
+                       help='Step size for step decay (default: 50)')
+    parser.add_argument('--lr_min', type=float, default=5.0,
+                       help='Minimum learning rate')
+    parser.add_argument('--lr_warmup_epochs', type=int, default=0,
+                       help='Number of warmup epochs with linear warmup (default: 0)')
     
     # Other parameters
     parser.add_argument('--seed', type=int, default=42,
@@ -1087,7 +1164,12 @@ if __name__ == "__main__":
         eps=args.eps,
         K_scale=args.K_scale,
         seed=args.seed,
-        device=args.device
+        device=args.device,
+        lr_decay_type=args.lr_decay_type,
+        lr_decay_rate=args.lr_decay_rate,
+        lr_decay_step=args.lr_decay_step,
+        lr_min=args.lr_min,
+        lr_warmup_epochs=args.lr_warmup_epochs
     )
     
     print("Hyperbolic entailment cones training completed!")

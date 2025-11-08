@@ -9,19 +9,16 @@ import random
 import numpy as np
 from collections import defaultdict
 from sklearn.model_selection import KFold
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Dataset
 
-from model.models import create_model, create_model_from_data
+from model.models import create_model
 from util.data_processing import (
     sort_samples_within_patient, 
     build_pairs, 
     build_vocab_from_pairs,
-    prepare_XY, 
     split_by_patient,
-    build_dialysis_pairs,
-    build_dialysis_vocab_from_pairs,
-    prepare_dialysis_XY
 )
+from eval_embedding import load_pkl_file
 from metrics.metrics import bce_pos_weight, evaluate
 
 
@@ -59,7 +56,6 @@ def aggregate_seed_results(seed_results):
 
 def train_diagnosis_model_on_samples(samples,
                            model_type="mlp",      # "mlp" or "transformer"
-                           task="next",          # "next" aligns with paper; "current" uses existing labels
                            use_current_step=False, # Admission prediction(False) or discharge prediction(True)
                            hidden=512, lr=1e-3, wd=1e-5,
                            epochs=10, seed=42, train_percentage=1.0,
@@ -71,7 +67,11 @@ def train_diagnosis_model_on_samples(samples,
                            use_gpu=True, force_cpu=False,  # GPU control
                            use_hyperbolic_embeddings=False,  # Use hyperbolic embeddings
                            embedding_file="hyperbolic_embeddings.pkl",  # Path to embeddings file
-                           max_seq_length=200,    # Maximum sequence length for sequential data
+                           max_seq_length=300,    # Maximum sequence length for sequential data
+                           use_lr_scheduler=True,  # Enable learning rate scheduler
+                           lr_scheduler_factor=0.5,  # Factor by which learning rate will be reduced
+                           lr_scheduler_patience=25,  # Number of epochs with no improvement after which learning rate will be reduced
+                           lr_scheduler_min_lr=1e-6,  # Minimum learning rate
                            **model_kwargs):
     """
     Train model for diagnosis prediction
@@ -92,6 +92,10 @@ def train_diagnosis_model_on_samples(samples,
         patience: Number of epochs to wait before stopping (default: 10)
         min_delta: Minimum change to qualify as improvement (default: 0.001)
         monitor_metric: Metric to monitor for early stopping (default: 'Acc@10')
+        use_lr_scheduler: Enable learning rate scheduler (default: True)
+        lr_scheduler_factor: Factor by which learning rate will be reduced (default: 0.5)
+        lr_scheduler_patience: Number of epochs with no improvement after which learning rate will be reduced (default: 5)
+        lr_scheduler_min_lr: Minimum learning rate (default: 1e-6)
         **model_kwargs: Model-specific parameters (e.g., num_heads, num_layers, etc.)
     
     Returns:
@@ -105,12 +109,11 @@ def train_diagnosis_model_on_samples(samples,
     # Each sample is a patient's visit record
     # Except for adm_time and cond_hist, other fields are specific to this visit (these two fields contain the patient's past records)
     # In each visit, cond_hist contains the patient's past condition original codes, but the conditions field is CCS-mapped codes
-    # TODO: redundant
     by_pid = sort_samples_within_patient(samples)   # defaultdict(list), {"patient_id": [sample1, sample2, ...]}
     # print(f"\nBy pid: {by_pid['10001401']}")
     # build_pairs has issues... We should use all past visit records of the patient to predict the next diagnosis, not the previous visit
     # Never mind, the cond_hist field contains all previous visits
-    pairs = build_pairs(by_pid, task=task)   # (sample_t, label_t+1)
+    pairs = build_pairs(by_pid)  # [(sample, sample["conditions"])]
     # print(f"\nPairs: {pairs[10]}")
 
     # 2) Patient-level split
@@ -127,81 +130,102 @@ def train_diagnosis_model_on_samples(samples,
         print(f"Few-shot training: Using {len(train_pairs)}/{original_train_size} samples ({train_percentage:.1%} of training data)")
 
     # 3) Vocabulary
-    (diag_stoi,_), (proc_stoi,_), (drug_stoi,_), (y_stoi, y_itos) = build_vocab_from_pairs(train_pairs)
+    (diag_stoi, diag_itos), (proc_stoi,_), (drug_stoi,_), (y_stoi, y_itos) = build_vocab_from_pairs(train_pairs)
+    vocab_size = len(diag_stoi)
     vocabs = (diag_stoi, proc_stoi, drug_stoi, y_stoi)
 
-    # 4) Vectorization
-    if use_hyperbolic_embeddings:
-        print(f"Using hyperbolic embeddings with variable-length sequences")
-        Xtr, Ytr = prepare_XY(train_pairs, vocabs, use_current_step=use_current_step, 
-                              use_hyperbolic_embeddings=True, embedding_file=embedding_file)
-        Xva, Yva = prepare_XY(val_pairs, vocabs, use_current_step=use_current_step,
-                              use_hyperbolic_embeddings=True, embedding_file=embedding_file)
-        Xte, Yte = prepare_XY(test_pairs, vocabs, use_current_step=use_current_step,
-                             use_hyperbolic_embeddings=True, embedding_file=embedding_file)
-        # Xtr is a list of tensors, Ytr is a tensor
-        print(f"\nTrain data: list of {len(Xtr)} tensors with variable lengths")
-        print(f"Train label shape: {Ytr.shape}")  # (batch_size, num_labels)
-        # Create list dataset for variable-length sequences
-        train_dataset = list(zip(Xtr, Ytr))
-        val_dataset = list(zip(Xva, Yva))
-        test_dataset = list(zip(Xte, Yte))
-    else:
-        Xtr, Ytr = prepare_XY(train_pairs, vocabs, use_current_step=use_current_step, 
-                            use_hyperbolic_embeddings=False)
-        Xva, Yva = prepare_XY(val_pairs, vocabs, use_current_step=use_current_step,
-                            use_hyperbolic_embeddings=False)
-        Xte, Yte = prepare_XY(test_pairs, vocabs, use_current_step=use_current_step,
-                            use_hyperbolic_embeddings=False)
-        print(f"\nTrain data shape: {Xtr.shape}")   # 100% [34972, 19733]
-        print(f"\nTrain label shape: {Ytr.shape}")   # 100% [34972, 274]
-        train_dataset = TensorDataset(Xtr, Ytr)
-        val_dataset = TensorDataset(Xva, Yva)
-        test_dataset = TensorDataset(Xte, Yte)
+    # 4) Dataset creation
+    class DiagnosisDataset(Dataset):
+        """Custom Dataset for diagnosis prediction"""
+        def __init__(self, pairs, diag_stoi, y_stoi, max_seq_len):
+            """
+            Args:
+                pairs: List of (sample, y_codes_list) tuples
+                diag_stoi: Dictionary mapping diagnosis codes to integers
+                y_stoi: Dictionary mapping label codes to integers
+                max_seq_len: Maximum sequence length for padding
+            """
+            self.pairs = pairs
+            self.diag_stoi = diag_stoi
+            self.y_stoi = y_stoi
+            self.max_seq_len = max_seq_len
+        
+        def __len__(self):
+            return len(self.pairs)
+        
+        def __getitem__(self, idx):
+            sample, y_codes_list = self.pairs[idx]
+            
+            # Extract cond_hist from sample (list of lists)
+            cond_hist = sample.get("cond_hist", [])
+            
+            # Flatten cond_hist into a single list of codes
+            # Skip the last empty visit (to prevent leakage)
+            flattened_codes = []
+            if len(cond_hist) > 1:
+                # Skip last empty visit
+                for visit_codes in cond_hist[:-1]:
+                    flattened_codes.extend(visit_codes)
+            elif len(cond_hist) == 1:
+                # Only one visit (should be empty, but handle it anyway)
+                flattened_codes.extend(cond_hist[0])
+            
+            # Convert codes to integers using diag_stoi
+            condition_tokens = []
+            for code in flattened_codes:
+                if code in self.diag_stoi:
+                    condition_tokens.append(self.diag_stoi[code])
+            
+            # Pad to max_seq_len with 0
+            if len(condition_tokens) > self.max_seq_len:
+                condition_tokens = condition_tokens[:self.max_seq_len]
+            else:
+                condition_tokens = condition_tokens + [0] * (self.max_seq_len - len(condition_tokens))
+            
+            # Create multi-hot vector from y_codes_list using y_stoi
+            label = torch.zeros(len(self.y_stoi), dtype=torch.float32)
+            for code in y_codes_list:
+                if code in self.y_stoi:
+                    label[self.y_stoi[code]] = 1.0
+            
+            return torch.tensor(condition_tokens, dtype=torch.long), label
+    
+    train_dataset = DiagnosisDataset(train_pairs, diag_stoi, y_stoi, max_seq_length)
+    val_dataset = DiagnosisDataset(val_pairs, diag_stoi, y_stoi, max_seq_length)
+    test_dataset = DiagnosisDataset(test_pairs, diag_stoi, y_stoi, max_seq_length)
 
     # 5) Create DataLoaders for batch training
-    # Custom collate function for variable-length sequences when using hyperbolic embeddings
-    if use_hyperbolic_embeddings:
-        def collate_fn(batch):
-            """Collate function for variable-length sequences"""
-            X_batch, Y_batch = zip(*batch)
-            # X_batch is a list of tensors with variable shapes (num_codes_i, embedding_dim)
-            # Y_batch is a list of label tensors (num_labels,)
-            # Return as list of X tensors and stacked Y tensor
-            return list(X_batch), torch.stack(Y_batch)
-        
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-    else:
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     # 6) Model and loss (multi-label)
-    # input: (batch_size, in_dim), in_dim = historical diagnosis codes (ICD)len(diag_stoi) + historical procedure codes (Procedures)len(proc_stoi) + historical drug codes (ATC-3)len(drug_stoi)
-    # output: (batch_size, out_dim), out_dim = label codes (CCS)len(y_stoi), size of label vocabulary
-    
     device = torch.device('cuda')
-    
-    # Create model with automatic input dimension detection
-    # For hyperbolic embeddings, use first sample to determine embedding_dim
-    if use_hyperbolic_embeddings:
-        # Xtr is a list, get embedding_dim from first sample
-        sample_X = Xtr[0]  # (num_codes, embedding_dim)
-        embedding_dim = sample_X.shape[1]
-        # Create a dummy 3D tensor for model creation
-        dummy_X = sample_X.unsqueeze(0)  # (1, num_codes, embedding_dim)
-        model = create_model_from_data(model_type, dummy_X, hidden=hidden, out_dim=Ytr.size(1), 
-                                      use_hyperbolic_embeddings=True, **model_kwargs)
-    else:
-        model = create_model_from_data(model_type, Xtr, hidden=hidden, out_dim=Ytr.size(1), 
-                                      use_hyperbolic_embeddings=False, **model_kwargs)
+    out_dim = len(y_stoi)  # Number of label classes
+    save_data = load_pkl_file(embedding_file) if use_hyperbolic_embeddings else None
+    # Pass diag_itos to model for converting token IDs back to code strings when using hyperbolic embeddings
+    model = create_model(model_type, vocab_size=vocab_size, hidden=hidden, out_dim=out_dim, 
+                        save_data=save_data, diag_itos=diag_itos if use_hyperbolic_embeddings else None, **model_kwargs)
     model = model.to(device)  # Move model to device
     
+    # Calculate positive weights from training dataset
+    # Collect all labels from training dataset
+    all_labels = []
+    for _, label in train_dataset:
+        all_labels.append(label)
+    Ytr = torch.stack(all_labels)
     pw = bce_pos_weight(Ytr).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pw)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    
+    # Create learning rate scheduler
+    if use_lr_scheduler:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode='max', factor=lr_scheduler_factor, 
+            patience=lr_scheduler_patience, min_lr=lr_scheduler_min_lr, verbose=True
+        )
+    else:
+        scheduler = None
 
     # 7) Training loop with batches and early stopping
     best_metric = -float('inf')
@@ -216,13 +240,11 @@ def train_diagnosis_model_on_samples(samples,
         # Training phase
         for batch_X, batch_Y in train_loader:
             batch_Y = batch_Y.to(device)
-            # batch_X is either a tensor (regular) or list of tensors (hyperbolic embeddings)
-            if use_hyperbolic_embeddings:
-                # batch_X is a list of tensors, move each to device
-                batch_X = [x.to(device) for x in batch_X]
-            else:
-                batch_X = batch_X.to(device)
+            batch_X = batch_X.to(device)
             
+            # print(batch_X.shape, batch_Y.shape)
+            # print(batch_X[0])
+            # print(batch_Y[0])
             logits = model(batch_X)
             loss = criterion(logits, batch_Y)
             
@@ -240,10 +262,19 @@ def train_diagnosis_model_on_samples(samples,
             val_metrics = evaluate_batched(model, val_loader, ks=(10, 20, 30), device=device)
             current_metric = val_metrics[monitor_metric]
             
-            print(f"Epoch {ep:02d} | avg_loss={avg_loss:.4f} | "
-                  f"val P@10={val_metrics['P@10']:.4f} Acc@10={val_metrics['Acc@10']:.4f} "
-                  f"P@20={val_metrics['P@20']:.4f} Acc@20={val_metrics['Acc@20']:.4f} "
-                  f"P@30={val_metrics['P@30']:.4f} Acc@30={val_metrics['Acc@30']:.4f}")
+            # Update learning rate scheduler
+            if scheduler is not None:
+                scheduler.step(current_metric)
+                current_lr = opt.param_groups[0]['lr']
+                print(f"Epoch {ep:02d} | avg_loss={avg_loss:.4f} | lr={current_lr:.2e} | "
+                      f"val P@10={val_metrics['P@10']:.4f} Acc@10={val_metrics['Acc@10']:.4f} "
+                      f"P@20={val_metrics['P@20']:.4f} Acc@20={val_metrics['Acc@20']:.4f} "
+                      f"P@30={val_metrics['P@30']:.4f} Acc@30={val_metrics['Acc@30']:.4f}")
+            else:
+                print(f"Epoch {ep:02d} | avg_loss={avg_loss:.4f} | "
+                      f"val P@10={val_metrics['P@10']:.4f} Acc@10={val_metrics['Acc@10']:.4f} "
+                      f"P@20={val_metrics['P@20']:.4f} Acc@20={val_metrics['Acc@20']:.4f} "
+                      f"P@30={val_metrics['P@30']:.4f} Acc@30={val_metrics['Acc@30']:.4f}")
             
             # Early stopping logic
             if early_stopping:
@@ -267,11 +298,6 @@ def train_diagnosis_model_on_samples(samples,
     print("[TEST]", test_metrics)
     
     return model, vocabs, y_itos, test_metrics
-
-
-def train_mlp_on_samples(samples, **kwargs):
-    """Backward compatible MLP training function"""
-    return train_diagnosis_model_on_samples(samples, model_type="mlp", **kwargs)
 
 
 def evaluate_batched(model, data_loader, ks=(10, 20, 30), device=None):
@@ -331,262 +357,3 @@ def evaluate_batched(model, data_loader, ks=(10, 20, 30), device=None):
         metrics[f"Recall@{k}"] = r_at_k
     
     return metrics
-
-
-def train_dialysis_model_on_samples(samples,
-                                   model_type="mlp",
-                                   hidden=512, lr=1e-3, wd=1e-5,
-                                   epochs=10, seed=42, train_percentage=1.0,
-                                   batch_size=32,
-                                   early_stopping=True,
-                                   patience=10,
-                                   min_delta=0.001,
-                                   monitor_metric='accuracy',
-                                   use_gpu=True, force_cpu=False,
-                                   **model_kwargs):
-    """
-    Train model for dialysis prediction (binary classification)
-    
-    Args:
-        samples: Sample data from dialysis_prediction_mimic4_fn
-        model_type: "mlp" or "transformer", model type
-        hidden: Hidden layer dimension
-        lr: Learning rate
-        wd: Weight decay
-        epochs: Number of training epochs
-        seed: Random seed
-        train_percentage: Percentage of training data to use (0.01-1.0)
-        batch_size: Batch size for training
-        early_stopping: Enable early stopping
-        patience: Number of epochs to wait before stopping
-        min_delta: Minimum change to qualify as improvement
-        monitor_metric: Metric to monitor for early stopping
-        use_gpu: Use GPU if available
-        force_cpu: Force CPU usage
-        **model_kwargs: Model-specific parameters
-    
-    Returns:
-        model: Trained model
-        vocabs: Vocabulary dictionaries
-        test_metrics: Test set evaluation metrics
-    """
-    print(f"\nStarting dialysis prediction training...")
-    print(f"Total samples: {len(samples)}")
-    
-    # Count dialysis vs non-dialysis patients
-    dialysis_count = sum(1 for s in samples if s['dialysis_label'] == 1)
-    non_dialysis_count = len(samples) - dialysis_count
-    print(f"Dialysis patients: {dialysis_count}, Non-dialysis patients: {non_dialysis_count}")
-    
-    # Build pairs for dialysis prediction
-    pairs = build_dialysis_pairs(samples)
-    print(f"Total pairs: {len(pairs)}")
-    
-    # Split by patient ID to avoid data leakage
-    train_pairs, val_pairs, test_pairs = split_dialysis_by_patient(pairs, seed=seed)
-    
-    # Apply few-shot sampling to training data
-    if train_percentage < 1.0:
-        torch.manual_seed(seed)
-        random.seed(seed)
-        original_train_size = len(train_pairs)
-        sample_size = int(original_train_size * train_percentage)
-        train_pairs = random.sample(train_pairs, sample_size)
-        print(f"Few-shot training: Using {len(train_pairs)}/{original_train_size} samples ({train_percentage:.1%})")
-    
-    # Build vocabulary
-    (med_stoi, med_itos), (cond_stoi, cond_itos), (proc_stoi, proc_itos) = build_dialysis_vocab_from_pairs(train_pairs)
-    vocabs = (med_stoi, cond_stoi, proc_stoi)
-    
-    print(f"Vocabulary sizes - Medications: {len(med_stoi)}, Conditions: {len(cond_stoi)}, Procedures: {len(proc_stoi)}")
-    
-    # Vectorize data
-    Xtr, Ytr = prepare_dialysis_XY(train_pairs, vocabs)
-    Xva, Yva = prepare_dialysis_XY(val_pairs, vocabs)
-    Xte, Yte = prepare_dialysis_XY(test_pairs, vocabs)
-    
-    print(f"Train data shape: {Xtr.shape}")
-    print(f"Train labels shape: {Ytr.shape}")
-    print(f"Train labels distribution: {Ytr.sum().item()}/{len(Ytr)} positive")
-    
-    # Create DataLoaders
-    train_dataset = TensorDataset(Xtr, Ytr)
-    val_dataset = TensorDataset(Xva, Yva)
-    test_dataset = TensorDataset(Xte, Yte)
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    
-    # Setup device
-    if force_cpu:
-        device = torch.device('cpu')
-        print("Using device: cpu (forced)")
-    elif use_gpu and torch.cuda.is_available():
-        device = torch.device('cuda')
-        print(f"Using device: {device}")
-    else:
-        device = torch.device('cpu')
-        print(f"Using device: {device} (GPU not available or disabled)")
-    
-    # Create model for binary classification
-    model = create_model(model_type, Xtr.size(1), hidden=hidden, out_dim=1, **model_kwargs)
-    model = model.to(device)
-    
-    # Binary classification loss
-    criterion = nn.BCEWithLogitsLoss()
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
-    
-    # Training loop with early stopping
-    best_metric = -float('inf')
-    patience_counter = 0
-    best_model_state = None
-    
-    for ep in range(1, epochs + 1):
-        model.train()
-        epoch_loss = 0.0
-        num_batches = 0
-        
-        # Training phase
-        for batch_X, batch_Y in train_loader:
-            batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
-            logits = model(batch_X).squeeze()
-            loss = criterion(logits, batch_Y)
-            
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            
-            epoch_loss += loss.item()
-            num_batches += 1
-        
-        avg_loss = epoch_loss / num_batches
-        
-        # Validation phase - check every epoch for early stopping
-        if ep % 1 == 0:
-            val_metrics = evaluate_dialysis_batched(model, val_loader, device=device)
-            current_metric = val_metrics[monitor_metric]
-            
-            print(f"Epoch {ep}: Loss={avg_loss:.4f}, Val {monitor_metric}={current_metric:.4f}")
-            
-            # Early stopping logic
-            if early_stopping:
-                if current_metric > best_metric + min_delta:
-                    best_metric = current_metric
-                    patience_counter = 0
-                    best_model_state = model.state_dict().copy()
-                    print(f"  → New best {monitor_metric}: {best_metric:.4f}")
-                else:
-                    patience_counter += 1
-                    
-                if patience_counter >= patience:
-                    model.load_state_dict(best_model_state)
-                    print(f"\nEarly stopping triggered! No improvement in {monitor_metric} for {patience} epochs.")
-                    print(f"Restoring best model from epoch {ep - patience_counter}")
-                    break
-    
-    # Final evaluation on test set
-    test_metrics = evaluate_dialysis_batched(model, test_loader, device=device)
-    
-    print(f"\nFinal test results:")
-    for metric, value in test_metrics.items():
-        print(f"  {metric}: {value:.4f}")
-    
-    return model, vocabs, test_metrics
-
-
-def split_dialysis_by_patient(pairs, test_size=0.2, val_size=0.1, seed=42):
-    """Split dialysis prediction dataset by patient ID to avoid data leakage"""
-    from sklearn.model_selection import train_test_split
-    
-    pid2pairs = defaultdict(list)
-    for features, label in pairs:
-        pid2pairs[features["patient_id"]].append((features, label))
-    
-    pids = list(pid2pairs.keys())
-    tr_pids, te_pids = train_test_split(pids, test_size=test_size, random_state=seed)
-    tr_pids, va_pids = train_test_split(tr_pids, test_size=val_size, random_state=seed)
-    
-    def collect(pid_list):
-        out = []
-        for pid in pid_list:
-            out.extend(pid2pairs[pid])
-        return out
-    
-    return collect(tr_pids), collect(va_pids), collect(te_pids)
-
-
-def evaluate_dialysis_batched(model, data_loader, device):
-    """Evaluate dialysis prediction model on batched data"""
-    model.eval()
-    all_logits = []
-    all_labels = []
-    
-    with torch.no_grad():
-        for batch_X, batch_Y in data_loader:
-            batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
-            logits = model(batch_X).squeeze()
-            
-            all_logits.append(logits.cpu().numpy())
-            all_labels.append(batch_Y.cpu().numpy())
-    
-    # Concatenate all batches
-    logits = np.concatenate(all_logits)
-    labels = np.concatenate(all_labels)
-    
-    # Convert logits to probabilities
-    probs = torch.sigmoid(torch.from_numpy(logits)).numpy()
-    
-    # Debug: Print prediction probability distribution
-    print(f"\n=== Prediction Probability Distribution Debug ===")
-    print(f"Prediction probabilities range: {probs.min():.4f} - {probs.max():.4f}")
-    print(f"Prediction probabilities mean: {probs.mean():.4f}")
-    print(f"Prediction probabilities std: {probs.std():.4f}")
-    print(f"Number of predictions > 0.5: {(probs > 0.5).sum()}")
-    print(f"Number of predictions > 0.3: {(probs > 0.3).sum()}")
-    print(f"Number of predictions > 0.1: {(probs > 0.1).sum()}")
-    
-    # Debug: Print label distribution
-    print(f"True positive rate: {labels.sum() / len(labels):.4f}")
-    print(f"Number of positive samples: {labels.sum()}")
-    print(f"Number of negative samples: {len(labels) - labels.sum()}")
-    
-    # Calculate binary classification metrics
-    predictions = (probs > 0.5).astype(int)
-    
-    # Accuracy
-    accuracy = np.mean(predictions == labels)
-    
-    # Precision, Recall, F1
-    tp = np.sum((predictions == 1) & (labels == 1))
-    fp = np.sum((predictions == 1) & (labels == 0))
-    fn = np.sum((predictions == 0) & (labels == 1))
-    tn = np.sum((predictions == 0) & (labels == 0))
-    
-    print(f"Confusion Matrix:")
-    print(f"  TP: {tp}, FP: {fp}")
-    print(f"  FN: {fn}, TN: {tn}")
-    
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    
-    # AUC and AUPRC
-    from sklearn.metrics import roc_auc_score, average_precision_score
-    try:
-        auc = roc_auc_score(labels, probs)
-    except ValueError:
-        auc = 0.5  # Default for single class
-    
-    # Calculate AUPRC (Area Under Precision-Recall Curve)
-    auprc = average_precision_score(labels, probs)
-    
-    return {
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'auc': auc,
-        'auprc': auprc
-    }
-
