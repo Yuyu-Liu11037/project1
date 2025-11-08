@@ -1147,11 +1147,6 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     
-    # Set device
-    if args.device == 'cuda' and not torch.cuda.is_available():
-        print("CUDA not available, using CPU instead")
-        args.device = 'cpu'
-    
     train_and_save_cones(
         icd10_file_path=args.icd10_file,
         output_file=args.output_file,
