@@ -62,7 +62,7 @@ def train_diagnosis_model_on_samples(samples,
                            batch_size=32,         # Batch size for training
                            early_stopping=True,   # Enable early stopping
                            patience=10,           # Number of epochs to wait before stopping
-                           min_delta=0.001,      # Minimum change to qualify as improvement
+                           min_delta=0.0001,      # Minimum change to qualify as improvement
                            monitor_metric='Acc@10', # Metric to monitor for early stopping
                            use_gpu=True, force_cpu=False,  # GPU control
                            use_hyperbolic_embeddings=False,  # Use hyperbolic embeddings
@@ -219,13 +219,10 @@ def train_diagnosis_model_on_samples(samples,
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
     
     # Create learning rate scheduler
-    if use_lr_scheduler:
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             opt, mode='max', factor=lr_scheduler_factor, 
             patience=lr_scheduler_patience, min_lr=lr_scheduler_min_lr, verbose=True
         )
-    else:
-        scheduler = None
 
     # 7) Training loop with batches and early stopping
     best_metric = -float('inf')
@@ -263,15 +260,9 @@ def train_diagnosis_model_on_samples(samples,
             current_metric = val_metrics[monitor_metric]
             
             # Update learning rate scheduler
-            if scheduler is not None:
-                scheduler.step(current_metric)
-                current_lr = opt.param_groups[0]['lr']
-                print(f"Epoch {ep:02d} | avg_loss={avg_loss:.4f} | lr={current_lr:.2e} | "
-                      f"val P@10={val_metrics['P@10']:.4f} Acc@10={val_metrics['Acc@10']:.4f} "
-                      f"P@20={val_metrics['P@20']:.4f} Acc@20={val_metrics['Acc@20']:.4f} "
-                      f"P@30={val_metrics['P@30']:.4f} Acc@30={val_metrics['Acc@30']:.4f}")
-            else:
-                print(f"Epoch {ep:02d} | avg_loss={avg_loss:.4f} | "
+            scheduler.step(current_metric)
+            current_lr = opt.param_groups[0]['lr']
+            print(f"Epoch {ep:02d} | avg_loss={avg_loss:.4f} | lr={current_lr:.2e} | "
                       f"val P@10={val_metrics['P@10']:.4f} Acc@10={val_metrics['Acc@10']:.4f} "
                       f"P@20={val_metrics['P@20']:.4f} Acc@20={val_metrics['Acc@20']:.4f} "
                       f"P@30={val_metrics['P@30']:.4f} Acc@30={val_metrics['Acc@30']:.4f}")
@@ -293,7 +284,7 @@ def train_diagnosis_model_on_samples(samples,
                     model.load_state_dict(best_model_state)
                     break
 
-    # 8) Test set evaluation (consistent with paper: Visit-level P@k, Code-level Acc@k)
+    # 8) Test set evaluation (Visit-level P@k, Code-level Acc@k)
     test_metrics = evaluate_batched(model, test_loader, ks=(10, 20, 30), device=device)
     print("[TEST]", test_metrics)
     

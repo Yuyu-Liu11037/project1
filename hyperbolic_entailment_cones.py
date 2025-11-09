@@ -445,18 +445,15 @@ class HyperbolicEntailmentCones(nn.Module):
 # Training helper
 # =========================
 
-def get_learning_rate(epoch: int, initial_lr: float, lr_decay_type: str = "none", 
-                     lr_decay_rate: float = 0.1, lr_decay_step: int = 50,
+def get_learning_rate(epoch: int, initial_lr: float, T_max: float, 
                      lr_min: float = 1e-6, lr_warmup_epochs: int = 0) -> float:
     """
-    Calculate learning rate with decay schedule.
+    Calculate learning rate with cosine annealing decay schedule.
     
     Args:
         epoch: Current epoch (1-indexed)
         initial_lr: Initial learning rate
-        lr_decay_type: Type of decay ("none", "step", "exponential", "cosine")
-        lr_decay_rate: Decay rate (for step/exponential) or T_max (for cosine)
-        lr_decay_step: Step size for step decay
+        T_max: Maximum number of epochs for cosine decay (period)
         lr_min: Minimum learning rate
         lr_warmup_epochs: Number of warmup epochs (linear warmup)
     
@@ -470,24 +467,11 @@ def get_learning_rate(epoch: int, initial_lr: float, lr_decay_type: str = "none"
     # Adjust epoch for decay calculation (after warmup)
     effective_epoch = epoch - lr_warmup_epochs
     
-    if lr_decay_type == "none":
-        return initial_lr
-    elif lr_decay_type == "step":
-        # Step decay: lr = initial_lr * (decay_rate ^ floor(epoch / decay_step))
-        steps = effective_epoch // lr_decay_step
-        current_lr = initial_lr * (lr_decay_rate ** steps)
-    elif lr_decay_type == "exponential":
-        # Exponential decay: lr = initial_lr * (decay_rate ^ epoch)
-        current_lr = initial_lr * (lr_decay_rate ** effective_epoch)
-    elif lr_decay_type == "cosine":
-        # Cosine annealing: lr = lr_min + (initial_lr - lr_min) * (1 + cos(π * epoch / T_max)) / 2
-        # lr_decay_rate is used as T_max (period)
-        if effective_epoch >= lr_decay_rate:
-            current_lr = lr_min
-        else:
-            current_lr = lr_min + (initial_lr - lr_min) * (1 + math.cos(math.pi * effective_epoch / lr_decay_rate)) / 2
+    # Cosine annealing: lr = lr_min + (initial_lr - lr_min) * (1 + cos(π * epoch / T_max)) / 2
+    if effective_epoch >= T_max:
+        current_lr = lr_min
     else:
-        raise ValueError(f"Unknown lr_decay_type: {lr_decay_type}")
+        current_lr = lr_min + (initial_lr - lr_min) * (1 + math.cos(math.pi * effective_epoch / T_max)) / 2
     
     return max(current_lr, lr_min)
 
@@ -513,17 +497,6 @@ def build_batch(
     batch_size: int,
     neg_ratio: int = 5
 ):
-    """
-    edges: list of (parent_id, child_id) positive edges
-    returns tensors of heads_pos, tails_pos, heads_neg, tails_neg
-    """
-    if len(edges) == 0:
-        # keep original empty behavior
-        return (torch.empty(0, dtype=torch.long),
-                torch.empty(0, dtype=torch.long),
-                torch.empty(0, dtype=torch.long),
-                torch.empty(0, dtype=torch.long))
-
     positives = set(edges)  # NEW: for filtering negatives
 
     batch = random.sample(edges, k=min(batch_size, len(edges)))
@@ -552,7 +525,61 @@ def build_batch(
 
     hn = torch.tensor(hn_list, dtype=torch.long)
     tn = torch.tensor(tn_list, dtype=torch.long)
-    return hp, tp, hn, tn
+    return hp, tp, hn, tn  #positive heads, positive tails, negative heads, negative tails
+
+
+def compute_depths(num_nodes: int, edges: List[Tuple[int, int]]) -> List[int]:
+    """
+    Compute DAG depths from roots (nodes with no incoming edges).
+    If cycles exist (shouldn't), this is a best-effort breadth layering.
+    """
+    indeg = [0] * num_nodes
+    children = [[] for _ in range(num_nodes)]
+    for u, v in edges:
+        children[u].append(v)
+        indeg[v] += 1
+    roots = [i for i in range(num_nodes) if indeg[i] == 0]
+    # if no explicit root, pick all as roots (avoids empty)
+    if not roots:
+        roots = list(range(num_nodes))
+
+    depth = [-1] * num_nodes
+    from collections import deque
+    q = deque()
+    for r in roots:
+        depth[r] = 0
+        q.append(r)
+    while q:
+        u = q.popleft()
+        for v in children[u]:
+            if depth[v] < 0 or depth[v] > depth[u] + 1:
+                depth[v] = depth[u] + 1
+                q.append(v)
+    # fill any isolated/unreached with 0
+    for i in range(num_nodes):
+        if depth[i] < 0:
+            depth[i] = 0
+    return depth
+
+
+def radial_initialize_embeddings(model, depths: List[int], eps_val: float, r_max: float = 0.9):
+    with torch.no_grad():
+        dmax = max(depths) if depths else 0
+        # avoid divide-by-zero
+        denom = float(dmax) if dmax > 0 else 1.0
+        E = model.emb.data
+        n, d = E.shape
+        # random directions
+        dirs = torch.randn_like(E)
+        dirs = dirs / dirs.norm(dim=-1, keepdim=True).clamp(min=1e-15)
+        # radii: r = eps + (r_max - eps) * depth/denom
+        depths_t = torch.tensor(depths, dtype=E.dtype, device=E.device).view(-1, 1)
+        radii = eps_val + (r_max - eps_val) * (depths_t / denom)
+        model.emb.data = dirs * radii
+        # safe projection
+        model.emb.data = PoincareOps.proj_to_ball(model.emb.data,
+                                                   max_norm=model.max_norm,
+                                                   min_norm=model.eps)
 
 
 def train_hyperbolic_cones(
@@ -568,28 +595,15 @@ def train_hyperbolic_cones(
     K_scale: float = 0.9,
     seed: int = 42,
     device: str = "cpu",
-    lr_decay_type: str = "none",
-    lr_decay_rate: float = 0.1,
-    lr_decay_step: int = 50,
+    T_max: float = 200,
     lr_min: float = 1e-6,
     lr_warmup_epochs: int = 0
 ):
-    """
-    parent_child_edges: list of (parent_code, child_code), meaning parent entails child.
-    Returns: trained model and code->id mapping
-    
-    Args:
-        lr_decay_type: Type of learning rate decay ("none", "step", "exponential", "cosine")
-        lr_decay_rate: Decay rate (for step/exponential) or T_max (for cosine)
-        lr_decay_step: Step size for step decay
-        lr_min: Minimum learning rate
-        lr_warmup_epochs: Number of warmup epochs (linear warmup)
-    """
     random.seed(seed)
     torch.manual_seed(seed)
 
-    id_map = make_id_map(codes)
-    edges_id = [(id_map[p], id_map[c]) for (p, c) in parent_child_edges if p in id_map and c in id_map]
+    id_map = make_id_map(codes)   # {code : id}
+    edges_id = [(id_map[p], id_map[c]) for (p, c) in parent_child_edges]
 
     model = HyperbolicEntailmentCones(
         num_codes=len(codes),
@@ -599,70 +613,9 @@ def train_hyperbolic_cones(
         seed=seed
     ).to(device)
 
-    def compute_depths(num_nodes: int, edges: List[Tuple[int, int]]) -> List[int]:
-        """
-        Compute DAG depths from roots (nodes with no incoming edges).
-        If cycles exist (shouldn't), this is a best-effort breadth layering.
-        """
-        indeg = [0] * num_nodes
-        children = [[] for _ in range(num_nodes)]
-        for u, v in edges:
-            children[u].append(v)
-            indeg[v] += 1
-        roots = [i for i in range(num_nodes) if indeg[i] == 0]
-        # if no explicit root, pick all as roots (avoids empty)
-        if not roots:
-            roots = list(range(num_nodes))
-
-        depth = [-1] * num_nodes
-        from collections import deque
-        q = deque()
-        for r in roots:
-            depth[r] = 0
-            q.append(r)
-        while q:
-            u = q.popleft()
-            for v in children[u]:
-                if depth[v] < 0 or depth[v] > depth[u] + 1:
-                    depth[v] = depth[u] + 1
-                    q.append(v)
-        # fill any isolated/unreached with 0
-        for i in range(num_nodes):
-            if depth[i] < 0:
-                depth[i] = 0
-        return depth
-
-    def radial_initialize_embeddings(model, depths: List[int], eps_val: float, r_max: float = 0.9):
-        with torch.no_grad():
-            dmax = max(depths) if depths else 0
-            # avoid divide-by-zero
-            denom = float(dmax) if dmax > 0 else 1.0
-            E = model.emb.data
-            n, d = E.shape
-            # random directions
-            dirs = torch.randn_like(E)
-            dirs = dirs / dirs.norm(dim=-1, keepdim=True).clamp(min=1e-15)
-            # radii: r = eps + (r_max - eps) * depth/denom
-            depths_t = torch.tensor(depths, dtype=E.dtype, device=E.device).view(-1, 1)
-            radii = eps_val + (r_max - eps_val) * (depths_t / denom)
-            model.emb.data = dirs * radii
-            # safe projection
-            model.emb.data = PoincareOps.proj_to_ball(model.emb.data,
-                                                       max_norm=model.max_norm,
-                                                       min_norm=model.eps)
-
-    if len(edges_id) > 0:
-        depths = compute_depths(len(codes), edges_id)
-        radial_initialize_embeddings(model, depths, eps_val=eps, r_max=0.9)
-
-    # We'll use manual Riemannian update, so only need to keep autograd for 'emb'
-    # No standard optimizer is strictly necessary here.
+    depths = compute_depths(len(codes), edges_id)
+    radial_initialize_embeddings(model, depths, eps_val=eps, r_max=0.9)
     model.train()
-
-    if len(edges_id) == 0:
-        print("Warning: No parent-child edges found. Training without hierarchy constraints.")
-        # Return untrained model if no edges
-        return model, id_map
 
     # ========== DEBUG: Save initial embedding state ==========
     initial_emb = None
@@ -673,13 +626,6 @@ def train_hyperbolic_cones(
 
     for ep in range(1, epochs + 1):
         hp, tp, hn, tn = build_batch(edges_id, len(codes), batch_size, neg_ratio)
-        
-        # Skip if batch is empty
-        if len(hp) == 0:
-            if ep % 20 == 0 or ep == 1:
-                print(f"[epoch {ep:4d}] No edges available, skipping...")
-            continue
-            
         hp, tp, hn, tn = hp.to(device), tp.to(device), hn.to(device), tn.to(device)
 
         pos_energy = model(hp, tp)                # E(u,v)
@@ -714,13 +660,11 @@ def train_hyperbolic_cones(
                 grad_max = grad_mean = grad_norm = 0.0
         # ========== END DEBUG ==========
         
-        # Calculate current learning rate with decay
+        # Calculate current learning rate with cosine decay
         current_lr = get_learning_rate(
             epoch=ep,
             initial_lr=lr,
-            lr_decay_type=lr_decay_type,
-            lr_decay_rate=lr_decay_rate,
-            lr_decay_step=lr_decay_step,
+            T_max=T_max,
             lr_min=lr_min,
             lr_warmup_epochs=lr_warmup_epochs
         )
@@ -772,41 +716,20 @@ def train_hyperbolic_cones(
                 model.train()
         
         if ep % 20 == 0 or ep == 1:
-            # ========== DEBUG: Print detailed debug information ==========
-            if True:  # DEBUG flag - set to False to disable
-                print(f"\n{'='*60}")
-                print(f"DEBUG INFO at epoch {ep}")
-                print(f"{'='*60}")
-                print(f"Batch size: {len(hp)} positive pairs, {len(hn)} negative pairs")
-                print(f"\nEnergy values:")
-                print(f"  pos_energy: min={pos_energy.min().item():.6f}, max={pos_energy.max().item():.6f}, mean={pos_energy.mean().item():.6f}")
-                print(f"  neg_energy: min={neg_energy.min().item():.6f}, max={neg_energy.max().item():.6f}, mean={neg_energy.mean().item():.6f}")
-                print(f"\nXi and psi_u breakdown:")
-                print(f"  Xi (angle): min={Xi.min().item():.6f}, max={Xi.max().item():.6f}, mean={Xi.mean().item():.6f}")
-                print(f"  psi_u (cone angle): min={psi_u.min().item():.6f}, max={psi_u.max().item():.6f}, mean={psi_u.mean().item():.6f}")
-                print(f"  Xi - psi_u: min={(Xi-psi_u).min().item():.6f}, max={(Xi-psi_u).max().item():.6f}, mean={(Xi-psi_u).mean().item():.6f}")
-                print(f"  Energy = relu(Xi - psi_u), should match pos_energy")
-                print(f"\nEmbedding stats:")
-                emb_norms = model.emb.data.norm(dim=1)
-                print(f"  Embedding norms: min={emb_norms.min().item():.4f}, max={emb_norms.max().item():.4f}, mean={emb_norms.mean().item():.4f}")
-                print(f"\nModel parameters:")
-                print(f"  K={model.K:.6f}, eps={model.eps:.6f}, initial_lr={lr:.6f}, current_lr={current_lr:.6f}")
-                print(f"\nGradient stats (before update):")
-                print(f"  grad_norm={grad_norm:.8f}, grad_max={grad_max:.8f}, grad_mean={grad_mean:.8f}")
+            print(f"\nGradient stats (before update):")
+            print(f"  grad_norm={grad_norm:.8f}, grad_max={grad_max:.8f}, grad_mean={grad_mean:.8f}")
+            if initial_emb is not None:
+                # Compute hyperbolic distance for each embedding vector
+                hyperbolic_distances = PoincareOps.poincare_distance(
+                    model.emb.data, 
+                    initial_emb,
+                    eps=1e-15
+                )
+                emb_change = hyperbolic_distances.mean().item()
+                print(f"\nEmbedding update:")
+                print(f"  Average hyperbolic distance from initial: {emb_change:.8f}")
                 
-                # Check if embeddings are changing (using hyperbolic distance)
-                if initial_emb is not None:
-                    # Compute hyperbolic distance for each embedding vector
-                    hyperbolic_distances = PoincareOps.poincare_distance(
-                        model.emb.data, 
-                        initial_emb,
-                        eps=1e-15
-                    )
-                    emb_change = hyperbolic_distances.mean().item()
-                    print(f"\nEmbedding update:")
-                    print(f"  Average hyperbolic distance from initial: {emb_change:.8f}")
-                
-                print(f"{'='*60}\n")
+            print(f"{'='*60}\n")
             # ========== END DEBUG ==========
 
     return model, id_map
@@ -905,68 +828,18 @@ def extract_icd_parent_child_pair(code: str) -> List[Tuple[str, str]]:
 
 
 def build_parent_child_edges_from_codes(codes: List[str]) -> Tuple[List[Tuple[str, str]], List[str]]:
-    """
-    Build parent-child edges for all ICD-10 codes based on their hierarchy.
-    Includes parent codes even if they're not in the original code set.
-    
-    Args:
-        codes: List of ICD codes
-        
-    Returns:
-        Tuple of (edges, all_codes):
-        - edges: List of (parent, child) tuples representing hierarchy relationships
-        - all_codes: List of all codes including original codes and generated parent codes
-    """
     pairs = []
-    code_set = set(codes)
-    all_codes_set = set(codes)  # Track all codes including parents
+    all_codes = set()
     
-    # First pass: extract all parent-child pairs and collect all parent codes
-    # We need to iteratively build the hierarchy because intermediate parents might be missing
     for code in codes:
         code_pairs = extract_icd_parent_child_pair(code)
         for parent, child in code_pairs:
-            # Add both parent and child to all_codes_set
-            all_codes_set.add(parent)
-            all_codes_set.add(child)
-            # Only keep pairs where child is in the original code set
-            # This ensures we build hierarchy even if parents are not explicitly in the list
-            if child in code_set:
-                pairs.append((parent, child))
+            pairs.append((parent, child))
+            all_codes.add(parent)
+            all_codes.add(child)
+    pairs = list(set(pairs))
     
-    # Second pass: recursively build hierarchy for intermediate parents
-    # This ensures we have complete chains: A01 -> A010 -> A0100
-    # We need to process all_codes_set recursively to build the full hierarchy
-    changed = True
-    while changed:
-        changed = False
-        current_all_codes = set(all_codes_set)
-        for code in current_all_codes:
-            if len(code) > 3 and '.' not in code:
-                # Check if this code itself has a parent
-                parent = code[:-1]
-                if len(parent) >= 3:
-                    if parent not in all_codes_set:
-                        # Add the intermediate parent
-                        all_codes_set.add(parent)
-                        changed = True
-                    # Add the parent-child relationship (parent -> code)
-                    # We add this edge if code is in all_codes_set (either original or generated)
-                    pairs.append((parent, code))
-    
-    # Remove duplicates
-    final_pairs = []
-    seen = set()
-    for parent, child in pairs:
-        pair = (parent, child)
-        if pair not in seen:
-            final_pairs.append(pair)
-            seen.add(pair)
-    
-    # Return all codes (original + generated parents) sorted for consistent ordering
-    all_codes_list = sorted(list(all_codes_set))
-    
-    return final_pairs, all_codes_list
+    return pairs, list(all_codes)
 
 
 # =========================
@@ -986,63 +859,24 @@ def train_and_save_cones(
     K_scale: float = 0.9,
     seed: int = 42,
     device: str = "cpu",
-    lr_decay_type: str = "none",
-    lr_decay_rate: float = 0.1,
-    lr_decay_step: int = 50,
+    T_max: float = 200,
     lr_min: float = 1e-6,
     lr_warmup_epochs: int = 0
 ):
-    """
-    Train hyperbolic entailment cones model and save to file.
-    
-    Args:
-        icd10_file_path: Path to ICD-10 codes file
-        output_file: Path to save the trained model
-        dim: Embedding dimension
-        lr: Learning rate
-        epochs: Number of training epochs
-        batch_size: Batch size for training
-        neg_ratio: Negative sampling ratio
-        margin: Margin for max-margin loss
-        eps: Epsilon parameter for entailment cones
-        K_scale: K scale parameter
-        seed: Random seed
-        device: Device to use for training
-        lr_decay_type: Type of learning rate decay ("none", "step", "exponential", "cosine")
-        lr_decay_rate: Decay rate (for step/exponential) or T_max (for cosine)
-        lr_decay_step: Step size for step decay
-        lr_min: Minimum learning rate
-        lr_warmup_epochs: Number of warmup epochs (linear warmup)
-    """
-    print(f"Loading ICD-10 codes from: {icd10_file_path}")
     codes = load_icd10_codes(icd10_file_path)
-    print(f"Loaded {len(codes)} ICD-10 codes")
-    
-    # Show sample codes for debugging
-    if len(codes) > 0:
-        print(f"Sample codes (first 10): {codes[:10]}")
     
     print("Building parent-child edges from code hierarchy...")
     parent_child_edges, all_codes = build_parent_child_edges_from_codes(codes)
     print(f"Built {len(parent_child_edges)} parent-child edges")
-    print(f"Total codes (including generated parents): {len(all_codes)} (original: {len(codes)})")
     
     if len(parent_child_edges) > 0:
         sample_edges = random.sample(parent_child_edges, min(5, len(parent_child_edges)))
         print(f"Sample edges (random 5): {sample_edges}")
-    
-    if len(parent_child_edges) == 0:
-        print("Warning: No parent-child relationships found. Training will be skipped.")
-        print("This usually means codes don't follow standard ICD-10 hierarchy structure.")
-        print("Please check the code format in the input file.")
-        # Use original codes if no edges found
-        all_codes = codes
-    
+  
     print(f"Training hyperbolic entailment cones model...")
     print(f"  dim={dim}, epochs={epochs}, batch_size={batch_size}, lr={lr}")
     print(f"  neg_ratio={neg_ratio}, margin={margin}, eps={eps}, K_scale={K_scale}")
-    if lr_decay_type != "none":
-        print(f"  lr_decay: type={lr_decay_type}, rate={lr_decay_rate}, step={lr_decay_step}, min={lr_min}, warmup={lr_warmup_epochs}")
+    print(f"  lr_decay: cosine, T_max={T_max}, lr_min={lr_min}, warmup={lr_warmup_epochs}")
     
     model, id_map = train_hyperbolic_cones(
         codes=all_codes,  # Use all_codes including generated parents
@@ -1057,9 +891,7 @@ def train_and_save_cones(
         K_scale=K_scale,
         seed=seed,
         device=device,
-        lr_decay_type=lr_decay_type,
-        lr_decay_rate=lr_decay_rate,
-        lr_decay_step=lr_decay_step,
+        T_max=T_max,
         lr_min=lr_min,
         lr_warmup_epochs=lr_warmup_epochs
     )
@@ -1096,10 +928,10 @@ def parse_args():
                        default="/data/yuyu/data/MIMIC_IV/icd10cm-codes-April-2024.txt",
                        help='Path to ICD-10 codes file')
     parser.add_argument('--output_file', type=str, default='hyperbolic_cones_embeddings.pkl',
-                       help='Output file to save model (default: hyperbolic_cones_embeddings.pkl)')
+                       help='Output file to save model')
     
     # Model parameters
-    parser.add_argument('--dim', type=int, default=100,
+    parser.add_argument('--dim', type=int, default=128,
                        help='Dimension of hyperbolic embeddings')
     parser.add_argument('--eps', type=float, default=0.15,
                        help='Epsilon parameter for entailment cones')
@@ -1107,29 +939,24 @@ def parse_args():
                        help='K scale parameter')
     
     # Training parameters
-    parser.add_argument('--epochs', type=int, default=100000,
+    parser.add_argument('--epochs', type=int, default=15000,
                        help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=256,
-                       help='Batch size for training (default: 256)')
-    parser.add_argument('--lr', type=float, default=2e-5,
+    parser.add_argument('--batch_size', type=int, default=1024,
+                       help='Batch size for training')
+    parser.add_argument('--lr', type=float, default=10,
                        help='Learning rate for training')
-    parser.add_argument('--neg_ratio', type=int, default=10,
-                       help='Negative sampling ratio (default: 10)')
-    parser.add_argument('--margin', type=float, default=2.0,
+    parser.add_argument('--neg_ratio', type=int, default=30,
+                       help='Negative sampling ratio')
+    parser.add_argument('--margin', type=float, default=0.5,
                        help='Margin for max-margin loss')
     
-    # Learning rate decay parameters
-    parser.add_argument('--lr_decay_type', type=str, default='none',
-                       choices=['none', 'step', 'exponential', 'cosine'],
-                       help='Type of learning rate decay: none, step, exponential, or cosine')
-    parser.add_argument('--lr_decay_rate', type=float, default=100000,
-                       help='Decay rate for step/exponential decay, or T_max for cosine decay')
-    parser.add_argument('--lr_decay_step', type=int, default=50,
-                       help='Step size for step decay (default: 50)')
-    parser.add_argument('--lr_min', type=float, default=5.0,
+    # Learning rate decay parameters (cosine annealing)
+    parser.add_argument('--T_max', type=float, default=15000,
+                       help='Maximum number of epochs for cosine decay (period)')
+    parser.add_argument('--lr_min', type=float, default=1.0,
                        help='Minimum learning rate')
     parser.add_argument('--lr_warmup_epochs', type=int, default=0,
-                       help='Number of warmup epochs with linear warmup (default: 0)')
+                       help='Number of warmup epochs with linear warmup')
     
     # Other parameters
     parser.add_argument('--seed', type=int, default=42,
@@ -1160,9 +987,7 @@ if __name__ == "__main__":
         K_scale=args.K_scale,
         seed=args.seed,
         device=args.device,
-        lr_decay_type=args.lr_decay_type,
-        lr_decay_rate=args.lr_decay_rate,
-        lr_decay_step=args.lr_decay_step,
+        T_max=args.T_max,
         lr_min=args.lr_min,
         lr_warmup_epochs=args.lr_warmup_epochs
     )

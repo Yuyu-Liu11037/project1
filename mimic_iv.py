@@ -26,7 +26,7 @@ def parse_args():
     # Training parameters
     parser.add_argument('--use_current_step', action='store_true',
                        help='Whether to use current step information (default: False)')
-    parser.add_argument('--hidden', type=int, default=100,
+    parser.add_argument('--hidden', type=int, default=128,
                        help='Hidden layer dimension')
     parser.add_argument('--lr', type=float, default=1e-3,
                        help='Learning rate')
@@ -50,14 +50,14 @@ def parse_args():
                        help='Enable early stopping (default: True)')
     parser.add_argument('--patience', type=int, default=50,
                        help='Number of epochs to wait before stopping (default: 10)')
-    parser.add_argument('--min_delta', type=float, default=0.001,
-                       help='Minimum change to qualify as improvement (default: 0.001)')
+    parser.add_argument('--min_delta', type=float, default=0.0001,
+                       help='Minimum change to qualify as improvement')
     parser.add_argument('--monitor_metric', type=str, default='Acc@10',
                        choices=['P@10', 'Acc@10', 'P@20', 'Acc@20', 'P@30', 'Acc@30'],
                        help='Metric to monitor for early stopping (default: Acc@10)')
     
     # Transformer specific parameters
-    parser.add_argument('--num_heads', type=int, default=5,
+    parser.add_argument('--num_heads', type=int, default=8,
                        help='Number of Transformer attention heads')
     parser.add_argument('--num_layers', type=int, default=3,
                        help='Number of Transformer layers (default: 3)')
@@ -72,10 +72,10 @@ def parse_args():
     # Hyperbolic embeddings
     parser.add_argument('--use_hyperbolic_embeddings', action='store_true',
                        help='Use hyperbolic embeddings instead of multi-hot vectors (default: False)')
-    parser.add_argument('--embedding_file', type=str, default='lr10_margin05_2.pkl',
+    parser.add_argument('--embedding_file', type=str, default='hyperbolic_cones_embeddings.pkl',
                        help='Path to hyperbolic embeddings file')
     parser.add_argument('--max_seq_length', type=int, default=200,
-                       help='Maximum sequence length for sequential data (default: 200)')
+                       help='Maximum sequence length for sequential data')
     
     return parser.parse_args()
 
