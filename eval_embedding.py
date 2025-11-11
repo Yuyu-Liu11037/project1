@@ -241,33 +241,64 @@ def build_parent_child_edges_from_codes(codes):
 def xi_poincare(p, c):
     '''双曲锥的开口角'''
     # p, c: shape (d,)
-    p2, c2 = np.dot(p, p), np.dot(c, c)
+    # 与训练代码中的 angle_Xi 保持一致
+    p2 = np.dot(p, p)
+    c2 = np.dot(c, c)
     pc = np.dot(p, c)
-    num = pc*(1 + p2) - p2*(1 + c2)
-    den = (np.sqrt(p2) * np.linalg.norm(p - c) *
-           np.sqrt(1 + p2*c2 - 2*pc))
-    val = np.clip(num / (den + 1e-12), -1.0, 1.0)
+    
+    num = pc * (1 + p2) - p2 * (1 + c2)
+    
+    # 使用 clamp 保护数值稳定性，与训练代码一致
+    p_minus_c = p - c
+    p_minus_c_norm = np.linalg.norm(p_minus_c)
+    p_minus_c_norm = max(p_minus_c_norm, 1e-15)  # 对应训练代码中的 clamp(min=1e-15)
+    
+    p_norm = np.sqrt(p2)
+    p_norm = max(p_norm, 1e-15)  # 对应训练代码中的 clamp(min=1e-15)
+    
+    inside = 1 + p2 * c2 - 2 * pc
+    inside = max(inside, 1e-15)  # 对应训练代码中的 clamp(min=1e-15)
+    
+    den = p_norm * p_minus_c_norm * np.sqrt(inside)
+    
+    # 与训练代码保持一致：clamp 到 [-1.0 + 1e-7, 1.0 - 1e-7]
+    val = num / (den + 1e-15)
+    val = np.clip(val, -1.0 + 1e-7, 1.0 - 1e-7)
     return np.arccos(val)  # Xi(p,c)
 
 
-def psi_from_norm_poincare(norm_p, K):
+def psi_from_norm_poincare(norm_p, K, eps):
     '''以 p 为顶点的双曲锥体的半角'''
     # psi(p) = arcsin( K * (1 - ||p||^2) / ||p|| )
-    s = K * (1 - norm_p**2) / (norm_p + 1e-12)
-    s = np.clip(s, -1.0, 1.0)  # arcsin domain safety
-    return np.arcsin(s)
+    # 与训练代码中的 psi 保持一致：使用 eps 来 clamp 范数的最小值
+    norm_p = max(norm_p, eps)  # 对应训练代码中的 clamp(min=eps)
+    arg = K * (1.0 - norm_p * norm_p) / (norm_p + 1e-15)
+    # 与训练代码保持一致：clamp 到 [-1.0 + 1e-7, 1.0 - 1e-7]
+    arg = np.clip(arg, -1.0 + 1e-7, 1.0 - 1e-7)
+    return np.arcsin(arg)
 
 
-def in_cone(p, c, K):
-    return xi_poincare(p, c) <= psi_from_norm_poincare(np.linalg.norm(p), K) + 1e-12
+def in_cone(p, c, K, eps):
+    return xi_poincare(p, c) <= psi_from_norm_poincare(np.linalg.norm(p), K, eps) + 1e-12
 
 
 if __name__ == "__main__":
-    save_data = load_pkl_file("lr10_margin05_2.pkl")
-    id_map = save_data['id_map'] 
-    # code_pairs = [("J981", "J9811")]
-    code_pairs = [("N183", "Z9114")]
+    save_data = load_pkl_file("hyperbolic_cones_embeddings.pkl")
+    id_map = save_data['id_map']
+    
+    # 从保存的数据中获取参数
+    K = save_data['K']
+    eps = save_data.get('eps', 0.1)  # 如果不存在则使用默认值 0.1
+    
+    print(f"Using parameters: K={K:.6f}, eps={eps:.6f}")
+    print()
+    
+    code_pairs = [("E1131", "E11319"), ("E113", "E1131"), ("E11", "E113"), ("E11", "E11319"), ("E113", "E11319")]
     for code1, code2 in code_pairs:
-        embedding1 = save_data['model'].emb.data[id_map[code1]].cpu().clone()
-        embedding2 = save_data['model'].emb.data[id_map[code2]].cpu().clone()
-        print(f"{code2} in {code1} cone: {in_cone(embedding1, embedding2, save_data['K'])}")
+        # 将 torch tensor 转换为 numpy array
+        embedding1 = save_data['model'].emb.data[id_map[code1]].cpu().clone().numpy()
+        embedding2 = save_data['model'].emb.data[id_map[code2]].cpu().clone().numpy()
+        
+        # 传递 eps 参数
+        result = in_cone(embedding1, embedding2, K, eps)
+        print(f"{code2} in {code1} cone: {result}")

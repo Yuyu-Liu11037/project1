@@ -397,6 +397,7 @@ class HyperbolicEntailmentCones(nn.Module):
 
         # K must satisfy: K <= eps/(1-eps^2) (Eq. 25)
         self.K_max = eps / (1.0 - eps * eps)
+        self.K_scale = float(K_scale)  # Store K_scale for annealing
         self.K = float(K_scale) * self.K_max
 
         # embeddings in D^n
@@ -440,15 +441,37 @@ class HyperbolicEntailmentCones(nn.Module):
 
         self.emb.grad.zero_()
 
+    def update_K_scale(self, new_K_scale: float):
+        """
+        Update K_scale and recalculate K.
+        
+        Args:
+            new_K_scale: New K_scale value (should be in [0, 1])
+        """
+        self.K_scale = float(new_K_scale)
+        self.K = self.K_scale * self.K_max
+
 
 # =========================
 # Training helper
 # =========================
 
-def get_learning_rate(epoch: int, initial_lr: float, T_max: float, 
-                     lr_min: float = 1e-6, lr_warmup_epochs: int = 0) -> float:
+def get_learning_rate(
+    epoch: int, 
+    initial_lr: float, 
+    T_max: float, 
+    lr_min: float = 1e-6, 
+    lr_warmup_epochs: int = 0,
+    pos_satisfied: float = None,  # 新增参数
+    adaptive_lr: bool = False,   # 是否启用自适应
+    sat_threshold_high: float = 0.95,  # 高满足度阈值
+    sat_threshold_low: float = 0.5,    # 低满足度阈值
+    lr_scale_high: float = 0.5,        # 高满足度时的学习率缩放
+    lr_scale_low: float = 1.2          # 低满足度时的学习率缩放（上限为 initial_lr）
+) -> float:
     """
     Calculate learning rate with cosine annealing decay schedule.
+    Optionally adapt based on pos_satisfied.
     
     Args:
         epoch: Current epoch (1-indexed)
@@ -456,24 +479,84 @@ def get_learning_rate(epoch: int, initial_lr: float, T_max: float,
         T_max: Maximum number of epochs for cosine decay (period)
         lr_min: Minimum learning rate
         lr_warmup_epochs: Number of warmup epochs (linear warmup)
+        pos_satisfied: Current pos_satisfied value (0-1)
+        adaptive_lr: Whether to use adaptive learning rate based on pos_satisfied
+        sat_threshold_high: High satisfaction threshold
+        sat_threshold_low: Low satisfaction threshold
+        lr_scale_high: Learning rate scale when satisfaction is high
+        lr_scale_low: Learning rate scale when satisfaction is low
     
     Returns:
         Current learning rate
     """
     # Warmup phase
     if epoch <= lr_warmup_epochs and lr_warmup_epochs > 0:
-        return initial_lr * (epoch / lr_warmup_epochs)
-    
-    # Adjust epoch for decay calculation (after warmup)
-    effective_epoch = epoch - lr_warmup_epochs
-    
-    # Cosine annealing: lr = lr_min + (initial_lr - lr_min) * (1 + cos(π * epoch / T_max)) / 2
-    if effective_epoch >= T_max:
-        current_lr = lr_min
+        base_lr = initial_lr * (epoch / lr_warmup_epochs)
     else:
-        current_lr = lr_min + (initial_lr - lr_min) * (1 + math.cos(math.pi * effective_epoch / T_max)) / 2
+        # Adjust epoch for decay calculation (after warmup)
+        effective_epoch = epoch - lr_warmup_epochs
+        
+        # Cosine annealing: lr = lr_min + (initial_lr - lr_min) * (1 + cos(π * epoch / T_max)) / 2
+        if effective_epoch >= T_max:
+            base_lr = lr_min
+        else:
+            base_lr = lr_min + (initial_lr - lr_min) * (1 + math.cos(math.pi * effective_epoch / T_max)) / 2
     
-    return max(current_lr, lr_min)
+    # Adaptive adjustment based on pos_satisfied
+    if adaptive_lr and pos_satisfied is not None:
+        if pos_satisfied >= sat_threshold_high:
+            # High satisfaction: reduce learning rate for fine-tuning
+            base_lr = base_lr * lr_scale_high
+        elif pos_satisfied < sat_threshold_low:
+            # Low satisfaction: increase learning rate (but cap at initial_lr)
+            base_lr = min(base_lr * lr_scale_low, initial_lr)
+        # Medium satisfaction: keep base_lr
+    
+    return max(base_lr, lr_min)
+
+def get_K_scale_annealed(
+    epoch: int,
+    K_scale_start: float = 0.99,
+    K_scale_end: float = 0.9,
+    T_max: float = 200,
+    warmup_epochs: int = 0,
+    annealing_type: str = "linear"
+) -> float:
+    """
+    Calculate K_scale with annealing schedule.
+    
+    Args:
+        epoch: Current epoch (1-indexed)
+        K_scale_start: Initial K_scale value (default: 0.99)
+        K_scale_end: Final K_scale value (default: 0.9)
+        T_max: Maximum number of epochs for annealing (period)
+        warmup_epochs: Number of warmup epochs (keep K_scale_start)
+        annealing_type: Type of annealing - "linear" or "cosine"
+    
+    Returns:
+        Current K_scale value
+    """
+    # Warmup phase: keep initial value
+    if epoch <= warmup_epochs and warmup_epochs > 0:
+        return K_scale_start
+    
+    # Adjust epoch for annealing calculation (after warmup)
+    effective_epoch = epoch - warmup_epochs
+    
+    if effective_epoch >= T_max:
+        # After annealing period, use final value
+        return K_scale_end
+    
+    if annealing_type == "cosine":
+        # Cosine annealing: smooth transition
+        progress = effective_epoch / T_max
+        K_scale = K_scale_end + (K_scale_start - K_scale_end) * (1 + math.cos(math.pi * progress)) / 2
+    else:
+        # Linear annealing: default
+        progress = effective_epoch / T_max
+        K_scale = K_scale_start + (K_scale_end - K_scale_start) * progress
+    
+    return K_scale
 
 def make_id_map(codes: List[str]) -> Dict[str, int]:
     return {c: i for i, c in enumerate(codes)}
@@ -597,7 +680,22 @@ def train_hyperbolic_cones(
     device: str = "cpu",
     T_max: float = 200,
     lr_min: float = 1e-6,
-    lr_warmup_epochs: int = 0
+    lr_warmup_epochs: int = 0,
+    # 新增参数：动态调整相关
+    adaptive_lr: bool = True,              # 是否启用自适应学习率
+    early_stopping: bool = True,          # 是否启用早停
+    early_stop_patience: int = 50,        # 早停耐心值（epochs）
+    early_stop_threshold: float = 0.98,   # 早停阈值（pos_satisfied）
+    early_stop_min_epochs: int = 100,     # 最少训练轮数
+    sat_history_window: int = 10,          # 用于计算平均满足度的窗口大小
+    # K_scale 退火相关参数
+    K_scale_annealing: bool = True,       # 是否启用 K_scale 退火
+    K_scale_start: float = 0.99,          # K_scale 初始值
+    K_scale_end: float = 0.9,             # K_scale 最终值
+    K_scale_T_max: float = None,          # K_scale 退火周期（None 则使用 T_max）
+    K_scale_warmup_epochs: int = 0,       # K_scale 预热轮数
+    K_scale_annealing_type: str = "linear",  # 退火类型："linear" 或 "cosine"
+    verbose: bool = True
 ):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -605,13 +703,22 @@ def train_hyperbolic_cones(
     id_map = make_id_map(codes)   # {code : id}
     edges_id = [(id_map[p], id_map[c]) for (p, c) in parent_child_edges]
 
+    # 如果启用 K_scale 退火，使用初始值；否则使用指定的 K_scale
+    initial_K_scale = K_scale_start if K_scale_annealing else K_scale
+    
     model = HyperbolicEntailmentCones(
         num_codes=len(codes),
         dim=dim,
         eps=eps,
-        K_scale=K_scale,
+        K_scale=initial_K_scale,
         seed=seed
     ).to(device)
+    
+    # 设置 K_scale 退火参数
+    if K_scale_annealing:
+        K_scale_T_max_val = K_scale_T_max if K_scale_T_max is not None else T_max
+    else:
+        K_scale_T_max_val = T_max
 
     depths = compute_depths(len(codes), edges_id)
     radial_initialize_embeddings(model, depths, eps_val=eps, r_max=0.9)
@@ -623,6 +730,12 @@ def train_hyperbolic_cones(
         with torch.no_grad():
             initial_emb = model.emb.data.clone()
     # ========== END DEBUG ==========
+
+    best_sat = 0.0
+    best_epoch = 0
+    sat_history = [] 
+    patience_counter = 0
+    best_model_state = None
 
     for ep in range(1, epochs + 1):
         hp, tp, hn, tn = build_batch(edges_id, len(codes), batch_size, neg_ratio)
@@ -660,177 +773,133 @@ def train_hyperbolic_cones(
                 grad_max = grad_mean = grad_norm = 0.0
         # ========== END DEBUG ==========
         
-        # Calculate current learning rate with cosine decay
-        current_lr = get_learning_rate(
-            epoch=ep,
-            initial_lr=lr,
-            T_max=T_max,
-            lr_min=lr_min,
-            lr_warmup_epochs=lr_warmup_epochs
-        )
+        # 计算当前 batch 的 pos_satisfied 和 neg_unsatisfied
+        with torch.no_grad():
+            sat = (pos_energy < 1e-1).float().mean().item()
+            sat_history.append(sat)
+            # 保持历史窗口大小
+            if len(sat_history) > sat_history_window:
+                sat_history.pop(0)
+            avg_sat = sum(sat_history) / len(sat_history) if sat_history else sat  # 平均满足度
+            
+            # neg_unsatisfied: 负样本能量 >= margin 的比例（被正确拒绝）
+            neg_unsat = (neg_energy >= margin).float().mean().item()
+        
+        # 动态调整学习率
+        if adaptive_lr:
+            current_lr = get_learning_rate(
+                epoch=ep,
+                initial_lr=lr,
+                T_max=T_max,
+                lr_min=lr_min,
+                lr_warmup_epochs=lr_warmup_epochs,
+                pos_satisfied=avg_sat,  # 使用平均满足度
+                adaptive_lr=True,
+                sat_threshold_high=0.95,
+                sat_threshold_low=0.5,
+                lr_scale_high=0.5,
+                lr_scale_low=1.2
+            )
+        else:
+            current_lr = get_learning_rate(
+                epoch=ep,
+                initial_lr=lr,
+                T_max=T_max,
+                lr_min=lr_min,
+                lr_warmup_epochs=lr_warmup_epochs
+            )
+        
+        # K_scale 退火
+        if K_scale_annealing:
+            current_K_scale = get_K_scale_annealed(
+                epoch=ep,
+                K_scale_start=K_scale_start,
+                K_scale_end=K_scale_end,
+                T_max=K_scale_T_max_val,
+                warmup_epochs=K_scale_warmup_epochs,
+                annealing_type=K_scale_annealing_type
+            )
+            model.update_K_scale(current_K_scale)
+        else:
+            current_K_scale = model.K_scale
         
         model.riemannian_step(current_lr)
 
+        # 早停检查
+        if early_stopping and ep >= early_stop_min_epochs:
+            if avg_sat >= early_stop_threshold:
+                patience_counter += 1
+                if patience_counter >= early_stop_patience:
+                    if verbose:
+                        print(f"\n{'='*60}")
+                        print(f"Early stopping triggered at epoch {ep}!")
+                        print(f"  Average pos_satisfied: {avg_sat*100:.2f}% >= {early_stop_threshold*100:.2f}%")
+                        print(f"  Maintained for {patience_counter} epochs")
+                        print(f"{'='*60}\n")
+                    if best_model_state is not None:
+                        model.load_state_dict(best_model_state)
+                    break
+            else:
+                patience_counter = 0
+            
+            # 保存最佳模型
+            if avg_sat > best_sat:
+                best_sat = avg_sat
+                best_epoch = ep
+                best_model_state = model.state_dict().copy()
+
+        # 打印信息
         if ep % 20 == 0 or ep == 1:
-            with torch.no_grad():
-                # simple monitoring: fraction of satisfied positives (E ~ 0) on current batch
-                sat = (pos_energy < 1e-1).float().mean().item()
-            print(f"[epoch {ep:4d}] loss={loss.item():.6f}  pos_satisfied(batch)={sat*100:.2f}%  lr={current_lr:.6f}")
-        
-        # Evaluate on all data every 1000 epochs
-        if ep % 1000 == 0 and len(edges_id) > 0:
-            with torch.no_grad():
-                model.eval()
-                # Convert all edges to tensors
-                all_hp = torch.tensor([h for h, _ in edges_id], dtype=torch.long).to(device)
-                all_tp = torch.tensor([t for _, t in edges_id], dtype=torch.long).to(device)
-                
-                # Compute energy for all positive pairs (in batches to avoid memory issues)
-                all_pos_energies = []
-                eval_batch_size = 1024  # Use larger batch for evaluation
-                
-                for i in range(0, len(all_hp), eval_batch_size):
-                    end_idx = min(i + eval_batch_size, len(all_hp))
-                    batch_hp = all_hp[i:end_idx]
-                    batch_tp = all_tp[i:end_idx]
-                    batch_energy = model(batch_hp, batch_tp)
-                    all_pos_energies.append(batch_energy)
-                
-                # Concatenate all energies
-                all_pos_energy = torch.cat(all_pos_energies, dim=0)
-                
-                # Calculate pos_satisfied on all data
-                all_sat = (all_pos_energy < 1e-1).float().mean().item()
-                all_mean_energy = all_pos_energy.mean().item()
-                all_min_energy = all_pos_energy.min().item()
-                all_max_energy = all_pos_energy.max().item()
-                
-                print(f"\n{'='*60}")
-                print(f"FULL DATA EVALUATION at epoch {ep}")
-                print(f"{'='*60}")
-                print(f"Total positive pairs: {len(edges_id)}")
-                print(f"  pos_energy (all): min={all_min_energy:.6f}, max={all_max_energy:.6f}, mean={all_mean_energy:.6f}")
-                print(f"  pos_satisfied (all): {all_sat*100:.2f}%")
+            if verbose:
+                print(f"[epoch {ep:4d}] loss={loss.item():.6f}  "
+                      f"pos_satisfied(batch)={sat*100:.2f}%  "
+                      f"pos_satisfied(avg)={avg_sat*100:.2f}%  "
+                      f"neg_unsatisfied={neg_unsat*100:.2f}%  "
+                      f"lr={current_lr:.6f}  "
+                      f"K_scale={current_K_scale:.4f}")
+                if early_stopping and ep >= early_stop_min_epochs:
+                    print(f"  Early stop: patience={patience_counter}/{early_stop_patience}, "
+                          f"best_sat={best_sat*100:.2f}% @ epoch {best_epoch}")
+                print(f"\nGradient stats (before update):")
+                print(f"  grad_norm={grad_norm:.8f}, grad_max={grad_max:.8f}, grad_mean={grad_mean:.8f}")
+                if initial_emb is not None:
+                    hyperbolic_distances = PoincareOps.poincare_distance(
+                        model.emb.data, 
+                        initial_emb,
+                        eps=1e-15
+                    )
+                    emb_change = hyperbolic_distances.mean().item()
+                    print(f"\nEmbedding update:")
+                    print(f"  Average hyperbolic distance from initial: {emb_change:.8f}")
+                    
                 print(f"{'='*60}\n")
-                
-                model.train()
-        
-        if ep % 20 == 0 or ep == 1:
-            print(f"\nGradient stats (before update):")
-            print(f"  grad_norm={grad_norm:.8f}, grad_max={grad_max:.8f}, grad_mean={grad_mean:.8f}")
-            if initial_emb is not None:
-                # Compute hyperbolic distance for each embedding vector
-                hyperbolic_distances = PoincareOps.poincare_distance(
-                    model.emb.data, 
-                    initial_emb,
-                    eps=1e-15
-                )
-                emb_change = hyperbolic_distances.mean().item()
-                print(f"\nEmbedding update:")
-                print(f"  Average hyperbolic distance from initial: {emb_change:.8f}")
-                
-            print(f"{'='*60}\n")
             # ========== END DEBUG ==========
 
     return model, id_map
 
-
-# =========================
-# Utilities for loading ICD-10 codes and building hierarchy
-# =========================
-
 def load_icd10_codes(icd10_file_path: str) -> List[str]:
-    """
-    Load all ICD-10 condition codes from the MIMIC-IV file
-    
-    Args:
-        icd10_file_path: Path to the ICD-10 codes file
-        
-    Returns:
-        List of ICD-10 condition codes
-    """
     all_conditions = []
     with open(icd10_file_path, 'r') as f:
         for line in f:
-            line = line.strip()
-            if line:
-                # Extract the code (first part before tab/space)
-                code = line.split()[0]
-                all_conditions.append(code)
-    
+            code = line.split()[0]
+            all_conditions.append(code)
     return all_conditions
 
 
 def extract_icd_parent_child_pair(code: str) -> List[Tuple[str, str]]:
-    """
-    Extract parent-child pairs for an ICD-10 code based on hierarchy.
-    Supports both formats:
-    - With dots: "I11.0" -> [("I11", "I11.0")]
-                 "I11.01" -> [("I11", "I11.0"), ("I11.0", "I11.01")]
-    - Without dots: "I110" -> [("I11", "I110")]
-                   "I1101" -> [("I11", "I110"), ("I110", "I1101")]
-    
-    ICD-10 hierarchy: 
-    - 3 chars: "I11" (category)
-    - With dots: 5 chars "I11.0" (subcategory), 6+ chars "I11.01" (more specific)
-    - Without dots: 4 chars "I110" (subcategory), 5+ chars "I1101" (more specific)
-    
-    This function generates ALL possible parent-child relationships based on the code structure,
-    even if the parent codes are not in the original code list.
-    
-    Args:
-        code: ICD-10 code string (may or may not contain dots)
-        
-    Returns:
-        List of (parent, child) tuples
-    """
-    if not code or len(code) < 3:
-        return []
-    
     pairs = []
     
-    # Case 1: Code contains dots (e.g., "I11.0", "I11.01")
-    if '.' in code:
-        parts = code.split('.')
-        prefix = parts[0]  # e.g., "I11"
-        
-        # Level 1: 3-char prefix (e.g., "I11" -> "I11.0")
-        if len(prefix) >= 3 and len(code) > len(prefix):
-            pairs.append((prefix, code))
-        
-        # Level 2+: For codes with suffix after dot (e.g., "I11.01")
-        if len(parts) >= 2 and len(parts[1]) > 0:
-            suffix = parts[1]
-            # Generate parents by shortening the suffix
-            for i in range(1, len(suffix)):
-                parent_suffix = suffix[:i]
-                parent_code = f"{prefix}.{parent_suffix}"
-                if parent_code != code:
-                    pairs.append((parent_code, code))
-    
-    # Case 2: Code without dots (e.g., "I110", "I1101")
-    else:
-        # Build hierarchy by incrementally increasing length
-        # Only generate DIRECT parent-child relationships (adjacent levels)
-        # e.g., "I1101" should generate:
-        #   - ("I110", "I1101") - direct parent
-        # But we also need to track all intermediate levels for the hierarchy
-        # The direct parent is always the code with one less character
-        if len(code) > 3:
-            # Find the direct parent (one character shorter)
-            # For ICD-10 codes, the parent is typically the code minus the last character
-            # But we need to be careful: "A0100" -> parent is "A010" (not "A010" -> "A01" directly for "A0100")
-            parent = code[:-1]  # Remove last character to get direct parent
-            if len(parent) >= 3:  # Ensure parent is at least 3 characters (ICD-10 minimum)
-                pairs.append((parent, code))
+    if len(code) > 3:
+        parent = code[:-1]  # Remove last character to get direct parent
+        if len(parent) >= 3:  # Ensure parent is at least 3 characters (ICD-10 minimum)
+            pairs.append((parent, code))
     
     return pairs
 
 
 def build_parent_child_edges_from_codes(codes: List[str]) -> Tuple[List[Tuple[str, str]], List[str]]:
     pairs = []
-    all_codes = set()
-    
+    all_codes = set(codes)
     for code in codes:
         code_pairs = extract_icd_parent_child_pair(code)
         for parent, child in code_pairs:
@@ -838,7 +907,6 @@ def build_parent_child_edges_from_codes(codes: List[str]) -> Tuple[List[Tuple[st
             all_codes.add(parent)
             all_codes.add(child)
     pairs = list(set(pairs))
-    
     return pairs, list(all_codes)
 
 
@@ -861,7 +929,21 @@ def train_and_save_cones(
     device: str = "cpu",
     T_max: float = 200,
     lr_min: float = 1e-6,
-    lr_warmup_epochs: int = 0
+    lr_warmup_epochs: int = 0,
+    # 新增参数：动态调整相关
+    adaptive_lr: bool = True,
+    early_stopping: bool = True,
+    early_stop_patience: int = 50,
+    early_stop_threshold: float = 0.98,
+    early_stop_min_epochs: int = 100,
+    sat_history_window: int = 10,
+    # K_scale 退火相关参数
+    K_scale_annealing: bool = True,
+    K_scale_start: float = 0.99,
+    K_scale_end: float = 0.9,
+    K_scale_T_max: float = None,
+    K_scale_warmup_epochs: int = 0,
+    K_scale_annealing_type: str = "linear"
 ):
     codes = load_icd10_codes(icd10_file_path)
     
@@ -875,8 +957,15 @@ def train_and_save_cones(
   
     print(f"Training hyperbolic entailment cones model...")
     print(f"  dim={dim}, epochs={epochs}, batch_size={batch_size}, lr={lr}")
-    print(f"  neg_ratio={neg_ratio}, margin={margin}, eps={eps}, K_scale={K_scale}")
+    if K_scale_annealing:
+        print(f"  neg_ratio={neg_ratio}, margin={margin}, eps={eps}")
+        print(f"  K_scale: annealing from {K_scale_start} to {K_scale_end} (type={K_scale_annealing_type})")
+    else:
+        print(f"  neg_ratio={neg_ratio}, margin={margin}, eps={eps}, K_scale={K_scale}")
     print(f"  lr_decay: cosine, T_max={T_max}, lr_min={lr_min}, warmup={lr_warmup_epochs}")
+    print(f"  adaptive_lr={adaptive_lr}, early_stopping={early_stopping}")
+    if early_stopping:
+        print(f"    early_stop_threshold={early_stop_threshold}, patience={early_stop_patience}, min_epochs={early_stop_min_epochs}")
     
     model, id_map = train_hyperbolic_cones(
         codes=all_codes,  # Use all_codes including generated parents
@@ -893,7 +982,19 @@ def train_and_save_cones(
         device=device,
         T_max=T_max,
         lr_min=lr_min,
-        lr_warmup_epochs=lr_warmup_epochs
+        lr_warmup_epochs=lr_warmup_epochs,
+        adaptive_lr=adaptive_lr,
+        early_stopping=early_stopping,
+        early_stop_patience=early_stop_patience,
+        early_stop_threshold=early_stop_threshold,
+        early_stop_min_epochs=early_stop_min_epochs,
+        sat_history_window=sat_history_window,
+        K_scale_annealing=K_scale_annealing,
+        K_scale_start=K_scale_start,
+        K_scale_end=K_scale_end,
+        K_scale_T_max=K_scale_T_max,
+        K_scale_warmup_epochs=K_scale_warmup_epochs,
+        K_scale_annealing_type=K_scale_annealing_type
     )
     
     print(f"Training completed!")
@@ -925,7 +1026,7 @@ def parse_args():
     
     # Data parameters
     parser.add_argument('--icd10_file', type=str, 
-                       default="/data/yuyu/data/MIMIC_IV/icd10cm-codes-April-2024.txt",
+                       default="/data/yuyu/project1/cond_hist_codes.txt",
                        help='Path to ICD-10 codes file')
     parser.add_argument('--output_file', type=str, default='hyperbolic_cones_embeddings.pkl',
                        help='Output file to save model')
@@ -935,11 +1036,11 @@ def parse_args():
                        help='Dimension of hyperbolic embeddings')
     parser.add_argument('--eps', type=float, default=0.15,
                        help='Epsilon parameter for entailment cones')
-    parser.add_argument('--K_scale', type=float, default=0.95,
+    parser.add_argument('--K_scale', type=float, default=0.99,
                        help='K scale parameter')
     
     # Training parameters
-    parser.add_argument('--epochs', type=int, default=15000,
+    parser.add_argument('--epochs', type=int, default=20000,
                        help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=1024,
                        help='Batch size for training')
@@ -947,16 +1048,51 @@ def parse_args():
                        help='Learning rate for training')
     parser.add_argument('--neg_ratio', type=int, default=30,
                        help='Negative sampling ratio')
-    parser.add_argument('--margin', type=float, default=0.5,
+    parser.add_argument('--margin', type=float, default=0.15,
                        help='Margin for max-margin loss')
     
     # Learning rate decay parameters (cosine annealing)
-    parser.add_argument('--T_max', type=float, default=15000,
+    parser.add_argument('--T_max', type=float, default=20000,
                        help='Maximum number of epochs for cosine decay (period)')
     parser.add_argument('--lr_min', type=float, default=1.0,
                        help='Minimum learning rate')
     parser.add_argument('--lr_warmup_epochs', type=int, default=0,
                        help='Number of warmup epochs with linear warmup')
+    
+    # Dynamic adjustment parameters
+    parser.add_argument('--adaptive_lr', action='store_true', default=True,
+                       help='Enable adaptive learning rate based on pos_satisfied')
+    parser.add_argument('--no_adaptive_lr', dest='adaptive_lr', action='store_false',
+                       help='Disable adaptive learning rate')
+    parser.add_argument('--early_stopping', action='store_true', default=True,
+                       help='Enable early stopping based on pos_satisfied')
+    parser.add_argument('--no_early_stopping', dest='early_stopping', action='store_false',
+                       help='Disable early stopping')
+    parser.add_argument('--early_stop_patience', type=int, default=50,
+                       help='Number of epochs to wait before early stopping')
+    parser.add_argument('--early_stop_threshold', type=float, default=0.98,
+                       help='pos_satisfied threshold for early stopping (0-1)')
+    parser.add_argument('--early_stop_min_epochs', type=int, default=100,
+                       help='Minimum number of epochs before early stopping can trigger')
+    parser.add_argument('--sat_history_window', type=int, default=10,
+                       help='Window size for computing average pos_satisfied')
+    
+    # K_scale annealing parameters
+    parser.add_argument('--K_scale_annealing', action='store_true',
+                       help='Enable K_scale annealing')
+    parser.add_argument('--no_K_scale_annealing', dest='K_scale_annealing', action='store_false',
+                       help='Disable K_scale annealing')
+    parser.add_argument('--K_scale_start', type=float, default=0.995,
+                       help='Initial K_scale value for annealing')
+    parser.add_argument('--K_scale_end', type=float, default=0.9,
+                       help='Final K_scale value for annealing')
+    parser.add_argument('--K_scale_T_max', type=float, default=None,
+                       help='Maximum epochs for K_scale annealing (None uses T_max)')
+    parser.add_argument('--K_scale_warmup_epochs', type=int, default=0,
+                       help='Number of warmup epochs for K_scale annealing')
+    parser.add_argument('--K_scale_annealing_type', type=str, default='linear',
+                       choices=['linear', 'cosine'],
+                       help='Type of K_scale annealing: linear or cosine')
     
     # Other parameters
     parser.add_argument('--seed', type=int, default=42,
@@ -989,7 +1125,19 @@ if __name__ == "__main__":
         device=args.device,
         T_max=args.T_max,
         lr_min=args.lr_min,
-        lr_warmup_epochs=args.lr_warmup_epochs
+        lr_warmup_epochs=args.lr_warmup_epochs,
+        adaptive_lr=args.adaptive_lr,
+        early_stopping=args.early_stopping,
+        early_stop_patience=args.early_stop_patience,
+        early_stop_threshold=args.early_stop_threshold,
+        early_stop_min_epochs=args.early_stop_min_epochs,
+        sat_history_window=args.sat_history_window,
+        K_scale_annealing=args.K_scale_annealing,
+        K_scale_start=args.K_scale_start,
+        K_scale_end=args.K_scale_end,
+        K_scale_T_max=args.K_scale_T_max,
+        K_scale_warmup_epochs=args.K_scale_warmup_epochs,
+        K_scale_annealing_type=args.K_scale_annealing_type
     )
     
     print("Hyperbolic entailment cones training completed!")

@@ -1,35 +1,35 @@
-Euclidean embedding, 5%:
+Euclidean embedding + Transformer, 5%:
 [DONE] TRANSFORMER model test results:
-  P@10: 0.3932
-  Acc@10: 0.2483
-  Recall@10: 0.2483
-  P@20: 0.4654
-  Acc@20: 0.4249
-  Recall@20: 0.4249
-  P@30: 0.5825
-  Acc@30: 0.5612
-  Recall@30: 0.5612
+  P@10: 0.3951
+  Acc@10: 0.2495
+  Recall@10: 0.2495
+  P@20: 0.4687
+  Acc@20: 0.4271
+  Recall@20: 0.4271
+  P@30: 0.5858
+  Acc@30: 0.5640
+  Recall@30: 0.5640
 
-Freezed untrained hyperbolic embedding, 5%:
+Freezed untrained hyperbolic embedding + Transformer with tangent-space adapter, 5%:
 [DONE] TRANSFORMER model test results:
-  P@10: 0.3802
-  Acc@10: 0.2408
-  Recall@10: 0.2408
-  P@20: 0.4544
-  Acc@20: 0.4149
-  Recall@20: 0.4149
-  P@30: 0.5748
-  Acc@30: 0.5533
-  Recall@30: 0.5533
+  P@10: 0.4059
+  Acc@10: 0.2562
+  Recall@10: 0.2562
+  P@20: 0.4750
+  Acc@20: 0.4331
+  Recall@20: 0.4331
+  P@30: 0.5913
+  Acc@30: 0.5681
+  Recall@30: 0.5681
 
-Freezed hyperbolic embedding, 5%:
+Freezed trained hyperbolic embedding + Transformer with tangent-space adapter, 5%:
 [DONE] TRANSFORMER model test results:
-  P@10: 0.3919
-  Acc@10: 0.2477
-  Recall@10: 0.2477
-  P@20: 0.4671
-  Acc@20: 0.4279
-  Recall@20: 0.4279
-  P@30: 0.5875
-  Acc@30: 0.5666
-  Recall@30: 0.5666
+  P@10: 0.4139
+  Acc@10: 0.2620
+  Recall@10: 0.2620
+  P@20: 0.4820
+  Acc@20: 0.4402
+  Recall@20: 0.4402
+  P@30: 0.5955
+  Acc@30: 0.5737
+  Recall@30: 0.5737
