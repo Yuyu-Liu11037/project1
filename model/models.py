@@ -9,6 +9,45 @@ import math
 from model.hierarchical_embedding import HierarchicalHyperbolicEmbedding
 
 
+def project_to_ball(x, c, eps=1e-5):
+    """Project points to Poincaré ball."""
+    r = 1.0 / (c**0.5)
+    norm = x.norm(dim=-1, keepdim=True).clamp_min(1e-15)
+    max_norm = (1 - eps) * r
+    scale = torch.where(norm > max_norm, max_norm / norm, torch.ones_like(norm))
+    return x * scale
+
+
+def artanh(x):  # 数值稳定的 atanh
+    """Numerically stable arctanh."""
+    return 0.5 * (torch.log1p(x) - torch.log1p(-x))
+
+
+def logmap0_poincare(x, c):
+    """Logarithmic map from Poincaré ball to tangent space at origin."""
+    x = project_to_ball(x, c)
+    norm = x.norm(dim=-1, keepdim=True).clamp_min(1e-15)
+    return (2.0 / (c**0.5)) * artanh((c**0.5) * norm) * (x / norm)
+
+
+class PoincareToEuclid(nn.Module):
+    """Project from Poincaré ball to Euclidean space with learnable curvature."""
+    def __init__(self, in_dim, out_dim, c_init=1.0):
+        super().__init__()
+        self.logit_c = nn.Parameter(torch.tensor(float(c_init)).log())  # learnable curvature
+        self.norm = nn.LayerNorm(out_dim)
+        self.linear = nn.Linear(in_dim, out_dim)  # Linear projection to hidden dimension
+
+    @property
+    def c(self):
+        return self.logit_c.exp()
+
+    def forward(self, x_h):  # x_h in Poincaré ball
+        x_tan = logmap0_poincare(x_h, self.c)
+        x_proj = self.linear(x_tan)
+        return self.norm(x_proj)
+
+
 class HyperbolicEmbedding(nn.Module):
     def __init__(self, num_embeddings, embedding_dim, c=1.0, padding_idx=0, init_scale=1e-3):
         super().__init__()
@@ -30,6 +69,14 @@ class HyperbolicEmbedding(nn.Module):
             mask = (idx == self.padding_idx).unsqueeze(-1)
             x_e = x_e.masked_fill(mask, 0.)
         return x_e
+    
+    def get_hyperbolic_embeddings(self, idx):
+        """Get embeddings in hyperbolic space (Poincaré ball)."""
+        x_h = self.weight[idx]
+        if self.padding_idx is not None:
+            mask = (idx == self.padding_idx).unsqueeze(-1)
+            x_h = x_h.masked_fill(mask, 0.)
+        return x_h
 
     @torch.no_grad()
     def reproject_(self):
@@ -73,9 +120,11 @@ class TransformerModel(nn.Module):
         self.emb_proc  = HyperbolicEmbedding(P + 1, embed_dim, c=c_proc,  padding_idx=0)
         self.emb_third = HyperbolicEmbedding(T + 1, embed_dim, c=c_third, padding_idx=0)
 
-        # 之后仍在欧式空间里跑
-        self.input_projection = nn.Linear(embed_dim, hidden)
-        self.pos_encoding = PositionalEncoding(hidden, p)
+        # Project from Poincaré ball to Euclidean space with learnable curvature
+        # Use average curvature of the three embedding types as initial value
+        c_avg = (c_diag + c_proc + c_third) / 3.0
+        self.input_projection = PoincareToEuclid(embed_dim, hidden, c_init=c_avg)
+        # self.pos_encoding = PositionalEncoding(hidden, p)
 
         enc_layer = nn.TransformerEncoderLayer(
             d_model=hidden, nhead=num_heads,
@@ -105,13 +154,12 @@ class TransformerModel(nn.Module):
         device = x_diag.device
         B = x_diag.shape[0]
         
-        # Embed each type separately (already using local indices)
-        e_diag = self.emb_diag(x_diag)   # (B, L_diag, E)
-        e_proc = self.emb_proc(x_proc)   # (B, L_proc, E)
-        e_third = self.emb_third(x_drug) # (B, L_drug, E)
+        e_diag_h = self.emb_diag.get_hyperbolic_embeddings(x_diag)   # (B, L_diag, E)
+        e_proc_h = self.emb_proc.get_hyperbolic_embeddings(x_proc)   # (B, L_proc, E)
+        e_third_h = self.emb_third.get_hyperbolic_embeddings(x_drug) # (B, L_drug, E)
 
         # Concatenate the three sequences along the sequence dimension
-        x_embedded = torch.cat([e_diag, e_proc, e_third], dim=1)  # (B, L_total, E)
+        x_embedded_h = torch.cat([e_diag_h, e_proc_h, e_third_h], dim=1)  # (B, L_total, E)
         
         # Get padding masks for each type
         diag_mask = (x_diag != 0)   # (B, L_diag)
@@ -121,8 +169,12 @@ class TransformerModel(nn.Module):
         # Concatenate masks
         padding_mask = torch.cat([diag_mask, proc_mask, drug_mask], dim=1)  # (B, L_total)
 
-        # Project to hidden dimension
-        x_projected = self.input_projection(x_embedded)  # (B, L_total, H)
+        # Project from Poincaré ball to Euclidean space and then to hidden dimension
+        x_projected = self.input_projection(x_embedded_h)  # (B, L_total, H)
+        
+        # Apply padding mask (set padding positions to zero)
+        padding_mask_expanded = padding_mask.unsqueeze(-1)  # (B, L_total, 1)
+        x_projected = x_projected.masked_fill(~padding_mask_expanded, 0.)
 
         # Add CLS token
         cls_tokens = self.cls_token.expand(B, 1, -1)
@@ -133,11 +185,9 @@ class TransformerModel(nn.Module):
         key_padding_mask = torch.cat([cls_mask, padding_mask], dim=1)
         src_key_padding_mask = ~key_padding_mask  # True = mask out
 
-        # Positional encoding & Transformer encoder
-        x_seq = self.pos_encoding(x_seq)
+        # x_seq = self.pos_encoding(x_seq)
         x_seq = self.transformer(x_seq, src_key_padding_mask=src_key_padding_mask)
 
-        # Use CLS token for output
         x_cls = self.dropout(x_seq[:, 0, :])
         return self.output_projection(x_cls)
 
@@ -148,26 +198,6 @@ class TransformerModel(nn.Module):
             self.emb_diag.reproject_()
         self.emb_proc.reproject_()
         self.emb_third.reproject_()
-
-
-class PositionalEncoding(nn.Module):
-    """Positional encoding"""
-    
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer('pe', pe)
-        
-    def forward(self, x):
-        x = x + self.pe[:x.size(1), :].transpose(0, 1)
-        return self.dropout(x)
 
 
 def create_model(model_type, x_vocab_size, hidden, out_dim, **kwargs):

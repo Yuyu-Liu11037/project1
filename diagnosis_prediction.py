@@ -77,11 +77,6 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    
-    # Validate train_percentage argument
-    if not 0.01 <= args.train_percentage <= 1.0:
-        raise ValueError("train_percentage must be between 0.01 and 1.0")
-    
     # Set random seed
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -107,7 +102,6 @@ if __name__ == "__main__":
         root=args.data_path,
         tables=["diagnoses_icd", "procedures_icd", "prescriptions"],
         code_mapping={"NDC": ("ATC", {"target_kwargs": {"level": 3}})},
-        # refresh_cache=True,
     )
 
     mimic4_prediction = mimic4_base.set_task(diag_prediction_mimic4_fn)

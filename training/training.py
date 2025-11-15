@@ -20,10 +20,12 @@ from util.data_processing import (
     build_pairs, 
     build_vocab_from_pairs,
     prepare_XY, 
-    split_by_patient,
-    build_icd_hierarchy
+    split_by_patient
 )
-from metrics.metrics import evaluate, precision_at_k_visit, accuracy_at_k_code, recall_at_k_micro
+from metrics.metrics import precision_at_k_visit, accuracy_at_k_code, recall_at_k_micro
+
+def compute_hierarchical_loss(model, hierarchy, device, batch_tokens=None):
+    pass
 
 
 class VariableLengthDataset(Dataset):
@@ -34,7 +36,7 @@ class VariableLengthDataset(Dataset):
             X_list_diag: list of 1D tensors for diagnosis codes (variable length)
             X_list_proc: list of 1D tensors for procedure codes (variable length)
             X_list_drug: list of 1D tensors for drug codes (variable length)
-            Y_list: list of 1D tensors for labels (variable length)
+            Y_list: list of 1D tensors for labels (multi-hot vectors, fixed length = len(ccs_stoi))
         """
         self.X_list_diag = X_list_diag
         self.X_list_proc = X_list_proc
@@ -75,136 +77,10 @@ def collate_fn(batch, max_diag_len=None, max_proc_len=None, max_drug_len=None):
     X_drug_padded = torch.nn.utils.rnn.pad_sequence(X_drug_batch, batch_first=True, padding_value=0)
     X_drug_padded = X_drug_padded[:, :max_drug_len]
     
-    # For Y (multi-label), pad to max length
-    max_y_len = max(len(y) for y in Y_batch)
-    Y_padded_list = []
-    for y in Y_batch:
-        padded_y = torch.nn.functional.pad(y, (0, max_y_len - len(y)), value=0)
-        Y_padded_list.append(padded_y)
-    Y_padded = torch.stack(Y_padded_list)
+    # For Y (multi-hot vectors), stack directly since they all have the same length (len(ccs_stoi))
+    Y_padded = torch.stack(Y_batch)
     
     return (X_diag_padded, X_proc_padded, X_drug_padded), Y_padded
-
-
-def compute_hierarchical_loss(model, icd_hierarchy, ccs_groups, diag_stoi, diag_itos, device='cuda', relevant_codes=None):
-    """
-    Compute hierarchical constraint loss in hyperbolic space.
-
-    Args:
-        model: The model with hyperbolic embeddings
-        icd_hierarchy: Dictionary {icd_code: [parent]} for prefix hierarchy
-        ccs_groups: Dictionary {ccs_code: [icd_code1, icd_code2, ...]} for CCS grouping
-        diag_stoi: Dictionary mapping ICD codes to indices
-        diag_itos: Dictionary mapping indices to ICD codes
-        device: Device for computation
-        relevant_codes: Set of codes to compute constraints for (if None, compute for all)
-
-    Returns:
-        hierarchical_loss: Scalar tensor with hyperbolic distance constraints
-    """
-    # ---- Setup & defaults ----
-    emb_diag = model.emb_diag
-    ball = emb_diag.ball
-    emb_weight = emb_diag.weight  # (V, D)
-    emb_device = emb_weight.device
-    emb_dtype = emb_weight.dtype
-
-    total_loss = torch.tensor(0.0, device=emb_device, dtype=emb_dtype)
-    count = 0
-
-    # ---- Build relevant set (include ancestors) ----
-    if relevant_codes is not None:
-        processed = set()
-        stack = set(relevant_codes)  # copy to mutate
-        while stack:
-            code = stack.pop()
-            if code in processed:
-                continue
-            processed.add(code)
-            # Only expand if we have hierarchy info for this code
-            parents = icd_hierarchy.get(code, [])
-            for p in parents:
-                # Only explore known/embeddable parents
-                if p in diag_stoi and p not in processed:
-                    stack.add(p)
-        relevant_codes_set = processed
-    else:
-        relevant_codes_set = None
-
-    # ======================
-    # Constraint 1: ICD tree
-    # ======================
-    child_parent_pairs = []
-    for child_code, parent_codes in icd_hierarchy.items():
-        if child_code not in diag_stoi:
-            continue
-        if relevant_codes_set is not None and child_code not in relevant_codes_set:
-            continue
-
-        for parent_code in parent_codes:
-            if parent_code not in diag_stoi:
-                continue
-            if relevant_codes_set is not None and parent_code not in relevant_codes_set:
-                # parent may still be needed for depth/close constraint; include even if not in set?
-                # The original code required parent in diag_stoi only; keep identical semantics:
-                pass
-            child_parent_pairs.append((diag_stoi[child_code], diag_stoi[parent_code]))
-
-    if child_parent_pairs:
-        idx_child = torch.tensor([c for c, _ in child_parent_pairs], device=emb_device)
-        idx_parent = torch.tensor([p for _, p in child_parent_pairs], device=emb_device)
-
-        child_emb = emb_weight.index_select(0, idx_child)  # (N, D)
-        parent_emb = emb_weight.index_select(0, idx_parent)  # (N, D)
-
-        # 1a) hyperbolic distance child-parent
-        dist_cp = ball.dist(child_emb, parent_emb)  # (N,)
-
-        # 1b) depth penalty: child should be deeper than parent (euclidean norm as in original)
-        # Keep identical semantics to original implementation
-        child_r = torch.linalg.vector_norm(child_emb, dim=-1)
-        parent_r = torch.linalg.vector_norm(parent_emb, dim=-1)
-        depth_penalty = torch.relu(parent_r - child_r)
-
-        total_loss = total_loss + (dist_cp + depth_penalty).sum()
-        count += dist_cp.numel()
-
-    # ==========================
-    # Constraint 2: CCS grouping
-    # ==========================
-    # We'll batch by CCS group but compute all pairwise distances per group in one shot.
-    for _, icd_codes in ccs_groups.items():
-        if len(icd_codes) < 2:
-            continue
-
-        if relevant_codes_set is not None:
-            valid_idx = [diag_stoi[c] for c in icd_codes if c in diag_stoi and c in relevant_codes_set]
-        else:
-            valid_idx = [diag_stoi[c] for c in icd_codes if c in diag_stoi]
-
-        if len(valid_idx) < 2:
-            continue
-
-        # Build all pair indices once
-        pair_idx = list(combinations(valid_idx, 2))
-        if not pair_idx:
-            continue
-
-        idx1 = torch.tensor([i for i, _ in pair_idx], device=emb_device)
-        idx2 = torch.tensor([j for _, j in pair_idx], device=emb_device)
-
-        emb1 = emb_weight.index_select(0, idx1)
-        emb2 = emb_weight.index_select(0, idx2)
-
-        dist_pairs = ball.dist(emb1, emb2)  # (M,)
-        total_loss = total_loss + dist_pairs.sum()
-        count += dist_pairs.numel()
-
-    if count > 0:
-        # Match original return type/device/dtype behavior
-        return total_loss / count
-    else:
-        return torch.tensor(0.0, device=emb_device, dtype=emb_dtype)
 
 
 def train_model_on_samples(samples,
@@ -220,62 +96,22 @@ def train_model_on_samples(samples,
                            monitor_metric='Acc@10', # Metric to monitor for early stopping
                            hierarchical_loss_weight=0.1,  # Weight for hierarchical constraint loss
                            **model_kwargs):
-    """
-    Train model for diagnosis prediction
-    
-    Args:
-        samples: Sample data
-        model_type: "mlp" or "transformer", model type
-        task: "next" or "current", prediction task type
-        use_current_step: Whether to use current step information
-        hidden: Hidden layer dimension
-        lr: Learning rate
-        wd: Weight decay
-        epochs: Number of training epochs
-        seed: Random seed
-        train_percentage: Percentage of training data to use (0.01-1.0), for few-shot training
-        batch_size: Batch size for training (default: 32)
-        early_stopping: Enable early stopping (default: True)
-        patience: Number of epochs to wait before stopping (default: 10)
-        min_delta: Minimum change to qualify as improvement (default: 0.001)
-        monitor_metric: Metric to monitor for early stopping (default: 'Acc@10')
-        hierarchical_loss_weight: Weight for hierarchical constraint loss (default: 0.1)
-        **model_kwargs: Model-specific parameters (e.g., num_heads, num_layers, etc.)
-    
-    Returns:
-        model: Trained model
-        vocabs: Vocabulary dictionaries
-        ccs_itos: Label index to string mapping (CCS codes)
-        test_metrics: Test set evaluation metrics
-    """
     # 1) Sort and assemble (current/next)
     # print(f"\nSamples: {samples[0]}")
     # 每一个sample就是一个病人的一条visit记录
     # 除了 adm_time 和 cond_hist 以外，其他字段都是这个 visit 特有的记录(这两个字段包含了这个病人过往的记录)
     # 每条 visit 里，cond_hist 包含病人过往 conditions 原代码，但是 conditions 字段是 CCS 映射后的代码
-    # TODO: redundant
     by_pid = sort_samples_within_patient(samples)   # defaultdict(list), {"patient_id": [sample1, sample2, ...]}
     # print(f"\nBy pid: {by_pid['10001401']}")
     # build_pairs有问题。。我们应该是要用病人的所有过往visit记录来预测下一次的诊断，而不是上一次的visit
     # 没事了，cond_hist字段就是之前所有的visits
     pairs = build_pairs(by_pid, task=task)   # (sample_t, label_t+1)
     # print(f"\nPairs: {pairs[10]}")
-    
-    # Filter out samples with empty cond_hist (first visits without history)
-    original_num_pairs = len(pairs)
     pairs = [(s, y_codes) for s, y_codes in pairs if s.get('cond_hist', []) and len([x for x in s['cond_hist'] if x]) > 0]
-    filtered_num_pairs = len(pairs)
-    print(f"\nFiltered {original_num_pairs - filtered_num_pairs} samples with empty cond_hist")
-    print(f"Remaining samples: {filtered_num_pairs}/{original_num_pairs}")
 
     # 2) Patient-level split
     train_pairs, val_pairs, test_pairs = split_by_patient(pairs, seed=seed)
-    
-    # Check cond_hist lengths
-    cond_hist_lengths = [len(s.get('cond_hist', [])) for s, _ in train_pairs]
-    if cond_hist_lengths:
-        print(f"\ncond_hist length stats: min={min(cond_hist_lengths)}, max={max(cond_hist_lengths)}, avg={sum(cond_hist_lengths)/len(cond_hist_lengths):.2f}")
-    
+
     # Apply few-shot sampling to training data
     if train_percentage < 1.0:
         # Set random seed for reproducible sampling
@@ -287,25 +123,8 @@ def train_model_on_samples(samples,
         print(f"Few-shot training: Using {len(train_pairs)}/{original_train_size} samples ({train_percentage:.1%} of training data)")
 
     # 3) Vocabulary
-    (diag_stoi, diag_itos), (proc_stoi,_), (drug_stoi,_), (ccs_stoi, ccs_itos) = build_vocab_from_pairs(train_pairs) # diag_stoi=ICD, ccs_stoi=CCS for labels
+    (diag_stoi, diag_itos), (proc_stoi,_), (drug_stoi,_), (ccs_stoi, ccs_itos) = build_vocab_from_pairs(pairs) # diag_stoi=ICD, ccs_stoi=CCS for labels
     vocabs = (diag_stoi, proc_stoi, drug_stoi, ccs_stoi)
-    
-    # 3.5) Build ICD hierarchy structure
-    icd_hierarchy, ccs_groups, icd_to_ccs, additional_codes = build_icd_hierarchy(diag_stoi, ccs_stoi)
-    print(f"\nBuilt ICD hierarchy: {len(icd_hierarchy)} codes with parent-child relationships")
-    print(f"CCS groups: {len(ccs_groups)} distinct CCS codes mapped from ICD codes")
-    
-    # Expand vocab with additional parent codes
-    if additional_codes:
-        print(f"Expanding vocabulary with {len(additional_codes)} additional parent codes")
-        start_idx = len(diag_itos)
-        for code in additional_codes:
-            diag_itos.append(code)
-            diag_stoi[code] = start_idx
-            start_idx += 1
-        # Update vocabs tuple with expanded diag vocab
-        vocabs = (diag_stoi, proc_stoi, drug_stoi, ccs_stoi)
-        print(f"Expanded diag vocab size: {len(diag_stoi)}")
 
     # 4) Vectorization
     (Xtr_diag, Xtr_proc, Xtr_drug), Ytr = prepare_XY(train_pairs, vocabs, use_current_step=use_current_step)
@@ -337,7 +156,7 @@ def train_model_on_samples(samples,
     # Y vocab size = ccs_stoi + 1 (for padding) - now uses CCS codes only for output
     diag_stoi, proc_stoi, drug_stoi, ccs_stoi = vocabs
     x_vocab_size = len(diag_stoi) + len(proc_stoi) + len(drug_stoi) + 1  # +1 for padding
-    y_vocab_size = len(ccs_stoi) + 1  # +1 for padding (Y uses CCS vocab, separate from diag)
+    y_vocab_size = len(ccs_stoi)
     
     device = torch.device('cuda')
     print(f"Using device: {device}")
@@ -373,14 +192,7 @@ def train_model_on_samples(samples,
         
         # Training phase
         for batch_X, batch_Y in train_loader:
-            # batch_X is a tuple of (batch_X_diag, batch_X_proc, batch_X_drug)
             batch_X_diag, batch_X_proc, batch_X_drug = batch_X
-            # print(f"batch_X_diag: {batch_X_diag.shape}")
-            # print(f"batch_X_diag: {batch_X_diag[0]}")  # a lot of 0s
-            # print(f"batch_X_proc: {batch_X_proc.shape}")
-            # print(f"batch_X_proc: {batch_X_proc[0]}")
-            # print(f"batch_X_drug: {batch_X_drug.shape}")
-            # print(f"batch_X_drug: {batch_X_drug[0]}")
             batch_X_diag = batch_X_diag.to(device)
             batch_X_proc = batch_X_proc.to(device)
             batch_X_drug = batch_X_drug.to(device)
@@ -388,34 +200,10 @@ def train_model_on_samples(samples,
             
             logits = model(batch_X_diag, batch_X_proc, batch_X_drug)  # (batch_size, y_vocab_size)
             
-            # Convert Y from padded index sequences to multi-hot vectors
-            # batch_Y shape: (batch_size, max_y_len) with indices (0 = padding)
-            batch_size = batch_Y.size(0)
-            max_y_len = batch_Y.size(1)
-            y_multi_hot = torch.zeros(batch_size, logits.size(1), device=device)
+            loss = nn.functional.binary_cross_entropy_with_logits(logits, batch_Y)
             
-            for i in range(batch_size):
-                # Extract valid labels (non-zero indices) for this sample
-                valid_labels = batch_Y[i][batch_Y[i] != 0]  # Remove padding
-                y_multi_hot[i, valid_labels] = 1.0  # Set positions to 1
-            
-            # Calculate loss using BCE
-            loss = nn.functional.binary_cross_entropy_with_logits(logits, y_multi_hot)
-            
-            # Add hierarchical loss if weight > 0
             if hierarchical_loss_weight > 0:
-                # Extract relevant codes from batch for optimized hierarchical loss computation
-                # batch_X_diag uses offset=1 (indices 1 to len(diag_stoi)), 0 is padding
-                unique_indices = torch.unique(batch_X_diag[batch_X_diag != 0])
-                # Convert from 1-indexed to 0-indexed (remove offset)
-                adjusted_indices = unique_indices - 1
-                # Filter valid indices and convert to codes
-                batch_codes = set()
-                for idx in adjusted_indices:
-                    if 0 <= idx < len(diag_itos):
-                        code = diag_itos[idx]
-                        batch_codes.add(code)
-                hier_loss = compute_hierarchical_loss(model, icd_hierarchy, ccs_groups, diag_stoi, diag_itos, device, relevant_codes=batch_codes)
+                hier_loss = compute_hierarchical_loss(model, hierarchy, device='cuda', batch_tokens=batch_X_diag)
                 total_loss = loss + hierarchical_loss_weight * hier_loss
                 epoch_hier_loss += hier_loss.item()
             else:
@@ -503,15 +291,8 @@ def evaluate_batched(model, data_loader, ks=(10, 20, 30), device=None):
             logits = model(batch_X_diag, batch_X_proc, batch_X_drug)
             all_logits.append(logits.cpu())
             
-            # Convert padded index sequences to multi-hot vectors
-            batch_size = batch_Y.size(0)
-            num_labels = logits.size(1)
-            y_multi_hot = torch.zeros(batch_size, num_labels)
-            
-            for i in range(batch_size):
-                valid_labels = batch_Y[i][batch_Y[i] != 0].cpu()
-                y_multi_hot[i, valid_labels] = 1.0
-            
+            # batch_Y is already multi-hot vectors with shape (batch_size, len(ccs_stoi))
+            y_multi_hot = batch_Y.float().cpu()
             all_labels.append(y_multi_hot)
     
     # Concatenate all batches
