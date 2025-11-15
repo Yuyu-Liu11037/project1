@@ -31,13 +31,6 @@ def compute_hierarchical_loss(model, hierarchy, device, batch_tokens=None):
 class VariableLengthDataset(Dataset):
     """Dataset for variable-length tensors with three separate code types"""
     def __init__(self, X_list_diag, X_list_proc, X_list_drug, Y_list):
-        """
-        Args:
-            X_list_diag: list of 1D tensors for diagnosis codes (variable length)
-            X_list_proc: list of 1D tensors for procedure codes (variable length)
-            X_list_drug: list of 1D tensors for drug codes (variable length)
-            Y_list: list of 1D tensors for labels (multi-hot vectors, fixed length = len(ccs_stoi))
-        """
         self.X_list_diag = X_list_diag
         self.X_list_proc = X_list_proc
         self.X_list_drug = X_list_drug
@@ -170,13 +163,8 @@ def train_model_on_samples(samples,
     model = create_model(model_type, x_vocab_size=x_vocab_size, hidden=hidden, out_dim=y_vocab_size, **model_kwargs_with_max)
     model = model.to(device) 
     
-    mani_params = [p for p in model.parameters() if isinstance(p, geoopt.ManifoldParameter)]
-    euc_params  = [p for p in model.parameters() if not isinstance(p, geoopt.ManifoldParameter)]
-
-    opt = geoopt.optim.RiemannianAdam([
-        {"params": mani_params, "lr": lr, "weight_decay": wd},
-        {"params": euc_params,  "lr": lr, "weight_decay": wd},
-    ])
+    params = [p for p in model.parameters()]
+    opt = optim.Adam(params, lr=lr, weight_decay=wd)
 
     # 7) Training loop with batches and early stopping
     best_metric = -float('inf')
@@ -202,18 +190,8 @@ def train_model_on_samples(samples,
             
             loss = nn.functional.binary_cross_entropy_with_logits(logits, batch_Y)
             
-            if hierarchical_loss_weight > 0:
-                hier_loss = compute_hierarchical_loss(model, hierarchy, device='cuda', batch_tokens=batch_X_diag)
-                total_loss = loss + hierarchical_loss_weight * hier_loss
-                epoch_hier_loss += hier_loss.item()
-            else:
-                total_loss = loss
-                epoch_hier_loss += 0.0
-            
             opt.zero_grad()
-            total_loss.backward()
-            with torch.no_grad():
-                model.reproject_hyperbolic_()  # Reproject all three hyperbolic embeddings
+            loss.backward()
             opt.step()
             
             epoch_loss += loss.item()
@@ -242,7 +220,6 @@ def train_model_on_samples(samples,
                     print(f"  → New best {monitor_metric}: {best_metric:.4f}")
                 else:
                     patience_counter += 1
-                    print(f"  → No improvement for {patience_counter} epochs (best {monitor_metric}: {best_metric:.4f})")
                 
                 if patience_counter >= patience:
                     print(f"\nEarly stopping triggered! No improvement in {monitor_metric} for {patience} epochs.")

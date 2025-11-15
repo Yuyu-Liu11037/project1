@@ -6,6 +6,8 @@ import argparse
 import torch
 import numpy as np
 import warnings
+import pickle
+from pathlib import Path
 from pyhealth.datasets import MIMIC4Dataset
 
 from util.data_processing import diag_prediction_mimic4_fn
@@ -71,6 +73,11 @@ def parse_args():
     parser.add_argument('--data_path', type=str, 
                        default="/data/yuyu/data/MIMIC_IV/hosp",
                        help='MIMIC-IV data path')
+    parser.add_argument('--cache_path', type=str, 
+                       default=None,
+                       help='Path to save/load processed samples cache (default: ./cache/mimic4_prediction_samples.pkl)')
+    parser.add_argument('--force_reload', action='store_true',
+                       help='Force reload and reprocess data even if cache exists')
     
     return parser.parse_args()
 
@@ -97,14 +104,46 @@ if __name__ == "__main__":
     
     print(f"Single training run with seed: {args.seed}")
     
-    print("\nLoading MIMIC-IV dataset...")
-    mimic4_base = MIMIC4Dataset(
-        root=args.data_path,
-        tables=["diagnoses_icd", "procedures_icd", "prescriptions"],
-        code_mapping={"NDC": ("ATC", {"target_kwargs": {"level": 3}})},
-    )
-
-    mimic4_prediction = mimic4_base.set_task(diag_prediction_mimic4_fn)
+    # Set up cache path
+    if args.cache_path is None:
+        cache_dir = Path("./cache")
+        cache_dir.mkdir(exist_ok=True)
+        cache_path = cache_dir / "mimic4_prediction_samples.pkl"
+    else:
+        cache_path = Path(args.cache_path)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Try to load from cache
+    samples = None
+    if not args.force_reload and cache_path.exists():
+        print(f"\nLoading processed samples from cache: {cache_path}")
+        try:
+            with open(cache_path, 'rb') as f:
+                samples = pickle.load(f)
+            print(f"Successfully loaded {len(samples)} samples from cache")
+        except Exception as e:
+            print(f"Warning: Failed to load cache ({e}). Will reprocess data.")
+            samples = None
+    
+    # Process data if not loaded from cache
+    if samples is None:
+        print("\nLoading and processing MIMIC-IV dataset...")
+        mimic4_base = MIMIC4Dataset(
+            root=args.data_path,
+            tables=["diagnoses_icd", "procedures_icd", "prescriptions"],
+            code_mapping={"NDC": ("ATC", {"target_kwargs": {"level": 3}})},
+        )
+        mimic4_prediction = mimic4_base.set_task(diag_prediction_mimic4_fn)
+        samples = mimic4_prediction.samples
+        
+        # Save to cache
+        print(f"\nSaving processed samples to cache: {cache_path}")
+        try:
+            with open(cache_path, 'wb') as f:
+                pickle.dump(samples, f)
+            print(f"Successfully saved {len(samples)} samples to cache")
+        except Exception as e:
+            print(f"Warning: Failed to save cache ({e}). Continuing without cache.")
 
     # Prepare model parameters
     model_kwargs = {
@@ -118,7 +157,7 @@ if __name__ == "__main__":
         })
      
     model, vocabs, ccs_itos, test_metrics = train_model_on_samples(
-            mimic4_prediction.samples,
+            samples,
             model_type=args.model,
             task=args.task,
             use_current_step=args.use_current_step,
