@@ -1,35 +1,68 @@
-Euclidean embedding + Transformer, 5%:
+Euclidean embedding 
+Transformer, 5%:
 [DONE] TRANSFORMER model test results:
   P@10: 0.3951
   Acc@10: 0.2495
-  Recall@10: 0.2495
   P@20: 0.4687
   Acc@20: 0.4271
-  Recall@20: 0.4271
   P@30: 0.5858
   Acc@30: 0.5640
-  Recall@30: 0.5640
+Transformer, 15%:
+[DONE] TRANSFORMER model test results:
+  P@10: 0.3911
+  Acc@10: 0.2467
+  P@20: 0.4712
+  Acc@20: 0.4259
+  P@30: 0.5972
+  Acc@30: 0.5711
+Transformer, 100%:
+[DONE] TRANSFORMER model test results:
+  P@10: 0.1924
+  Acc@10: 0.1206
+  P@20: 0.2185
+  Acc@20: 0.1977
+  P@30: 0.2896
+  Acc@30: 0.2706
+SVM, 5%:
+[DONE] SVM model test results:
+  P@10: 0.5994
+  Acc@10: 0.3809
+  P@20: 0.6034
+  Acc@20: 0.5596
+  P@30: 0.6859
+  Acc@30: 0.6700
+SVM, 100%:
+[DONE] SVM model test results:
+  P@10: 0.6743
+  Acc@10: 0.4260
+  P@20: 0.6789
+  Acc@20: 0.6245
+  P@30: 0.7532
+  Acc@30: 0.7317
 
 Freezed untrained hyperbolic embedding + Transformer with tangent-space adapter, 5%:
 [DONE] TRANSFORMER model test results:
   P@10: 0.4059
   Acc@10: 0.2562
-  Recall@10: 0.2562
   P@20: 0.4750
   Acc@20: 0.4331
-  Recall@20: 0.4331
   P@30: 0.5913
   Acc@30: 0.5681
-  Recall@30: 0.5681
 
-Freezed trained hyperbolic embedding + Transformer with tangent-space adapter, 5%:
+Freezed trained hyperbolic embedding
+Transformer with tangent-space adapter, 5%:
 [DONE] TRANSFORMER model test results:
   P@10: 0.4139
   Acc@10: 0.2620
-  Recall@10: 0.2620
   P@20: 0.4820
   Acc@20: 0.4402
-  Recall@20: 0.4402
   P@30: 0.5955
   Acc@30: 0.5737
-  Recall@30: 0.5737
+Transformer with tangent-space adapter, 100%:
+[DONE] TRANSFORMER model test results:
+  P@10: 0.3479
+  Acc@10: 0.2188
+  P@20: 0.3932
+  Acc@20: 0.3514
+  P@30: 0.4895
+  Acc@30: 0.4595

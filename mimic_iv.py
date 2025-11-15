@@ -19,9 +19,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Diagnosis prediction model training')
     
     # Model selection
-    parser.add_argument('--model', type=str, default='transformer', 
-                       choices=['mlp', 'transformer'],
-                       help='Model type: mlp or transformer')
+    parser.add_argument('--model_type', type=str, default='transformer', 
+                       choices=['transformer', 'svm'])
     
     # Training parameters
     parser.add_argument('--use_current_step', action='store_true',
@@ -87,7 +86,7 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     
-    print(f"Using model: {args.model}")
+    print(f"Using model: {args.model_type}")
     print(f"Hidden layer dimension: {args.hidden}")
     print(f"Learning rate: {args.lr}")
     print(f"Training epochs: {args.epochs}")
@@ -99,7 +98,7 @@ if __name__ == "__main__":
         actual_monitor = args.monitor_metric
         print(f"  Patience: {args.patience}, Min delta: {args.min_delta}, Monitor: {actual_monitor}")
     
-    if args.model == 'transformer':
+    if args.model_type == 'transformer':
         print(f"Transformer parameters - attention heads: {args.num_heads}, layers: {args.num_layers}")
     
     print(f"Hyperbolic embeddings: {args.use_hyperbolic_embeddings}")
@@ -122,7 +121,7 @@ if __name__ == "__main__":
         'p': args.dropout,
     }
     
-    if args.model == 'transformer':
+    if args.model_type == 'transformer':
         model_kwargs.update({
             'num_heads': args.num_heads,
             'num_layers': args.num_layers,
@@ -130,7 +129,7 @@ if __name__ == "__main__":
     
     model, vocabs, y_itos, test_metrics = train_diagnosis_model_on_samples(
                 mimic4_prediction.samples,
-                model_type=args.model,
+                model_type=args.model_type,
                 use_current_step=args.use_current_step,
                 hidden=args.hidden,
                 lr=args.lr,
@@ -151,6 +150,6 @@ if __name__ == "__main__":
                 **model_kwargs
             )
         
-    print(f"\n[DONE] {args.model.upper()} model test results:")
+    print(f"\n[DONE] {args.model_type.upper()} model test results:")
     for metric, value in test_metrics.items():
         print(f"  {metric}: {value:.4f}")
