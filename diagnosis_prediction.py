@@ -12,6 +12,7 @@ from pyhealth.datasets import MIMIC4Dataset
 
 from util.data_processing import diag_prediction_mimic4_fn
 from training.training import train_model_on_samples
+from util.code_trie import CodeTrie
 
 warnings.filterwarnings('ignore')
 
@@ -21,9 +22,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Diagnosis prediction model training')
     
     # Model selection
-    parser.add_argument('--model', type=str, default='transformer', 
-                       choices=['mlp', 'transformer'],
-                       help='Model type: mlp or transformer (default: mlp)')
+    parser.add_argument('--model_type', type=str, default='transformer', choices=['transformer', 'hyperbolic'])
     
     # Training parameters
     parser.add_argument('--task', type=str, default='next',
@@ -66,7 +65,7 @@ def parse_args():
                        help='Dropout rate (default: 0.3)')
     
     # Hierarchical loss parameter
-    parser.add_argument('--hierarchical_loss_weight', type=float, default=0.5,
+    parser.add_argument('--hierarchical_loss_weight', type=float, default=0.1,
                        help='Weight for hierarchical constraint loss')
     
     # Data path
@@ -88,7 +87,7 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     
-    print(f"Using model: {args.model}")
+    print(f"Using model: {args.model_type}")
     print(f"Prediction task: {args.task}")
     print(f"Hidden layer dimension: {args.hidden}")
     print(f"Learning rate: {args.lr}")
@@ -99,10 +98,8 @@ if __name__ == "__main__":
     if args.early_stopping:
         print(f"  Patience: {args.patience}, Min delta: {args.min_delta}, Monitor: {args.monitor_metric}")
     
-    if args.model == 'transformer':
+    if args.model_type == 'transformer' or args.model_type == 'hyperbolic':
         print(f"Transformer parameters - attention heads: {args.num_heads}, layers: {args.num_layers}")
-    
-    print(f"Single training run with seed: {args.seed}")
     
     # Set up cache path
     if args.cache_path is None:
@@ -150,15 +147,17 @@ if __name__ == "__main__":
         'p': args.dropout,
     }
     
-    if args.model == 'transformer':
+    if args.model_type == 'transformer' or args.model_type == 'hyperbolic':
         model_kwargs.update({
             'num_heads': args.num_heads,
             'num_layers': args.num_layers,
         })
      
+    diag_trie = CodeTrie.from_file("cond_hist_codes.txt")
     model, vocabs, ccs_itos, test_metrics = train_model_on_samples(
             samples,
-            model_type=args.model,
+            diag_trie=diag_trie,
+            model_type=args.model_type,
             task=args.task,
             use_current_step=args.use_current_step,
             hidden=args.hidden,
@@ -176,6 +175,6 @@ if __name__ == "__main__":
             **model_kwargs
         )
         
-    print(f"\n[DONE] {args.model.upper()} model test results:")
+    print(f"\n[DONE] {args.model_type.upper()} model test results:")
     for metric, value in test_metrics.items():
         print(f"  {metric}: {value:.4f}")

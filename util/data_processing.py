@@ -113,10 +113,13 @@ def build_vocab_from_pairs(pairs):
     - These are now kept separate: ICD vocab for diag, CCS vocab for labels
     """
     diag_c, proc_c, drug_c, ccs_c = Counter(), Counter(), Counter(), Counter()
+    with open('/data/yuyu/project1/cond_hist_codes.txt', 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            codes = line.split()
+            diag_c.update(codes)
     
     for s, y in pairs:
-        for visit_codes in s["cond_hist"]:   # Historical ICD diagnoses (last step is empty to prevent leakage)
-            diag_c.update(visit_codes)
         for visit_codes in s["procedures"]:  # Each step is a procedure code list
             proc_c.update(visit_codes)
         for visit_codes in s["drugs"]:       # Each step is an ATC3 list
@@ -165,6 +168,9 @@ class CodeTokenizer:
         indices = []
         for codes in seq_of_lists:
             for c in codes:
+                if c not in self.stoi:
+                    # print(c)
+                    continue
                 indices.append(self.stoi[c] + self.offset)
         return indices
     
