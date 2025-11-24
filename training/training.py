@@ -45,7 +45,7 @@ class VariableLengthDataset(Dataset):
 
 
 def collate_fn(batch, max_diag_len=None, max_proc_len=None, max_drug_len=None):
-    """Custom collate function to pad variable-length sequences for three code types to global max lengths"""
+    """Custom collate function to pad variable-length sequences to batch max lengths (with optional upper limit)"""
     X_batch, Y_batch = zip(*batch)
     
     # Unpack three types of X
@@ -53,41 +53,23 @@ def collate_fn(batch, max_diag_len=None, max_proc_len=None, max_drug_len=None):
     X_proc_batch = [x[1] for x in X_batch]
     X_drug_batch = [x[2] for x in X_batch]
     
-    # Get max lengths (use provided global max, or fallback to batch max)
-    if max_diag_len is None:
-        max_diag_len = max(len(x) for x in X_diag_batch) if X_diag_batch else 0
-    if max_proc_len is None:
-        max_proc_len = max(len(x) for x in X_proc_batch) if X_proc_batch else 0
-    if max_drug_len is None:
-        max_drug_len = max(len(x) for x in X_drug_batch) if X_drug_batch else 0
+    # Truncate sequences if they exceed upper limits (for model constraints like context_length)
+    if max_diag_len is not None:
+        X_diag_batch = [x[:max_diag_len] for x in X_diag_batch]
+    if max_proc_len is not None:
+        X_proc_batch = [x[:max_proc_len] for x in X_proc_batch]
+    if max_drug_len is not None:
+        X_drug_batch = [x[:max_drug_len] for x in X_drug_batch]
     
-    # Pad each type to global max length (not batch max)
-    # First pad to batch max, then pad/truncate to global max
+    # Get batch max lengths (after truncation)
+    batch_max_diag_len = max(len(x) for x in X_diag_batch) if X_diag_batch else 0
+    batch_max_proc_len = max(len(x) for x in X_proc_batch) if X_proc_batch else 0
+    batch_max_drug_len = max(len(x) for x in X_drug_batch) if X_drug_batch else 0
+    
+    # Pad each type to batch max length (not global max)
     X_diag_padded = torch.nn.utils.rnn.pad_sequence(X_diag_batch, batch_first=True, padding_value=0)
-    if X_diag_padded.size(1) < max_diag_len:
-        # Pad to global max length
-        padding = torch.zeros(X_diag_padded.size(0), max_diag_len - X_diag_padded.size(1), 
-                             dtype=X_diag_padded.dtype, device=X_diag_padded.device)
-        X_diag_padded = torch.cat([X_diag_padded, padding], dim=1)
-    else:
-        # Truncate to global max length
-        X_diag_padded = X_diag_padded[:, :max_diag_len]
-    
     X_proc_padded = torch.nn.utils.rnn.pad_sequence(X_proc_batch, batch_first=True, padding_value=0)
-    if X_proc_padded.size(1) < max_proc_len:
-        padding = torch.zeros(X_proc_padded.size(0), max_proc_len - X_proc_padded.size(1), 
-                             dtype=X_proc_padded.dtype, device=X_proc_padded.device)
-        X_proc_padded = torch.cat([X_proc_padded, padding], dim=1)
-    else:
-        X_proc_padded = X_proc_padded[:, :max_proc_len]
-    
     X_drug_padded = torch.nn.utils.rnn.pad_sequence(X_drug_batch, batch_first=True, padding_value=0)
-    if X_drug_padded.size(1) < max_drug_len:
-        padding = torch.zeros(X_drug_padded.size(0), max_drug_len - X_drug_padded.size(1), 
-                             dtype=X_drug_padded.dtype, device=X_drug_padded.device)
-        X_drug_padded = torch.cat([X_drug_padded, padding], dim=1)
-    else:
-        X_drug_padded = X_drug_padded[:, :max_drug_len]
     
     # For Y (multi-hot vectors), stack directly since they all have the same length (len(ccs_stoi))
     Y_padded = torch.stack(Y_batch)
