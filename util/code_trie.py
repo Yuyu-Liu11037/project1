@@ -53,22 +53,11 @@ def proj_inside_unit_disk(x: np.ndarray, eps: float = 1e-5) -> np.ndarray:
 
 def sarkar_embed_trie(trie: "CodeTrie",
                       tau: float = 1.0) -> Dict["TrieNode", np.ndarray]:
-    """
-    使用 Sarkar 的方法，将 CodeTrie 中的整棵树嵌入到 2D Poincaré 双曲空间。
-
-    Args:
-        trie: 你的 CodeTrie 实例
-        tau: 每条边的双曲长度（可调超参数，越大层级拉得越开）
-    Returns:
-        embeddings: {TrieNode -> np.array([x, y])}，每个节点在双曲盘中的坐标
-    """
     embeddings: Dict["TrieNode", np.ndarray] = {}
 
     root = trie.root
-    # 根节点在圆盘中心
     embeddings[root] = np.zeros(2, dtype=float)
 
-    # 预先算好欧式半径 r，对应双曲距离 tau
     r = np.tanh(tau / 2.0)
 
     def dfs(node: "TrieNode",

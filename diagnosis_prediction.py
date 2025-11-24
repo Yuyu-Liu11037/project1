@@ -22,7 +22,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Diagnosis prediction model training')
     
     # Model selection
-    parser.add_argument('--model_type', type=str, default='transformer', choices=['transformer', 'hyperbolic'])
+    parser.add_argument('--model_type', type=str, default='transformer')
     
     # Training parameters
     parser.add_argument('--task', type=str, default='next',
@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument('--use_current_step', action='store_true',
                        help='Whether to use current step information (default: False)')
     parser.add_argument('--hidden', type=int, default=512,
-                       help='Hidden layer dimension (default: 512)')
+                       help='Hidden layer dimension')
     parser.add_argument('--lr', type=float, default=1e-4,
                        help='Learning rate (default: 1e-4)')
     parser.add_argument('--wd', type=float, default=1e-5,

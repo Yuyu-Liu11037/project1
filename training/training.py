@@ -29,196 +29,6 @@ from util.data_processing import (
 from metrics.metrics import precision_at_k_visit, accuracy_at_k_code, recall_at_k_micro
 
 
-def xi_poincare(p, c):
-    '''双曲锥的开口角'''
-    # p, c: shape (d,)
-    # 与训练代码中的 angle_Xi 保持一致
-    p2 = np.dot(p, p)
-    c2 = np.dot(c, c)
-    pc = np.dot(p, c)
-    
-    num = pc * (1 + p2) - p2 * (1 + c2)
-    
-    # 使用 clamp 保护数值稳定性，与训练代码一致
-    p_minus_c = p - c
-    p_minus_c_norm = np.linalg.norm(p_minus_c)
-    p_minus_c_norm = max(p_minus_c_norm, 1e-15)  # 对应训练代码中的 clamp(min=1e-15)
-    
-    p_norm = np.sqrt(p2)
-    p_norm = max(p_norm, 1e-15)  # 对应训练代码中的 clamp(min=1e-15)
-    
-    inside = 1 + p2 * c2 - 2 * pc
-    inside = max(inside, 1e-15)  # 对应训练代码中的 clamp(min=1e-15)
-    
-    den = p_norm * p_minus_c_norm * np.sqrt(inside)
-    
-    # 与训练代码保持一致：clamp 到 [-1.0 + 1e-7, 1.0 - 1e-7]
-    val = num / (den + 1e-15)
-    val = np.clip(val, -1.0 + 1e-7, 1.0 - 1e-7)
-    return np.arccos(val)  # Xi(p,c)
-
-
-def psi_from_norm_poincare(norm_p, K, eps):
-    '''以 p 为顶点的双曲锥体的半角'''
-    # psi(p) = arcsin( K * (1 - ||p||^2) / ||p|| )
-    # 与训练代码中的 psi 保持一致：使用 eps 来 clamp 范数的最小值
-    norm_p = max(norm_p, eps)  # 对应训练代码中的 clamp(min=eps)
-    arg = K * (1.0 - norm_p * norm_p) / (norm_p + 1e-15)
-    # 与训练代码保持一致：clamp 到 [-1.0 + 1e-7, 1.0 - 1e-7]
-    arg = np.clip(arg, -1.0 + 1e-7, 1.0 - 1e-7)
-    return np.arcsin(arg)
-
-
-def compute_xi_psi(p, c, K, eps):
-    p2 = torch.sum(p ** 2)
-    c2 = torch.sum(c ** 2)
-    pc = torch.sum(p * c)
-    
-    num = pc * (1 + p2) - p2 * (1 + c2)
-    
-    p_minus_c = p - c
-    p_minus_c_norm = torch.norm(p_minus_c).clamp_min(1e-15)
-    p_norm = torch.sqrt(p2).clamp_min(1e-15)
-    
-    inside = 1 + p2 * c2 - 2 * pc
-    inside = inside.clamp_min(1e-15)
-    
-    den = p_norm * p_minus_c_norm * torch.sqrt(inside)
-    
-    val = num / (den + 1e-15)
-    val = torch.clamp(val, -1.0 + 1e-7, 1.0 - 1e-7)
-    xi = torch.acos(val)
-    
-    norm_p = torch.norm(p).clamp_min(eps)
-    arg = K * (1.0 - norm_p * norm_p) / (norm_p + 1e-15)
-    arg = torch.clamp(arg, -1.0 + 1e-7, 1.0 - 1e-7)
-    psi = torch.asin(arg)
-    
-    return xi, psi
-
-
-def cone_violation(p, c, K, eps):
-    xi, psi = compute_xi_psi(p, c, K, eps)
-    violation = torch.clamp(xi - psi, min=0.0)  # Only penalize if xi > psi
-    return violation
-
-
-def poincare_distance(x, y, c=1.0, eps=1e-5):
-    x_norm_sq = torch.sum(x ** 2, dim=-1, keepdim=True).clamp(max=1.0 - eps)
-    y_norm_sq = torch.sum(y ** 2, dim=-1, keepdim=True).clamp(max=1.0 - eps)
-    
-    # Compute ||x - y||^2
-    diff_norm_sq = torch.sum((x - y) ** 2, dim=-1, keepdim=True)
-    
-    # Poincaré distance formula: d(x,y) = (1/√c) * arccosh(1 + 2 * ||x-y||^2 / ((1-||x||^2)(1-||y||^2)))
-    numerator = 2 * diff_norm_sq
-    denominator = (1 - x_norm_sq) * (1 - y_norm_sq)
-    denominator = denominator.clamp_min(eps)
-    
-    arg = 1 + numerator / denominator
-    arg = arg.clamp_min(1.0 + eps)  # Ensure arg >= 1 for arccosh
-    
-    sqrt_c = c ** 0.5
-    dist = (1.0 / sqrt_c) * torch.acosh(arg)
-    
-    return dist.squeeze(-1)
-
-
-def find_parent_child_pairs(valid_indices, diag_itos, diag_trie):
-    parent_child_pairs = []
-    
-    # Create mapping from code string to index (in diag_itos, which is 0-indexed)
-    # Note: Z_diag[0] is padding, Z_diag[1] corresponds to diag_itos[0], etc.
-    code_to_idx = {code: idx + 1 for idx, code in enumerate(diag_itos)}  # +1 because 0 is padding
-    
-    # Convert to list and get valid codes
-    valid_indices_list = valid_indices.cpu().numpy().tolist()
-    valid_codes = [diag_itos[idx - 1] for idx in valid_indices_list]  # -1 because 0 is padding
-    
-    # For each code, find its ancestors in the trie
-    for code in valid_codes:
-        all_sequences = diag_trie.get_all_sequences()
-        sequences = [seq for seq in all_sequences if code in seq]
-        
-        # For each sequence, find parent-child relationships
-        for seq in sequences:
-            if code in seq:
-                code_idx_in_seq = seq.index(code)
-                if code_idx_in_seq > 0:
-                    parent_code = seq[code_idx_in_seq - 1]
-                    parent_idx = code_to_idx[parent_code]
-                    child_idx = code_to_idx[code]
-                    parent_child_pairs.append((parent_idx, child_idx))
-    
-    return list(set(parent_child_pairs))  # Remove duplicates
-
-
-def hyperbolic_loss(patient_embeddings, Z_diag, diag_trie, diag_itos, batch_X_diag, 
-                    K=1.0, eps=1e-5, num_negatives=10, margin=1.0, cone_weight=0.5):
-    """
-    Hyperbolic loss function for hierarchical diagnosis code embeddings.
-    """
-    batch_size = patient_embeddings.shape[0]
-    device = 'cuda'
-    D = len(diag_itos)  # Number of diagnosis codes (excluding padding)
-    
-    loss_list = []
-    
-    for i in range(batch_size):
-        diag_indices = batch_X_diag[i].long()
-        patient_embedding = patient_embeddings[i]  # (dim,)
-        valid_mask = diag_indices > 0
-        valid_indices = diag_indices[valid_mask]  # non-zero tokens
-        
-        # Part1: Contrastive loss
-        positive_embeddings = Z_diag[valid_indices]  # (n_valid, dim)
-
-        all_indices = torch.arange(1, D + 1, device=device)  # 1 to D (excluding 0 which is padding)
-        negative_mask = torch.ones(len(all_indices), dtype=torch.bool, device=device)
-        for idx in valid_indices:
-            negative_mask[idx - 1] = False  # -1 because all_indices starts at 1
-        negative_candidates = all_indices[negative_mask]
-        num_neg = min(num_negatives, negative_candidates.numel())
-        negative_indices = negative_candidates[torch.randperm(negative_candidates.numel(), device=device)[:num_neg]]
-        negative_embeddings = Z_diag[negative_indices]  # (num_neg, dim)
-        
-        # Contrastive loss: minimize distance to positives, maximize distance to negatives
-        # Average distance to positive samples
-        pos_distances = poincare_distance(
-            patient_embedding.unsqueeze(0),  # (1, dim)
-            positive_embeddings  # (n_valid, dim)
-        )  # (n_valid,)
-        avg_pos_distance = pos_distances.mean()
-        
-        # Average distance to negative samples
-        neg_distances = poincare_distance(
-            patient_embedding.unsqueeze(0),  # (1, dim)
-            negative_embeddings  # (num_neg, dim)
-        )  # (num_neg,)
-        avg_neg_distance = neg_distances.mean()
-        
-        # Contrastive loss: pull positives closer, push negatives away
-        contrastive_loss = avg_pos_distance - avg_neg_distance + margin
-        contrastive_loss = torch.clamp(contrastive_loss, min=0.0)
-        
-        # Part2: Hierarchical loss - cone constraint violation
-        cone_loss_list = []
-        parent_child_pairs = find_parent_child_pairs(valid_indices, diag_itos, diag_trie)
-        
-        for parent_idx, child_idx in parent_child_pairs:
-            parent_emb = Z_diag[parent_idx]  # (dim,)
-            child_emb = Z_diag[child_idx]  # (dim,)
-            violation = cone_violation(parent_emb, child_emb, K, eps)
-            cone_loss_list.append(violation)
-        
-        cone_loss = torch.stack(cone_loss_list).mean()
-        # cone_loss = torch.tensor(0.0, device=device)
-        loss_list.append(contrastive_loss + cone_weight * cone_loss)
-    
-    total_loss = torch.stack(loss_list).mean()
-    return total_loss
-
-
 class VariableLengthDataset(Dataset):
     """Dataset for variable-length tensors with three separate code types"""
     def __init__(self, X_list_diag, X_list_proc, X_list_drug, Y_list):
@@ -235,7 +45,7 @@ class VariableLengthDataset(Dataset):
 
 
 def collate_fn(batch, max_diag_len=None, max_proc_len=None, max_drug_len=None):
-    """Custom collate function to pad variable-length sequences for three code types"""
+    """Custom collate function to pad variable-length sequences for three code types to global max lengths"""
     X_batch, Y_batch = zip(*batch)
     
     # Unpack three types of X
@@ -243,7 +53,7 @@ def collate_fn(batch, max_diag_len=None, max_proc_len=None, max_drug_len=None):
     X_proc_batch = [x[1] for x in X_batch]
     X_drug_batch = [x[2] for x in X_batch]
     
-    # Pad each type separately to their respective max lengths
+    # Get max lengths (use provided global max, or fallback to batch max)
     if max_diag_len is None:
         max_diag_len = max(len(x) for x in X_diag_batch) if X_diag_batch else 0
     if max_proc_len is None:
@@ -251,15 +61,33 @@ def collate_fn(batch, max_diag_len=None, max_proc_len=None, max_drug_len=None):
     if max_drug_len is None:
         max_drug_len = max(len(x) for x in X_drug_batch) if X_drug_batch else 0
     
-    # Pad each type
+    # Pad each type to global max length (not batch max)
+    # First pad to batch max, then pad/truncate to global max
     X_diag_padded = torch.nn.utils.rnn.pad_sequence(X_diag_batch, batch_first=True, padding_value=0)
-    X_diag_padded = X_diag_padded[:, :max_diag_len]  # Truncate if necessary
+    if X_diag_padded.size(1) < max_diag_len:
+        # Pad to global max length
+        padding = torch.zeros(X_diag_padded.size(0), max_diag_len - X_diag_padded.size(1), 
+                             dtype=X_diag_padded.dtype, device=X_diag_padded.device)
+        X_diag_padded = torch.cat([X_diag_padded, padding], dim=1)
+    else:
+        # Truncate to global max length
+        X_diag_padded = X_diag_padded[:, :max_diag_len]
     
     X_proc_padded = torch.nn.utils.rnn.pad_sequence(X_proc_batch, batch_first=True, padding_value=0)
-    X_proc_padded = X_proc_padded[:, :max_proc_len]
+    if X_proc_padded.size(1) < max_proc_len:
+        padding = torch.zeros(X_proc_padded.size(0), max_proc_len - X_proc_padded.size(1), 
+                             dtype=X_proc_padded.dtype, device=X_proc_padded.device)
+        X_proc_padded = torch.cat([X_proc_padded, padding], dim=1)
+    else:
+        X_proc_padded = X_proc_padded[:, :max_proc_len]
     
     X_drug_padded = torch.nn.utils.rnn.pad_sequence(X_drug_batch, batch_first=True, padding_value=0)
-    X_drug_padded = X_drug_padded[:, :max_drug_len]
+    if X_drug_padded.size(1) < max_drug_len:
+        padding = torch.zeros(X_drug_padded.size(0), max_drug_len - X_drug_padded.size(1), 
+                             dtype=X_drug_padded.dtype, device=X_drug_padded.device)
+        X_drug_padded = torch.cat([X_drug_padded, padding], dim=1)
+    else:
+        X_drug_padded = X_drug_padded[:, :max_drug_len]
     
     # For Y (multi-hot vectors), stack directly since they all have the same length (len(ccs_stoi))
     Y_padded = torch.stack(Y_batch)
@@ -279,7 +107,7 @@ def train_model_on_samples(samples,
                            patience=10,           # Number of epochs to wait before stopping
                            min_delta=0.001,      # Minimum change to qualify as improvement
                            monitor_metric='Acc@10', # Metric to monitor for early stopping
-                           hierarchical_loss_weight=0.1,  # Weight for hierarchical constraint loss
+                           hierarchical_loss_weight=0.5,
                            **model_kwargs):
     # 1) Sort and assemble (current/next)
     # print(f"\nSamples: {samples[0]}")
@@ -308,7 +136,7 @@ def train_model_on_samples(samples,
         print(f"Few-shot training: Using {len(train_pairs)}/{original_train_size} samples ({train_percentage:.1%} of training data)")
 
     # 3) Vocabulary
-    (diag_stoi, diag_itos), (proc_stoi,_), (drug_stoi,_), (ccs_stoi, ccs_itos) = build_vocab_from_pairs(pairs) # diag_stoi={code: index}, diag_itos=[code1, code2, ...]
+    (diag_stoi, diag_itos), (proc_stoi, proc_itos), (drug_stoi, drug_itos), (ccs_stoi, ccs_itos) = build_vocab_from_pairs(pairs) # diag_stoi={code: index}, diag_itos=[code1, code2, ...]
     # vocab_dict = {'diag_itos': diag_itos}
     # with open('vocab.pkl', 'wb') as f:
     #     pickle.dump(vocab_dict, f)
@@ -354,96 +182,42 @@ def train_model_on_samples(samples,
     model_kwargs_with_max = {**model_kwargs, 
                              'diag_size': len(diag_stoi),
                              'proc_size': len(proc_stoi),
+                             'diag_itos': diag_itos,
+                             'max_diag_len': max_diag_len,
                             }
     model = create_model(model_type, x_vocab_size=x_vocab_size, hidden=hidden, out_dim=y_vocab_size, **model_kwargs_with_max)
     model = model.to(device) 
-    
-    # Separate parameters: hyperbolic parameters use RiemannianAdam, others use regular Adam
-    # Note: In PoincareMap, all parameters (proj.weight, log_c, gamma) are in Euclidean space.
-    # The output embeddings are on the Poincaré ball, but they are computed, not parameters.
-    # Since c is learnable and changes during training, we cannot use a fixed manifold.
-    # Instead, we use RiemannianAdam without manifold for hyperbolic parameters (Euclidean updates),
-    # which still provides better optimization for hyperbolic-related parameters.
-    
-    hyperbolic_params = []
-    euclidean_params = []
-    
-    # Collect hyperbolic parameters from PoincareMap modules
-    # These include: proj.weight, proj.bias, log_c, gamma
-    hyperbolic_params.extend(list(model.patient_hyp_head.parameters()))
-    hyperbolic_params.extend(list(model.diag_hyp_head.parameters()))
-    
-    # Collect all other parameters
-    for name, param in model.named_parameters():
-        if 'patient_hyp_head' not in name and 'diag_hyp_head' not in name:
-            euclidean_params.append(param)
-    
-    # Create parameter groups
-    # Since c is learnable, we cannot use a fixed manifold.
-    # RiemannianAdam without manifold will use Euclidean updates, but it's still
-    # beneficial for hyperbolic-related parameters due to its adaptive learning rate.
-    param_groups = [
-        # Euclidean parameters (standard parameters)
-        {'params': euclidean_params, 'lr': lr, 'weight_decay': wd},
-        # Hyperbolic parameters (no manifold, but use RiemannianAdam for better optimization)
-        {'params': hyperbolic_params, 'lr': lr, 'weight_decay': wd}
-    ]
-    
-    # Use RiemannianAdam which can handle both Euclidean and Riemannian parameters
-    # Without manifold specified, it will use Euclidean updates for all parameters
-    opt = geoopt.optim.RiemannianAdam(param_groups, lr=lr, weight_decay=wd)
-
-    # Create checkpoint directory
-    checkpoint_dir = Path("checkpoints")
-    checkpoint_dir.mkdir(exist_ok=True)
-    
-    # Save initial model parameters before training
-    initial_model_path = checkpoint_dir / "model_initial.pt"
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': opt.state_dict(),
-        'epoch': 0,
-    }, initial_model_path)
-    print(f"Saved initial model parameters to {initial_model_path}")
+    opt = geoopt.optim.RiemannianAdam(model.parameters(), lr=lr, weight_decay=wd)
 
     # 7) Training loop with batches and early stopping
     best_metric = -float('inf')
     patience_counter = 0
     best_model_state = None
-    final_epoch = 0  # Track the final epoch number
-    
+        
     print(f"Training for {epochs} epochs")
     for ep in range(1, epochs+1):
-        final_epoch = ep
         model.train()
         epoch_loss = 0.0
         epoch_hier_loss = 0.0
         num_batches = 0
-        
+            
         # Training phase
         for batch_X, batch_Y in train_loader:
             batch_X_diag, batch_X_proc, batch_X_drug = batch_X
-            batch_X_diag = batch_X_diag.to(device)
+            batch_X_diag = batch_X_diag.to(device)   # (batch_size, max_diag_len)
             batch_X_proc = batch_X_proc.to(device)
             batch_X_drug = batch_X_drug.to(device)
             batch_Y = batch_Y.to(device)
             
-            logits, z_patient = model(batch_X_diag, batch_X_proc, batch_X_drug)  # (batch_size, y_vocab_size)
-            
+            logits = model(batch_X_diag, batch_X_proc, batch_X_drug)  # (batch_size, y_vocab_size)
+                
             loss = nn.functional.binary_cross_entropy_with_logits(logits, batch_Y)
             total_loss = loss
             hier_loss_value = 0.0  # Initialize hier_loss value
-            
-            if hierarchical_loss_weight > 0:
-                Z_diag    = model.get_diag_hyperbolic()
-                hier_loss = hyperbolic_loss(z_patient, Z_diag, diag_trie, diag_itos, batch_X_diag)
-                total_loss = loss + hierarchical_loss_weight * hier_loss
-                hier_loss_value = hier_loss.item()
-            
+                
             opt.zero_grad()
             total_loss.backward()
             opt.step()
-            
             epoch_loss += loss.item()
             epoch_hier_loss += hier_loss_value
             num_batches += 1
@@ -455,15 +229,10 @@ def train_model_on_samples(samples,
         if ep % 1 == 0:
             val_metrics = evaluate_batched(model, val_loader, ks=(10, 20, 30), device=device)
             current_metric = val_metrics[monitor_metric]
-            
-            # Get log_c values from both PoincareMap modules
-            patient_c = model.patient_hyp_head.c.item()
-            diag_c = model.diag_hyp_head.c.item()
-            
-            print(f"Epoch {ep:02d} | avg_loss={avg_loss:.4f} | hier_loss={avg_hier_loss:.4f} | "
-                  f"val P@10={val_metrics['P@10']:.4f} Acc@10={val_metrics['Acc@10']:.4f}  | "
-                  f"c: patient={patient_c:.4f} diag={diag_c:.4f}")
-            
+                
+            print(f"Epoch {ep:02d} | avg_loss={avg_loss:.4f} | hier_loss={avg_hier_loss:.4f} | val P@10={val_metrics['P@10']:.4f} Acc@10={val_metrics['Acc@10']:.4f}")   
+            print(f"Logits stats: min={logits.min().item():.4f}, max={logits.max().item():.4f}, mean={logits.mean().item():.4f}, std={logits.std().item():.4f}")
+            # print(f"Predictions: {(torch.sigmoid(logits) > 0.5).sum().item()} / {logits.numel()} positive predictions")
             # Early stopping logic
             if early_stopping:
                 if current_metric > best_metric + min_delta:
@@ -474,7 +243,7 @@ def train_model_on_samples(samples,
                     print(f"  → New best {monitor_metric}: {best_metric:.4f}")
                 else:
                     patience_counter += 1
-                
+                    
                 if patience_counter >= patience:
                     print(f"\nEarly stopping triggered! No improvement in {monitor_metric} for {patience} epochs.")
                     print(f"Restoring best model from epoch {ep - patience_counter}")
@@ -482,18 +251,8 @@ def train_model_on_samples(samples,
                     break
 
     # 8) Test set evaluation (consistent with paper: Visit-level P@k, Code-level Acc@k)
-    test_metrics = evaluate_batched(model, test_loader, ks=(10, 20, 30), device=device)
+    test_metrics = evaluate_batched(model, test_loader)
     print("[TEST]", test_metrics)
-    
-    # Save final model parameters after training
-    final_model_path = checkpoint_dir / "model_final.pt"
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': opt.state_dict(),
-        'test_metrics': test_metrics,
-        'epoch': final_epoch,
-    }, final_model_path)
-    print(f"Saved final model parameters to {final_model_path}")
     
     return model, vocabs, ccs_itos, test_metrics
 
@@ -506,13 +265,31 @@ def evaluate_batched(model, data_loader, ks=(10, 20, 30), device='cuda'):
     with torch.no_grad():
         for batch_X, batch_Y in data_loader:
             batch_X_diag, batch_X_proc, batch_X_drug = batch_X
-            batch_X_diag = batch_X_diag.to(device)
-            batch_X_proc = batch_X_proc.to(device)
-            batch_X_drug = batch_X_drug.to(device)
-            batch_Y = batch_Y.to(device)
+            # For SVM, keep on CPU; for other models, move to device
+            if device != 'cpu':
+                batch_X_diag = batch_X_diag.to(device)
+                batch_X_proc = batch_X_proc.to(device)
+                batch_X_drug = batch_X_drug.to(device)
+                batch_Y = batch_Y.to(device)
+            else:
+                batch_Y = batch_Y
             
-            logits, _ = model(batch_X_diag, batch_X_proc, batch_X_drug)
-            all_logits.append(logits.cpu())
+            # Handle models that return tuple vs single value
+            try:
+                # For LTransformerDecoder, only pass batch_X_diag
+                # The model will automatically handle padding mask
+                logits = model(batch_X_diag, batch_X_proc, batch_X_drug)
+                if isinstance(logits, tuple):
+                    logits = logits[0]
+            except RuntimeError as e:
+                if "fitted" in str(e):
+                    # Model not fitted yet, skip this batch
+                    continue
+                raise
+            
+            if device != 'cpu':
+                logits = logits.cpu()
+            all_logits.append(logits)
             
             # batch_Y is already multi-hot vectors with shape (batch_size, len(ccs_stoi))
             y_multi_hot = batch_Y.float().cpu()
