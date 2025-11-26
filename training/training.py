@@ -45,7 +45,7 @@ class VariableLengthDataset(Dataset):
 
 
 def collate_fn(batch, max_diag_len=None, max_proc_len=None, max_drug_len=None):
-    """Custom collate function to pad variable-length sequences to batch max lengths (with optional upper limit)"""
+    """Custom collate function to pad variable-length sequences for three code types"""
     X_batch, Y_batch = zip(*batch)
     
     # Unpack three types of X
@@ -53,23 +53,23 @@ def collate_fn(batch, max_diag_len=None, max_proc_len=None, max_drug_len=None):
     X_proc_batch = [x[1] for x in X_batch]
     X_drug_batch = [x[2] for x in X_batch]
     
-    # Truncate sequences if they exceed upper limits (for model constraints like context_length)
-    if max_diag_len is not None:
-        X_diag_batch = [x[:max_diag_len] for x in X_diag_batch]
-    if max_proc_len is not None:
-        X_proc_batch = [x[:max_proc_len] for x in X_proc_batch]
-    if max_drug_len is not None:
-        X_drug_batch = [x[:max_drug_len] for x in X_drug_batch]
+    # Pad each type separately to their respective max lengths
+    if max_diag_len is None:
+        max_diag_len = max(len(x) for x in X_diag_batch) if X_diag_batch else 0
+    if max_proc_len is None:
+        max_proc_len = max(len(x) for x in X_proc_batch) if X_proc_batch else 0
+    if max_drug_len is None:
+        max_drug_len = max(len(x) for x in X_drug_batch) if X_drug_batch else 0
     
-    # Get batch max lengths (after truncation)
-    batch_max_diag_len = max(len(x) for x in X_diag_batch) if X_diag_batch else 0
-    batch_max_proc_len = max(len(x) for x in X_proc_batch) if X_proc_batch else 0
-    batch_max_drug_len = max(len(x) for x in X_drug_batch) if X_drug_batch else 0
-    
-    # Pad each type to batch max length (not global max)
+    # Pad each type
     X_diag_padded = torch.nn.utils.rnn.pad_sequence(X_diag_batch, batch_first=True, padding_value=0)
+    X_diag_padded = X_diag_padded[:, :max_diag_len]  # Truncate if necessary
+    
     X_proc_padded = torch.nn.utils.rnn.pad_sequence(X_proc_batch, batch_first=True, padding_value=0)
+    X_proc_padded = X_proc_padded[:, :max_proc_len]
+    
     X_drug_padded = torch.nn.utils.rnn.pad_sequence(X_drug_batch, batch_first=True, padding_value=0)
+    X_drug_padded = X_drug_padded[:, :max_drug_len]
     
     # For Y (multi-hot vectors), stack directly since they all have the same length (len(ccs_stoi))
     Y_padded = torch.stack(Y_batch)
@@ -78,18 +78,16 @@ def collate_fn(batch, max_diag_len=None, max_proc_len=None, max_drug_len=None):
 
 
 def train_model_on_samples(samples,
-                           diag_trie,
                            model_type="transformer", 
                            task="next",          # "next" aligns with paper; "current" uses existing labels
                            use_current_step=False, # Admission prediction(False) or discharge prediction(True)
-                           hidden=512, lr=1e-3, wd=1e-5,
+                           lr=1e-4, wd=1e-6,
                            epochs=10, seed=42, train_percentage=1.0,
                            batch_size=32,         # Batch size for training
                            early_stopping=True,   # Enable early stopping
                            patience=10,           # Number of epochs to wait before stopping
                            min_delta=0.001,      # Minimum change to qualify as improvement
                            monitor_metric='Acc@10', # Metric to monitor for early stopping
-                           hierarchical_loss_weight=0.5,
                            **model_kwargs):
     # 1) Sort and assemble (current/next)
     # print(f"\nSamples: {samples[0]}")
@@ -101,8 +99,7 @@ def train_model_on_samples(samples,
     # build_pairs有问题。。我们应该是要用病人的所有过往visit记录来预测下一次的诊断，而不是上一次的visit
     # 没事了，cond_hist字段就是之前所有的visits
     pairs = build_pairs(by_pid, task=task)   # (sample_t, label_t+1)
-    # print(f"\nPairs: {pairs[10]}")
-    pairs = [(s, y_codes) for s, y_codes in pairs if s.get('cond_hist', []) and len([x for x in s['cond_hist'] if x]) > 0]
+    pairs = [(s, y_codes) for s, y_codes in pairs if len(s['cond_hist']) > 0]
 
     # 2) Patient-level split
     train_pairs, val_pairs, test_pairs = split_by_patient(pairs, seed=seed)
@@ -119,10 +116,6 @@ def train_model_on_samples(samples,
 
     # 3) Vocabulary
     (diag_stoi, diag_itos), (proc_stoi, proc_itos), (drug_stoi, drug_itos), (ccs_stoi, ccs_itos) = build_vocab_from_pairs(pairs) # diag_stoi={code: index}, diag_itos=[code1, code2, ...]
-    # vocab_dict = {'diag_itos': diag_itos}
-    # with open('vocab.pkl', 'wb') as f:
-    #     pickle.dump(vocab_dict, f)
-    # exit()
     vocabs = (diag_stoi, proc_stoi, drug_stoi, ccs_stoi)
 
     # 4) Vectorization
@@ -144,7 +137,6 @@ def train_model_on_samples(samples,
     
     # Create collate function with max lengths
     collate_fn_with_max = partial(collate_fn, max_diag_len=max_diag_len, max_proc_len=max_proc_len, max_drug_len=max_drug_len)
-    
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_with_max)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_with_max)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_with_max)
@@ -154,20 +146,21 @@ def train_model_on_samples(samples,
     # X vocab size = diag_stoi + proc_stoi + drug_stoi + 1 (for padding)
     # Y vocab size = ccs_stoi + 1 (for padding) - now uses CCS codes only for output
     diag_stoi, proc_stoi, drug_stoi, ccs_stoi = vocabs
-    x_vocab_size = len(diag_stoi) + len(proc_stoi) + len(drug_stoi) + 1  # +1 for padding
+    # x_vocab_size = len(diag_stoi) + len(proc_stoi) + len(drug_stoi) + 1  # +1 for padding
+    x_vocab_size = len(diag_stoi) + 1
     y_vocab_size = len(ccs_stoi)
     
     device = torch.device('cuda')
     print(f"Using device: {device}")
     print(f"X vocab size: {x_vocab_size}, Y vocab size: {y_vocab_size}")
-    
+
     model_kwargs_with_max = {**model_kwargs, 
                              'diag_size': len(diag_stoi),
                              'proc_size': len(proc_stoi),
                              'diag_itos': diag_itos,
                              'max_diag_len': max_diag_len,
                             }
-    model = create_model(model_type, x_vocab_size=x_vocab_size, hidden=hidden, out_dim=y_vocab_size, **model_kwargs_with_max)
+    model = create_model(model_type, x_vocab_size=x_vocab_size, out_dim=y_vocab_size, **model_kwargs_with_max)
     model = model.to(device) 
     opt = geoopt.optim.RiemannianAdam(model.parameters(), lr=lr, weight_decay=wd)
 
@@ -180,10 +173,8 @@ def train_model_on_samples(samples,
     for ep in range(1, epochs+1):
         model.train()
         epoch_loss = 0.0
-        epoch_hier_loss = 0.0
         num_batches = 0
-            
-        # Training phase
+
         for batch_X, batch_Y in train_loader:
             batch_X_diag, batch_X_proc, batch_X_drug = batch_X
             batch_X_diag = batch_X_diag.to(device)   # (batch_size, max_diag_len)
@@ -195,24 +186,21 @@ def train_model_on_samples(samples,
                 
             loss = nn.functional.binary_cross_entropy_with_logits(logits, batch_Y)
             total_loss = loss
-            hier_loss_value = 0.0  # Initialize hier_loss value
                 
             opt.zero_grad()
             total_loss.backward()
             opt.step()
             epoch_loss += loss.item()
-            epoch_hier_loss += hier_loss_value
             num_batches += 1
 
         avg_loss = epoch_loss / num_batches
-        avg_hier_loss = epoch_hier_loss / num_batches
 
         # Validation phase
         if ep % 1 == 0:
             val_metrics = evaluate_batched(model, val_loader, ks=(10, 20, 30), device=device)
             current_metric = val_metrics[monitor_metric]
                 
-            print(f"Epoch {ep:02d} | avg_loss={avg_loss:.4f} | hier_loss={avg_hier_loss:.4f} | val P@10={val_metrics['P@10']:.4f} Acc@10={val_metrics['Acc@10']:.4f}")   
+            print(f"Epoch {ep:02d} | avg_loss={avg_loss:.4f} | val P@10={val_metrics['P@10']:.4f} Acc@10={val_metrics['Acc@10']:.4f}")   
             print(f"Logits stats: min={logits.min().item():.4f}, max={logits.max().item():.4f}, mean={logits.mean().item():.4f}, std={logits.std().item():.4f}")
             # print(f"Predictions: {(torch.sigmoid(logits) > 0.5).sum().item()} / {logits.numel()} positive predictions")
             # Early stopping logic

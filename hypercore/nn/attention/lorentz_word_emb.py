@@ -7,7 +7,8 @@ from geoopt import ManifoldParameter
 import warnings
 import math
 class LorentzEmbeddings(nn.Module):
-    """Words embeddings for encoder/decoder, includes positional embedding
+    """
+    Words embeddings for encoder/decoder, includes positional embedding
     Additionally includes ability to add sparse input features
     based on "Linguistic Input Features Improve Neural Machine Translation"
     :cite:`sennrich2016linguistic`.
@@ -133,8 +134,7 @@ class LorentzEmbeddings(nn.Module):
         else:
             if batch_first:
                 source = source.permute(1, 0).contiguous()
-            source = self.embedding.index_select(
-                0, source.view(-1, )).view(source.shape + (-1, ))
+            source = self.embedding.index_select(0, source.view(-1, )).view(source.shape + (-1, ))
         if self.posit_embed:
             pe = self.poisitional_encoding[:source.size(0)] if step is None else self.poisitional_encoding[step]
             emb = self.add_pos(source, pe)
@@ -146,3 +146,4 @@ class LorentzEmbeddings(nn.Module):
             emb = emb * (self.manifold_out.c / self.manifold_in.c).sqrt()
             emb = emb.permute(1, 0, 2)
         return emb
+        

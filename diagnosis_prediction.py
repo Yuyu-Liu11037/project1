@@ -22,7 +22,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Diagnosis prediction model training')
     
     # Model selection
-    parser.add_argument('--model_type', type=str, default='transformer')
+    parser.add_argument('--model_type', type=str, default='transformer_encoder')
     
     # Training parameters
     parser.add_argument('--task', type=str, default='next',
@@ -30,8 +30,6 @@ def parse_args():
                        help='Prediction task: current or next (default: next)')
     parser.add_argument('--use_current_step', action='store_true',
                        help='Whether to use current step information (default: False)')
-    parser.add_argument('--hidden', type=int, default=512,
-                       help='Hidden layer dimension')
     parser.add_argument('--lr', type=float, default=1e-4,
                        help='Learning rate (default: 1e-4)')
     parser.add_argument('--wd', type=float, default=1e-5,
@@ -48,7 +46,7 @@ def parse_args():
     # Early stopping parameters
     parser.add_argument('--early_stopping', action='store_true', default=True,
                        help='Enable early stopping (default: True)')
-    parser.add_argument('--patience', type=int, default=50,
+    parser.add_argument('--patience', type=int, default=10,
                        help='Number of epochs to wait before stopping (default: 10)')
     parser.add_argument('--min_delta', type=float, default=0.001,
                        help='Minimum change to qualify as improvement (default: 0.001)')
@@ -63,10 +61,6 @@ def parse_args():
                        help='Number of Transformer layers (default: 3)')
     parser.add_argument('--dropout', type=float, default=0.3,
                        help='Dropout rate (default: 0.3)')
-    
-    # Hierarchical loss parameter
-    parser.add_argument('--hierarchical_loss_weight', type=float, default=0.1,
-                       help='Weight for hierarchical constraint loss')
     
     # Data path
     parser.add_argument('--data_path', type=str, 
@@ -89,7 +83,6 @@ if __name__ == "__main__":
     
     print(f"Using model: {args.model_type}")
     print(f"Prediction task: {args.task}")
-    print(f"Hidden layer dimension: {args.hidden}")
     print(f"Learning rate: {args.lr}")
     print(f"Training epochs: {args.epochs}")
     print(f"Training data percentage: {args.train_percentage:.1%}")
@@ -98,7 +91,7 @@ if __name__ == "__main__":
     if args.early_stopping:
         print(f"  Patience: {args.patience}, Min delta: {args.min_delta}, Monitor: {args.monitor_metric}")
     
-    if args.model_type == 'transformer' or args.model_type == 'hyperbolic':
+    if args.model_type == 'transformer':
         print(f"Transformer parameters - attention heads: {args.num_heads}, layers: {args.num_layers}")
     
     # Set up cache path
@@ -142,25 +135,19 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Warning: Failed to save cache ({e}). Continuing without cache.")
 
-    # Prepare model parameters
-    model_kwargs = {
-        'p': args.dropout,
-    }
+    model_kwargs = {'p': args.dropout,}
     
-    if args.model_type == 'transformer' or args.model_type == 'hyperbolic':
+    if args.model_type == 'transformer':
         model_kwargs.update({
             'num_heads': args.num_heads,
             'num_layers': args.num_layers,
         })
-     
-    diag_trie = CodeTrie.from_file("cond_hist_codes.txt")
+
     model, vocabs, ccs_itos, test_metrics = train_model_on_samples(
             samples,
-            diag_trie=diag_trie,
             model_type=args.model_type,
             task=args.task,
             use_current_step=args.use_current_step,
-            hidden=args.hidden,
             lr=args.lr,
             wd=args.wd,
             epochs=args.epochs,
@@ -171,7 +158,6 @@ if __name__ == "__main__":
             patience=args.patience,
             min_delta=args.min_delta,
             monitor_metric=args.monitor_metric,
-            hierarchical_loss_weight=args.hierarchical_loss_weight,
             **model_kwargs
         )
         

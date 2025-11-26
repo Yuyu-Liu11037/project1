@@ -5,9 +5,12 @@ Contains data preprocessing, vectorization, vocabulary building functions
 from collections import defaultdict, Counter
 import torch
 import numpy as np
+import pandas as pd
+import json
 from sklearn.model_selection import train_test_split
 from pyhealth.data import Patient
 from pyhealth.medcode import CrossMap
+from pathlib import Path
 
 
 mapping = CrossMap("ICD10CM", "CCSCM")
@@ -62,8 +65,8 @@ def diag_prediction_mimic4_fn(patient: Patient):
         samples[i]["cond_hist"] = samples[i - 1]["cond_hist"] + [samples[i]["cond_hist"]]
         samples[i]["adm_time"] = samples[i - 1]["adm_time"] + [samples[i]["adm_time"]]
 
-    for i in range(len(samples)):
-        samples[i]["cond_hist"][i] = []
+    # for i in range(len(samples)):
+    #     samples[i]["cond_hist"][i] = []
 
     return samples
 
@@ -297,4 +300,125 @@ def split_by_patient(pairs, test_size=0.2, val_size=0.1, seed=42):
         return out
     
     return collect(tr_pids), collect(va_pids), collect(te_pids)
+
+
+def load_preprocessed_data(data_path):
+    """
+    Load preprocessed data from the specified directory and convert to samples format
+    
+    Args:
+        data_path: Path to the preprocessed data directory
+        
+    Returns:
+        List of samples in the format expected by train_model_on_samples
+    """
+    data_path = Path(data_path)
+    
+    # Load the main CSV file with patient data
+    csv_file = data_path / "full_preprocessing_sample_977.csv"
+    if not csv_file.exists():
+        raise FileNotFoundError(f"Required file not found: {csv_file}")
+    
+    print(f"Loading data from {csv_file}")
+    df = pd.read_csv(csv_file)
+    
+    # Load mapping files
+    with open(data_path / "diag_code_to_idx.json", 'r') as f:
+        diag_code_to_idx = json.load(f)
+    with open(data_path / "med_code_to_idx.json", 'r') as f:
+        med_code_to_idx = json.load(f)
+    with open(data_path / "proc_code_to_idx.json", 'r') as f:
+        proc_code_to_idx = json.load(f)
+    
+    samples = []
+    
+    for _, row in df.iterrows():
+        patient_id = row['patient_id']
+        
+        # Parse diagnosis codes
+        diag_codes = []
+        if pd.notna(row['diagnosis_codes']) and row['diagnosis_codes']:
+            diag_codes = [code.strip() for code in str(row['diagnosis_codes']).split(';')]
+        
+        # Parse medication codes  
+        med_codes = []
+        if pd.notna(row['medication_codes']) and row['medication_codes']:
+            med_codes = [code.strip() for code in str(row['medication_codes']).split(';')]
+        
+        # Parse procedure codes
+        proc_codes = []
+        if pd.notna(row['procedure_codes']) and row['procedure_codes']:
+            proc_codes = [code.strip() for code in str(row['procedure_codes']).split(';')]
+        
+        # Skip if any code list is empty
+        if len(diag_codes) == 0 or len(med_codes) == 0 or len(proc_codes) == 0:
+            continue
+        
+        # For dialysis prediction, we'll create two visits per patient:
+        # Visit 1: Historical data (input features)
+        # Visit 2: Current data with dialysis flag as target
+        
+        # Split diagnosis codes into historical and current
+        mid_point = len(diag_codes) // 2 if len(diag_codes) > 1 else 1
+        hist_diag = diag_codes[:mid_point]
+        curr_diag = diag_codes[mid_point:] if len(diag_codes) > 1 else diag_codes
+        
+        # Split other codes similarly
+        mid_med = len(med_codes) // 2 if len(med_codes) > 1 else 1
+        hist_med = med_codes[:mid_med]
+        curr_med = med_codes[mid_med:] if len(med_codes) > 1 else med_codes
+        
+        mid_proc = len(proc_codes) // 2 if len(proc_codes) > 1 else 1
+        hist_proc = proc_codes[:mid_proc]
+        curr_proc = proc_codes[mid_proc:] if len(proc_codes) > 1 else proc_codes
+        
+        # Create historical visit (input)
+        hist_sample = {
+            "visit_id": f"{patient_id}_hist",
+            "patient_id": patient_id,
+            "conditions": hist_diag,
+            "procedures": hist_proc,
+            "drugs": hist_med,
+            "cond_hist": hist_diag,
+            "adm_time": "2023-01-01",
+            "lab_dialysis_flag": 0.0,  # Historical visit - no dialysis yet
+            "lab_egfr_min": row.get('lab_egfr_min', 0.0),
+            "lab_creatinine_max": row.get('lab_creatinine_max', 0.0),
+            "lab_bun_max": row.get('lab_bun_max', 0.0),
+            "lab_potassium_max": row.get('lab_potassium_max', 0.0),
+        }
+        
+        # Create current visit (target) - this will be used for prediction
+        curr_sample = {
+            "visit_id": f"{patient_id}_curr",
+            "patient_id": patient_id,
+            "conditions": curr_diag,
+            "procedures": curr_proc,
+            "drugs": curr_med,
+            "cond_hist": curr_diag,
+            "adm_time": "2023-06-01",
+            "lab_dialysis_flag": row.get('lab_dialysis_flag', 0.0),
+            "lab_egfr_min": row.get('lab_egfr_min', 0.0),
+            "lab_creatinine_max": row.get('lab_creatinine_max', 0.0),
+            "lab_bun_max": row.get('lab_bun_max', 0.0),
+            "lab_potassium_max": row.get('lab_potassium_max', 0.0),
+        }
+        
+        samples.extend([hist_sample, curr_sample])
+    
+    print(f"Loaded {len(samples)} samples from preprocessed data")
+    return samples
+
+
+def dialysis_prediction_fn(data_path):
+    """
+    Data processing function for dialysis prediction task using preprocessed data
+    
+    Args:
+        data_path: Path to the preprocessed data directory
+        
+    Returns:
+        List of samples formatted for training
+    """
+    return load_preprocessed_data(data_path)
 
