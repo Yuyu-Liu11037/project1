@@ -37,11 +37,11 @@ import math
 class TransformerEncoder(nn.Module):
     def __init__(self, x_vocab_size, hidden=390, out_dim=None, *,
                  diag_size, proc_size,
-                 num_heads=6, num_layers=3, p=0.3,
+                 num_heads=6, num_layers=3, 
                  diag_itos=None, c=1.0, max_diag_len=None):
         super().__init__()
         self.diag_itos = diag_itos
-        self.emb_diag  = nn.Embedding(diag_size + 1, hidden, padding_idx=0)
+        self.token_embed  = nn.Embedding(diag_size + 1, hidden, padding_idx=0)
         # self.emb_proc  = nn.Embedding(proc_size + 1, embed_dim, padding_idx=0)
         # self.emb_third = nn.Embedding(x_vocab_size - (diag_size + proc_size) + 1, embed_dim, padding_idx=0)
 
@@ -49,39 +49,27 @@ class TransformerEncoder(nn.Module):
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
 
         self.cls_token = nn.Parameter(torch.randn(1, 1, hidden))
-        self.output_projection = nn.Linear(hidden, out_dim, bias=False)
-        self.dropout = nn.Dropout(p)
-
-    def encode(self, x_diag, x_proc, x_drug):
-        device = x_diag.device
-        B = x_diag.shape[0]
-        
-        e_diag = self.emb_diag(x_diag)   # (B, L_diag, E)
-        # e_proc = self.emb_proc(x_proc)   # (B, L_proc, E)
-        # e_third = self.emb_third(x_drug) # (B, L_drug, E)
-        
-        diag_mask = (x_diag != 0)   # (B, L_diag)
-        # proc_mask = (x_proc != 0)   # (B, L_proc)
-        # drug_mask = (x_drug != 0)   # (B, L_drug)
-        # padding_mask = torch.cat([diag_mask, proc_mask, drug_mask], dim=1)  # (B, L_total)
-    
-        padding_mask_expanded = diag_mask.unsqueeze(-1)  # (B, L_total, 1)
-        e_diag = e_diag.masked_fill(~padding_mask_expanded, 0.)
-
-        cls_tokens = self.cls_token.expand(B, 1, -1)        # (B, 1, H)
-        x_seq = torch.cat([cls_tokens, e_diag], dim=1) # (B, L_total+1, H)
-        cls_mask = torch.ones(B, 1, dtype=torch.bool, device=device)
-        key_padding_mask = torch.cat([cls_mask, diag_mask], dim=1)
-        src_key_padding_mask = ~key_padding_mask  # True = mask out
-
-        x_seq = self.transformer(x_seq, src_key_padding_mask=src_key_padding_mask)
-        x_cls = self.dropout(x_seq[:, 0, :])  # (B, H)
-        return x_cls
+        self.classifier = nn.Linear(hidden, out_dim, bias=False)
+        self.dropout = nn.Dropout(0.3)
 
     def forward(self, x_diag, x_proc, x_drug):
-        x_cls = self.encode(x_diag, x_proc, x_drug)  # (B, H)
-        logits = self.output_projection(x_cls)  # (B, out_dim)
+        batch_size, max_len = x_diag.shape
+        device = x_diag.device
+
+        cls_token = self.cls_token.expand(batch_size, 1, -1)        # (batch_size, 1, H)
+        token_embeddings = self.token_embed(x_diag)   # (batch_size, L_diag, E)
+        token_embeddings = torch.cat([cls_token, token_embeddings], dim=1) # (batch_size, L_total+1, H)
+
+        cls_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
+        padding_mask = (x_diag != 0)   # (batch_size, L_diag)
+        padding_mask = torch.cat([cls_mask, padding_mask], dim=1)
+
+        token_embeddings = self.transformer(token_embeddings, src_key_padding_mask=~padding_mask)
+
+        cls_state = self.dropout(token_embeddings[:, 0, :])  # (batch_size, H)
+        logits = self.classifier(cls_state)  # (batch_size, out_dim)
         return logits
+
 
 class _LTransformerEncoderBlock(torch.nn.Module):
     def __init__(self, manifold, d_model: int, n_head: int):
@@ -110,6 +98,7 @@ class _LTransformerEncoderBlock(torch.nn.Module):
         x = self.res2(x, self.mlp(self.ln_2(x)))
         return x
     
+
 class LTransformerEncoder(torch.nn.Module):
     def __init__(
         self,
@@ -149,113 +138,31 @@ class LTransformerEncoder(torch.nn.Module):
         self.ln_final = LorentzRMSNorm(manifold_hidden, self.width - 1)
         # TODO: Dimension meaning?
         self.final_proj = LorentzLinear(manifold_hidden, self.width - 1, self.width - 1, manifold_out=manifold_hidden)
+        self.dropout = nn.Dropout(0.3)
         self.classifier = torch.nn.Linear(self.width, out_dim)
 
     def forward(self, x_diag, x_proc, x_drug, attn_mask = None):
         batch_size, max_len = x_diag.shape
         device = x_diag.device
 
-        # Shape: (batch_size, max_len, width) where width includes time+space dimensions
-        cls = self.cls_token.expand(batch_size, -1, -1)
-        token_embeddings = self.token_embed(x_diag)
-        token_embeddings = torch.cat([cls, token_embeddings], dim=1)
+        cls_token = self.cls_token.expand(batch_size, -1, -1)
+        token_embeddings = self.token_embed(x_diag)   # (batch_size, max_len, width)
+        token_embeddings = torch.cat([cls_token, token_embeddings], dim=1)
         
         cls_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=device)
-        padding_mask = (x_diag == 0)  # (B, max_len) - True where padding
-        padding_mask = torch.cat([cls_mask, padding_mask], dim=1)  # (B, max_len+1)
-        _attn_mask = padding_mask.unsqueeze(1).expand(-1, max_len+1, -1)  # (B, max_len+1, max_len+1)
+        padding_mask = (x_diag == 0)  # (batch_size, max_len) - True where padding
+        padding_mask = torch.cat([cls_mask, padding_mask], dim=1)  # (batch_size, max_len+1)
 
+        _attn_mask = padding_mask.unsqueeze(1).expand(-1, max_len+1, -1)  # (batch_size, max_len+1, max_len+1)
         # Each block applies: Lorentz normalization -> bidirectional self-attention -> residual connection
         #                    -> Lorentz normalization -> feed-forward network -> residual connection
         for block in self.resblocks:
             token_embeddings = block(token_embeddings, _attn_mask)
-
         token_embeddings = self.final_proj(token_embeddings)
         token_embeddings = self.ln_final(token_embeddings)
-        cls_state = token_embeddings[:, 0, :]
+
+        cls_state = self.dropout(token_embeddings[:, 0, :])
         logits = self.classifier(cls_state)
-        
-        # Return logits for multi-label classification
-        # Shape: (batch_size, out_dim)
-        return logits
-
-class TransformerDecoder(torch.nn.Module):
-    """
-    A standard decoder-only Transformer in Euclidean space.
-    - Same high-level interface as `LTransformerDecoder`.
-    - Uses PyTorch's `nn.TransformerEncoderLayer` with a padding mask (no causal masking).
-    """
-
-    def __init__(
-        self,
-        manifold_in=None,
-        manifold_hidden=None,
-        manifold_out=None,
-        arch: str = "L3_W390_A6",
-        vocab_size: int = None,
-        context_length: int = None,
-        out_dim: int = None,
-        grad_checkpointing: bool = False,
-    ):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.context_length = context_length
-        self.out_dim = out_dim
-        # Effective context length including CLS token
-        self.max_seq_len = context_length + 1
-
-        # Parse architecture string (same as LTransformerDecoder)
-        self.layers = int(re.search(r"L(\d+)", arch).group(1))
-        self.width = int(re.search(r"W(\d+)", arch).group(1))
-        _attn = re.search(r"A(\d+)", arch)
-        self.heads = int(_attn.group(1)) if _attn else self.width // 64
-
-        # Token embeddings in Euclidean space
-        self.token_embed = nn.Embedding(vocab_size, self.width, padding_idx=0)
-        self.cls_token = nn.Parameter(torch.randn(1, 1, self.width) * 0.02)
-
-        # Standard Transformer blocks (encoder layers; no causal mask, only padding mask)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.width,
-            nhead=self.heads,
-            dim_feedforward=self.width * 4,
-            dropout=0.1,
-            batch_first=True,
-        )
-        self.resblocks = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=self.layers,
-        )
-
-        self.ln_final = nn.LayerNorm(self.width)
-        self.mapping = nn.Linear(self.width, self.out_dim, bias=False)
-
-    def forward(self, x_diag, x_proc, x_drug, attn_mask=None):
-        """
-        x_* shapes: (batch_size, seq_len)
-        Only `x_diag` is used, to mirror `LTransformerDecoder` behaviour.
-        """
-        batch_size, max_len = x_diag.shape
-
-        # Build padding mask including CLS (CLS is never padding)
-        cls_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=x_diag.device)
-        padding_mask_1d = (x_diag == 0)  # True where padding
-        padding_mask_1d = torch.cat([cls_mask, padding_mask_1d], dim=1)  # (B, L+1)
-
-        # Embeddings + prepend CLS
-        token_embeddings = self.token_embed(x_diag)  # (B, L, D)
-        cls = self.cls_token.expand(batch_size, -1, -1)  # (B, 1, D)
-        x = torch.cat([cls, token_embeddings], dim=1)  # (B, L+1, D)
-
-        # Pass through Transformer encoder stack with padding masks only
-        x = self.resblocks(
-            x,
-            src_key_padding_mask=padding_mask_1d,
-        )
-
-        x = self.ln_final(x)
-        cls_state = x[:, 0, :]
-        logits = self.mapping(cls_state)
         return logits
 
 
@@ -266,11 +173,6 @@ def create_model(model_type, x_vocab_size, out_dim, **kwargs):
         return LTransformerEncoder(
             vocab_size=x_vocab_size,
             context_length=kwargs.get('max_diag_len'),
-            out_dim=out_dim  # Output vocabulary size for final mapping
-        )
-    elif model_type == 'transformer_decoder':
-        return TransformerDecoder(
-            vocab_size=x_vocab_size,
-            context_length=kwargs.get('max_diag_len'),
-            out_dim=out_dim
+            out_dim=out_dim,  # Output vocabulary size for final mapping
+            arch=kwargs.get('arch'),
         )

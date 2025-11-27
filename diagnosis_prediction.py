@@ -22,7 +22,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Diagnosis prediction model training')
     
     # Model selection
-    parser.add_argument('--model_type', type=str, default='transformer_encoder')
+    parser.add_argument('--model_type', type=str, default='ltransformer_encoder')
     
     # Training parameters
     parser.add_argument('--task', type=str, default='next',
@@ -32,7 +32,7 @@ def parse_args():
                        help='Whether to use current step information (default: False)')
     parser.add_argument('--lr', type=float, default=1e-4,
                        help='Learning rate (default: 1e-4)')
-    parser.add_argument('--wd', type=float, default=1e-5,
+    parser.add_argument('--wd', type=float, default=1e-6,
                        help='Weight decay (default: 1e-5)')
     parser.add_argument('--epochs', type=int, default=500,
                        help='Number of training epochs (default: 10)')
@@ -54,14 +54,6 @@ def parse_args():
                        choices=['P@10', 'Acc@10', 'P@20', 'Acc@20', 'P@30', 'Acc@30'],
                        help='Metric to monitor for early stopping (default: Acc@10)')
     
-    # Transformer specific parameters
-    parser.add_argument('--num_heads', type=int, default=8,
-                       help='Number of Transformer attention heads (default: 8)')
-    parser.add_argument('--num_layers', type=int, default=3,
-                       help='Number of Transformer layers (default: 3)')
-    parser.add_argument('--dropout', type=float, default=0.3,
-                       help='Dropout rate (default: 0.3)')
-    
     # Data path
     parser.add_argument('--data_path', type=str, 
                        default="/data/yuyu/data/MIMIC_IV/hosp",
@@ -72,6 +64,7 @@ def parse_args():
     parser.add_argument('--force_reload', action='store_true',
                        help='Force reload and reprocess data even if cache exists')
     
+    parser.add_argument('--arch', type=str, default='L3_W390_A6')
     return parser.parse_args()
 
 
@@ -90,9 +83,6 @@ if __name__ == "__main__":
     print(f"Early stopping: {args.early_stopping}")
     if args.early_stopping:
         print(f"  Patience: {args.patience}, Min delta: {args.min_delta}, Monitor: {args.monitor_metric}")
-    
-    if args.model_type == 'transformer':
-        print(f"Transformer parameters - attention heads: {args.num_heads}, layers: {args.num_layers}")
     
     # Set up cache path
     if args.cache_path is None:
@@ -135,14 +125,6 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Warning: Failed to save cache ({e}). Continuing without cache.")
 
-    model_kwargs = {'p': args.dropout,}
-    
-    if args.model_type == 'transformer':
-        model_kwargs.update({
-            'num_heads': args.num_heads,
-            'num_layers': args.num_layers,
-        })
-
     model, vocabs, ccs_itos, test_metrics = train_model_on_samples(
             samples,
             model_type=args.model_type,
@@ -158,7 +140,7 @@ if __name__ == "__main__":
             patience=args.patience,
             min_delta=args.min_delta,
             monitor_metric=args.monitor_metric,
-            **model_kwargs
+            arch=args.arch,
         )
         
     print(f"\n[DONE] {args.model_type.upper()} model test results:")

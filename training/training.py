@@ -88,7 +88,7 @@ def train_model_on_samples(samples,
                            patience=10,           # Number of epochs to wait before stopping
                            min_delta=0.001,      # Minimum change to qualify as improvement
                            monitor_metric='Acc@10', # Metric to monitor for early stopping
-                           **model_kwargs):
+                           arch='L3_W390_A6'):
     # 1) Sort and assemble (current/next)
     # print(f"\nSamples: {samples[0]}")
     # 每一个sample就是一个病人的一条visit记录
@@ -119,8 +119,8 @@ def train_model_on_samples(samples,
     vocabs = (diag_stoi, proc_stoi, drug_stoi, ccs_stoi)
 
     # 4) Vectorization
-    (Xtr_diag, Xtr_proc, Xtr_drug), Ytr = prepare_XY(train_pairs, vocabs, use_current_step=use_current_step)
-    (Xva_diag, Xva_proc, Xva_drug), Yva = prepare_XY(val_pairs,   vocabs, use_current_step=use_current_step)
+    (Xtr_diag, Xtr_proc, Xtr_drug), Ytr = prepare_XY(train_pairs,  vocabs, use_current_step=use_current_step)
+    (Xva_diag, Xva_proc, Xva_drug), Yva = prepare_XY(val_pairs,    vocabs, use_current_step=use_current_step)
     (Xte_diag, Xte_proc, Xte_drug), Yte = prepare_XY(test_pairs,   vocabs, use_current_step=use_current_step)
 
     # Calculate max sequence lengths for each code type
@@ -154,12 +154,11 @@ def train_model_on_samples(samples,
     print(f"Using device: {device}")
     print(f"X vocab size: {x_vocab_size}, Y vocab size: {y_vocab_size}")
 
-    model_kwargs_with_max = {**model_kwargs, 
-                             'diag_size': len(diag_stoi),
+    model_kwargs_with_max = {'diag_size': len(diag_stoi),
                              'proc_size': len(proc_stoi),
                              'diag_itos': diag_itos,
                              'max_diag_len': max_diag_len,
-                            }
+                             'arch': arch,}
     model = create_model(model_type, x_vocab_size=x_vocab_size, out_dim=y_vocab_size, **model_kwargs_with_max)
     model = model.to(device) 
     opt = geoopt.optim.RiemannianAdam(model.parameters(), lr=lr, weight_decay=wd)
