@@ -83,23 +83,7 @@ class TransformerEncoder(nn.Module):
         logits = self.output_projection(x_cls)  # (B, out_dim)
         return logits
 
-def precompute_theta_pos_frequencies(head_dim, seq_len, theta: float = 10000.0):
-    head_dim -= 1
-    assert head_dim % 2 == 0, "Dimension must be divisible by 2"
-    theta_numerator = torch.arange(0, head_dim, 2).float()
-    theta = 1.0 / (theta ** (theta_numerator / head_dim)) # (Head_Dim / 2)
-    m = torch.arange(seq_len)
-    freqs = torch.outer(m, theta).float()
-    freqs_complex = torch.polar(torch.ones_like(freqs), freqs)
-    return freqs_complex
-
-class _LTransformerDecoderBlock(torch.nn.Module):
-    """
-    A single Transformer block for the decoder.
-    - Uses **masked** self-attention with padding mask.
-    - Uses hyperbolic normalization and activation.
-    """
-
+class _LTransformerEncoderBlock(torch.nn.Module):
     def __init__(self, manifold, d_model: int, n_head: int):
         super().__init__()
         dim_per_head = d_model // n_head
@@ -121,20 +105,12 @@ class _LTransformerDecoderBlock(torch.nn.Module):
 
     def forward(self, x, attn_mask=None, rope=None):
         lx = self.ln_1(x)
-        ax = self.attn(lx, lx, output_attentions=False, mask=attn_mask, rot_pos=rope)  # Masked attention
+        ax = self.attn(lx, lx, output_attentions=False, mask=attn_mask, rot_pos=rope) 
         x = self.res1(x, ax)    
         x = self.res2(x, self.mlp(self.ln_2(x)))
         return x
     
-class LTransformerDecoder(torch.nn.Module):
-    """
-    A decoder-only Transformer (like LLAMA) that:
-    - Uses **causal + padding-based attention mask**:
-      - causal mask: prevent attending to future positions
-      - padding mask: mask out padding tokens (id == 0)
-    - Outputs **logits** for next-token prediction.
-    """
-
+class LTransformerEncoder(torch.nn.Module):
     def __init__(
         self,
         manifold_in = Lorentz(1.0),
@@ -164,60 +140,40 @@ class LTransformerDecoder(torch.nn.Module):
             manifold=manifold_hidden
         )
 
-        # Transformer Blocks (Decoder Only)
         self.resblocks = torch.nn.ModuleList([
-            _LTransformerDecoderBlock(manifold_hidden, self.width, self.heads)
+            _LTransformerEncoderBlock(manifold_hidden, self.width, self.heads)
             for _ in range(self.layers)
         ])
 
         # Final normalization and projection
         self.ln_final = LorentzRMSNorm(manifold_hidden, self.width - 1)
+        # TODO: Dimension meaning?
         self.final_proj = LorentzLinear(manifold_hidden, self.width - 1, self.width - 1, manifold_out=manifold_hidden)
-        self.mapping = torch.nn.Linear(self.width, self.out_dim, bias=False)
-
-        rope_vals = precompute_theta_pos_frequencies(
-            self.width // self.heads,
-            self.max_seq_len,
-        )
-        self.register_buffer("freqs_complex", rope_vals)
+        self.classifier = torch.nn.Linear(self.width, out_dim)
 
     def forward(self, x_diag, x_proc, x_drug, attn_mask = None):
         batch_size, max_len = x_diag.shape
         device = x_diag.device
-        # CLS is never padding; only mask out padding token 0
-        cls_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=device)
-        padding_mask_1d = (x_diag == 0)  # (B, max_len) - True where padding
-        padding_mask_1d = torch.cat([cls_mask, padding_mask_1d], dim=1)  # (B, max_len+1)
-        # Convert token indices to Lorentz manifold embeddings
-        # This projects discrete token IDs into continuous hyperbolic space representations
-        # Shape: (batch_size, context_length, width) where width includes time+space dimensions
+
+        # Shape: (batch_size, max_len, width) where width includes time+space dimensions
         cls = self.cls_token.expand(batch_size, -1, -1)
         token_embeddings = self.token_embed(x_diag)
         token_embeddings = torch.cat([cls, token_embeddings], dim=1)
-        # RoPE frequencies need to match full sequence length (including CLS)
-        seq_len = token_embeddings.shape[1]
-        freqs_cis = self.freqs_complex[:seq_len]
-
-        # Build causal mask (L+1, L+1): True where positions are NOT allowed to attend (future)
-        causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, dtype=torch.bool, device=device),
-            diagonal=1
-        )  # (L+1, L+1)
-        padding_mask_2d = padding_mask_1d.unsqueeze(1).expand(-1, seq_len, -1)  # (B, L+1, L+1)
-        # attn_mask = causal_mask.unsqueeze(0) | padding_mask_2d  # (B, L+1, L+1)
-        attn_mask = padding_mask_2d
-        _attn_mask = attn_mask
         
-        # Forward pass through all transformer decoder blocks
+        cls_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=device)
+        padding_mask = (x_diag == 0)  # (B, max_len) - True where padding
+        padding_mask = torch.cat([cls_mask, padding_mask], dim=1)  # (B, max_len+1)
+        _attn_mask = padding_mask.unsqueeze(1).expand(-1, max_len+1, -1)  # (B, max_len+1, max_len+1)
+
         # Each block applies: Lorentz normalization -> bidirectional self-attention -> residual connection
         #                    -> Lorentz normalization -> feed-forward network -> residual connection
         for block in self.resblocks:
-            token_embeddings = block(token_embeddings, _attn_mask, freqs_cis)
+            token_embeddings = block(token_embeddings, _attn_mask)
 
         token_embeddings = self.final_proj(token_embeddings)
         token_embeddings = self.ln_final(token_embeddings)
         cls_state = token_embeddings[:, 0, :]
-        logits = self.mapping(cls_state)
+        logits = self.classifier(cls_state)
         
         # Return logits for multi-label classification
         # Shape: (batch_size, out_dim)
@@ -306,8 +262,8 @@ class TransformerDecoder(torch.nn.Module):
 def create_model(model_type, x_vocab_size, out_dim, **kwargs):
     if model_type == 'transformer_encoder':
         return TransformerEncoder(x_vocab_size=x_vocab_size, out_dim=out_dim, **kwargs)
-    elif model_type == 'ltransformer_decoder':
-        return LTransformerDecoder(
+    elif model_type == 'ltransformer_encoder':
+        return LTransformerEncoder(
             vocab_size=x_vocab_size,
             context_length=kwargs.get('max_diag_len'),
             out_dim=out_dim  # Output vocabulary size for final mapping

@@ -38,7 +38,7 @@ def parse_args():
                        help='Number of training epochs (default: 10)')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed (default: 42)')
-    parser.add_argument('--train_percentage', type=float, default=0.05,
+    parser.add_argument('--train_percentage', type=float, default=0.1,
                        help='Percentage of training data to use for few-shot training')
     parser.add_argument('--batch_size', type=int, default=24,
                        help='Batch size for training')
