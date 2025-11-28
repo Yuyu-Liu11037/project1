@@ -33,7 +33,6 @@ class Lorentz(LorentzOri):
     def l_inner(self, x, y, keep_dim=False, dim=-1):
         return math._inner(x, y, keep_dim, dim)
     
-
     def sqdist(self, x, y, norm_control=True):
         return self.lorentzian_distance(x, y)
 
@@ -57,8 +56,7 @@ class Lorentz(LorentzOri):
         return self.proju(zeros, u)
 
     def proj_tan0(self, u):
-        return self.proj_tan_zero(u)
-    
+        return self.proj_tan_zero(u)  
 
     def normalize_input(self, x):
         num_nodes = x.size(0)
@@ -278,3 +276,4 @@ class Lorentz(LorentzOri):
         asin_input = 2 * min_radius / (torch.norm(x[..., 1:], dim=-1) * self.c**0.5 + eps)
         _half_aperture = torch.asin(torch.clamp(asin_input, min=-1 + eps, max=1 - eps))
         return _half_aperture
+        

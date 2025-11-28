@@ -15,7 +15,7 @@ Y (classes of next-visit codes):
 
 I concatenated all history ICD-10 codes in one sequence, then mapped them to integer tokens. Labels are originally constituted by ICD-10 codes in the next visit; they are mapped to some clinical classes through a mapping called "CCS". In my data there are 275 possible distinct labels.
 
-The feed-forward step is line 184 in training/training.py:
+The feed-forward step is line 185 in training/training.py:
 ```logits = model(batch_X_diag, batch_X_proc, batch_X_drug)```, but ```batch_X_proc, batch_X_drug``` are not used in the current procedure.
 
 ## Models

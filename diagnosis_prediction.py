@@ -12,7 +12,6 @@ from pyhealth.datasets import MIMIC4Dataset
 
 from util.data_processing import diag_prediction_mimic4_fn
 from training.training import train_model_on_samples
-from util.code_trie import CodeTrie
 
 warnings.filterwarnings('ignore')
 

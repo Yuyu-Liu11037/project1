@@ -124,7 +124,8 @@ def train_model_on_samples(samples,
     (Xte_diag, Xte_proc, Xte_drug), Yte = prepare_XY(test_pairs,   vocabs, use_current_step=use_current_step)
 
     # Calculate max sequence lengths for each code type
-    max_diag_len = max(max(len(x) for x in Xtr_diag), max(len(x) for x in Xva_diag), max(len(x) for x in Xte_diag))
+    # max_diag_len = max(max(len(x) for x in Xtr_diag), max(len(x) for x in Xva_diag), max(len(x) for x in Xte_diag))
+    max_diag_len = 512
     max_proc_len = max(max(len(x) for x in Xtr_proc), max(len(x) for x in Xva_proc), max(len(x) for x in Xte_proc))
     max_drug_len = max(max(len(x) for x in Xtr_drug), max(len(x) for x in Xva_drug), max(len(x) for x in Xte_drug))
     
@@ -201,8 +202,7 @@ def train_model_on_samples(samples,
                 
             print(f"Epoch {ep:02d} | avg_loss={avg_loss:.4f} | val P@10={val_metrics['P@10']:.4f} Acc@10={val_metrics['Acc@10']:.4f}")   
             print(f"Logits stats: min={logits.min().item():.4f}, max={logits.max().item():.4f}, mean={logits.mean().item():.4f}, std={logits.std().item():.4f}")
-            # print(f"Predictions: {(torch.sigmoid(logits) > 0.5).sum().item()} / {logits.numel()} positive predictions")
-            # Early stopping logic
+
             if early_stopping:
                 if current_metric > best_metric + min_delta:
                     best_metric = current_metric

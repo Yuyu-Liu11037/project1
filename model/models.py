@@ -1,38 +1,14 @@
 import torch
 import torch.nn as nn
-import geoopt
 import math
-import pickle
 import re
-import numpy as np
-from pathlib import Path
-from sklearn.svm import LinearSVC
-from sklearn.multioutput import MultiOutputClassifier
-from sklearn.preprocessing import StandardScaler
 
 from hypercore.nn.linear import LorentzLinear
 from hypercore.nn.conv import LResNet, LorentzRMSNorm, LorentzActivation
 from hypercore.nn.attention import LorentzMultiheadAttention, LorentzEmbeddings
 from hypercore.manifolds import Lorentz
-
-
-class LorentzFeedForward(torch.nn.Module):
-    """Feed-forward network in Lorentz space."""
-    def __init__(self, manifold, d_model, d_ff):
-        super().__init__()
-        self.manifold = manifold
-        self.linear1 = LorentzLinear(manifold, d_model - 1, d_ff - 1)
-        self.linear2 = LorentzLinear(manifold, d_ff - 1, d_model - 1)
-        self.activation = LorentzActivation(manifold, nn.ReLU())
-    
-    def forward(self, x):
-        x = self.linear1(x)
-        x = self.activation(x)
-        x = self.linear2(x)
-        return x
 from geoopt import ManifoldParameter
-import warnings
-import math
+
 
 class TransformerEncoder(nn.Module):
     def __init__(self, x_vocab_size, hidden=390, out_dim=None, *,
@@ -71,6 +47,22 @@ class TransformerEncoder(nn.Module):
         return logits
 
 
+class LorentzFeedForward(torch.nn.Module):
+    """Feed-forward network in Lorentz space."""
+    def __init__(self, manifold, d_model, d_ff):
+        super().__init__()
+        self.manifold = manifold
+        self.linear1 = LorentzLinear(manifold, d_model - 1, d_ff - 1)
+        self.linear2 = LorentzLinear(manifold, d_ff - 1, d_model - 1)
+        self.activation = LorentzActivation(manifold, nn.ReLU())
+    
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.activation(x)
+        x = self.linear2(x)
+        return x
+
+
 class _LTransformerEncoderBlock(torch.nn.Module):
     def __init__(self, manifold, d_model: int, n_head: int):
         super().__init__()
@@ -102,9 +94,7 @@ class _LTransformerEncoderBlock(torch.nn.Module):
 class LTransformerEncoder(torch.nn.Module):
     def __init__(
         self,
-        manifold_in = Lorentz(1.0),
-        manifold_hidden = Lorentz(1.0),
-        manifold_out = Lorentz(1.0),
+        manifold = Lorentz(1.0),
         arch = "L3_W390_A6",
         vocab_size = None,
         context_length = None,
@@ -112,36 +102,27 @@ class LTransformerEncoder(torch.nn.Module):
         grad_checkpointing: bool = False,
     ):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.context_length = context_length
-        self.out_dim = out_dim
-        # Effective context length including CLS token
-        self.max_seq_len = context_length + 1
         # Parse architecture string
         self.layers = int(re.search(r"L(\d+)", arch).group(1))
         self.width = int(re.search(r"W(\d+)", arch).group(1))
         _attn = re.search(r"A(\d+)", arch)
         self.heads = int(_attn.group(1)) if _attn else self.width // 64
         # Token Embeddings (Lorentz)
-        self.token_embed = LorentzEmbeddings(manifold_in, vocab_size, self.width, manifold_out=manifold_hidden, posit_embed=False, padding_idx=0)  # +1 for padding token
-        self.cls_token = ManifoldParameter(
-            manifold_hidden.random_normal((1, 1, self.width), std=0.02),
-            manifold=manifold_hidden
-        )
+        self.token_embed = LorentzEmbeddings(manifold, vocab_size, self.width, padding_idx=0) 
+        self.cls_token = ManifoldParameter(manifold.random_normal((1, 1, self.width), std=0.02), manifold=manifold)
 
         self.resblocks = torch.nn.ModuleList([
-            _LTransformerEncoderBlock(manifold_hidden, self.width, self.heads)
+            _LTransformerEncoderBlock(manifold, self.width, self.heads)
             for _ in range(self.layers)
         ])
 
         # Final normalization and projection
-        self.ln_final = LorentzRMSNorm(manifold_hidden, self.width - 1)
-        # TODO: Dimension meaning?
-        self.final_proj = LorentzLinear(manifold_hidden, self.width - 1, self.width - 1, manifold_out=manifold_hidden)
+        self.ln_final = LorentzRMSNorm(manifold, self.width - 1)
+        self.final_proj = LorentzLinear(manifold, self.width - 1, self.width - 1)
         self.dropout = nn.Dropout(0.3)
         self.classifier = torch.nn.Linear(self.width, out_dim)
 
-    def forward(self, x_diag, x_proc, x_drug, attn_mask = None):
+    def forward(self, x_diag, x_proc, x_drug):
         batch_size, max_len = x_diag.shape
         device = x_diag.device
 
