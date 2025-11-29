@@ -100,6 +100,7 @@ def train_model_on_samples(samples,
     # 没事了，cond_hist字段就是之前所有的visits
     pairs = build_pairs(by_pid, task=task)   # (sample_t, label_t+1)
     pairs = [(s, y_codes) for s, y_codes in pairs if len(s['cond_hist']) > 0]
+    # print(f"\nPairs: {pairs[10]}")
 
     # 2) Patient-level split
     train_pairs, val_pairs, test_pairs = split_by_patient(pairs, seed=seed)
@@ -115,8 +116,8 @@ def train_model_on_samples(samples,
         print(f"Few-shot training: Using {len(train_pairs)}/{original_train_size} samples ({train_percentage:.1%} of training data)")
 
     # 3) Vocabulary
-    (diag_stoi, diag_itos), (proc_stoi, proc_itos), (drug_stoi, drug_itos), (ccs_stoi, ccs_itos) = build_vocab_from_pairs(pairs) # diag_stoi={code: index}, diag_itos=[code1, code2, ...]
-    vocabs = (diag_stoi, proc_stoi, drug_stoi, ccs_stoi)
+    (diag_stoi, diag_itos), (proc_stoi, proc_itos), (drug_stoi, drug_itos)= build_vocab_from_pairs(pairs) # diag_stoi={code: index}, diag_itos=[code1, code2, ...]
+    vocabs = (diag_stoi, proc_stoi, drug_stoi)
 
     # 4) Vectorization
     (Xtr_diag, Xtr_proc, Xtr_drug), Ytr = prepare_XY(train_pairs,  vocabs, use_current_step=use_current_step)
@@ -143,24 +144,19 @@ def train_model_on_samples(samples,
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_with_max)
 
     # 6) Model and loss (multi-label)
-    # Calculate vocabulary sizes for embedding layers
-    # X vocab size = diag_stoi + proc_stoi + drug_stoi + 1 (for padding)
-    # Y vocab size = ccs_stoi + 1 (for padding) - now uses CCS codes only for output
-    diag_stoi, proc_stoi, drug_stoi, ccs_stoi = vocabs
     # x_vocab_size = len(diag_stoi) + len(proc_stoi) + len(drug_stoi) + 1  # +1 for padding
-    x_vocab_size = len(diag_stoi) + 1
-    y_vocab_size = len(ccs_stoi)
+    diag_vocab_size = len(diag_stoi) + 1
     
     device = torch.device('cuda')
     print(f"Using device: {device}")
-    print(f"X vocab size: {x_vocab_size}, Y vocab size: {y_vocab_size}")
+    print(f"Diag vocab size: {diag_vocab_size}")
 
     model_kwargs_with_max = {'diag_size': len(diag_stoi),
                              'proc_size': len(proc_stoi),
                              'diag_itos': diag_itos,
                              'max_diag_len': max_diag_len,
-                             'arch': arch,}
-    model = create_model(model_type, x_vocab_size=x_vocab_size, out_dim=y_vocab_size, **model_kwargs_with_max)
+                             'arch': arch}
+    model = create_model(model_type, x_vocab_size=diag_vocab_size, out_dim=diag_vocab_size-1, **model_kwargs_with_max)
     model = model.to(device) 
     opt = geoopt.optim.RiemannianAdam(model.parameters(), lr=lr, weight_decay=wd)
 
@@ -223,7 +219,7 @@ def train_model_on_samples(samples,
     test_metrics = evaluate_batched(model, test_loader)
     print("[TEST]", test_metrics)
     
-    return model, vocabs, ccs_itos, test_metrics
+    return model, vocabs, test_metrics
 
 
 def evaluate_batched(model, data_loader, ks=(10, 20, 30), device='cuda'):

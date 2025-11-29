@@ -145,3 +145,4 @@ if __name__ == "__main__":
     print(f"\n[DONE] {args.model_type.upper()} model test results:")
     for metric, value in test_metrics.items():
         print(f"  {metric}: {value:.4f}")
+        

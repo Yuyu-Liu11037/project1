@@ -29,19 +29,19 @@ def diag_prediction_mimic4_fn(patient: Patient):
         # ATC 3 level
         drugs = [drug[:4] for drug in drugs]
         
-        cond_ccs = []
-        for con in conditions:
-            if mapping.map(con):
-                cond_ccs.append(mapping.map(con)[0]) 
+        # cond_ccs = []
+        # for con in conditions:
+        #     if mapping.map(con):
+        #         cond_ccs.append(mapping.map(con)[0]) 
 
-        if len(cond_ccs) * len(procedures) * len(drugs) == 0:
+        if len(conditions) * len(procedures) * len(drugs) == 0:
             continue
             
         samples.append(
             {
                 "visit_id": visit.visit_id,
                 "patient_id": patient.patient_id,
-                "conditions": cond_ccs,
+                "conditions": conditions,
                 "procedures": procedures,
                 "adm_time" : visit.encounter_time.strftime("%Y-%m-%d %H:%M"),
                 "drugs": drugs,
@@ -64,9 +64,6 @@ def diag_prediction_mimic4_fn(patient: Patient):
         samples[i]["procedures"] = samples[i - 1]["procedures"] + [samples[i]["procedures"]]
         samples[i]["cond_hist"] = samples[i - 1]["cond_hist"] + [samples[i]["cond_hist"]]
         samples[i]["adm_time"] = samples[i - 1]["adm_time"] + [samples[i]["adm_time"]]
-
-    # for i in range(len(samples)):
-    #     samples[i]["cond_hist"][i] = []
 
     return samples
 
@@ -108,14 +105,7 @@ def build_pairs(samples_by_pid, task="current"):
 
 
 def build_vocab_from_pairs(pairs):
-    """Build vocabulary from training pairs
-    
-    Note: 
-    - cond_hist uses ICD codes (for input features)
-    - Labels use CCS codes (for output)
-    - These are now kept separate: ICD vocab for diag, CCS vocab for labels
-    """
-    diag_c, proc_c, drug_c, ccs_c = Counter(), Counter(), Counter(), Counter()
+    diag_c, proc_c, drug_c= Counter(), Counter(), Counter()
     with open('/data/yuyu/project1/cond_hist_codes.txt', 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
@@ -127,8 +117,6 @@ def build_vocab_from_pairs(pairs):
             proc_c.update(visit_codes)
         for visit_codes in s["drugs"]:       # Each step is an ATC3 list
             drug_c.update(visit_codes)
-        # Labels are CCS codes - keep separate from ICD diag vocab
-        ccs_c.update(y)                      # Labels (CCS) for output only
     
     def mk_vocab(cnt):
         itos = [c for c, _ in cnt.most_common()]
@@ -139,9 +127,8 @@ def build_vocab_from_pairs(pairs):
     diag_stoi, diag_itos = mk_vocab(diag_c)  # ICD codes for cond_hist
     proc_stoi, proc_itos = mk_vocab(proc_c)
     drug_stoi, drug_itos = mk_vocab(drug_c)
-    ccs_stoi, ccs_itos = mk_vocab(ccs_c)     # CCS codes for labels
     
-    return (diag_stoi, diag_itos), (proc_stoi, proc_itos), (drug_stoi, drug_itos), (ccs_stoi, ccs_itos)
+    return (diag_stoi, diag_itos), (proc_stoi, proc_itos), (drug_stoi, drug_itos)
 
 
 class CodeTokenizer:
@@ -212,33 +199,21 @@ def indices_from_sequence(seq_of_lists, stoi, offset=0):
 
 
 def create_tokenizers(vocabs):
-    """
-    Create tokenizers for diagnosis, procedure, drug codes, and labels
-    
-    Args:
-        vocabs: Tuple of (diag_stoi, proc_stoi, drug_stoi, ccs_stoi)
-        - diag_stoi: ICD codes for cond_hist (input)
-        - ccs_stoi: CCS codes for labels (output)
-    
-    Returns:
-        Tuple of (diag_tokenizer, proc_tokenizer, drug_tokenizer, ccs_tokenizer)
-    """
-    diag_stoi, proc_stoi, drug_stoi, ccs_stoi = vocabs
+    diag_stoi, proc_stoi, drug_stoi= vocabs
     
     # Reserve 0 for padding, so start at 1
     # With separate embeddings, each type uses local indexing (0-indexed in its own vocab)
-    diag_tokenizer = CodeTokenizer(diag_stoi, offset=1)  # ICD codes for input
-    ccs_tokenizer = CodeTokenizer(ccs_stoi, offset=1)    # CCS codes for output
+    diag_tokenizer = CodeTokenizer(diag_stoi, offset=1) 
     
     # Each code type now uses local indexing
     proc_tokenizer = CodeTokenizer(proc_stoi, offset=1)
     drug_tokenizer = CodeTokenizer(drug_stoi, offset=1)
     
-    return diag_tokenizer, proc_tokenizer, drug_tokenizer, ccs_tokenizer
+    return diag_tokenizer, proc_tokenizer, drug_tokenizer
 
 
 def vectorize_pair(s, y_codes, vocabs, use_current_step=False):
-    diag_stoi, proc_stoi, drug_stoi, ccs_stoi = vocabs
+    diag_stoi, proc_stoi, drug_stoi= vocabs
     
     # Admission prediction: don't look at current step's proc/drug; discharge prediction can look
     cond_hist = s["cond_hist"]
@@ -249,8 +224,7 @@ def vectorize_pair(s, y_codes, vocabs, use_current_step=False):
         proc_hist = s["procedures"][:-1] if len(s["procedures"])>0 else []
         drug_hist = s["drugs"][:-1] if len(s["drugs"])>0 else []
 
-    # Create tokenizers (CCS for labels, ICD for input)
-    diag_tokenizer, proc_tokenizer, drug_tokenizer, ccs_tokenizer = create_tokenizers(vocabs)
+    diag_tokenizer, proc_tokenizer, drug_tokenizer = create_tokenizers(vocabs)
     
     # Tokenize each type of code
     x_diag_indices = diag_tokenizer.encode(cond_hist) 
@@ -262,8 +236,8 @@ def vectorize_pair(s, y_codes, vocabs, use_current_step=False):
     X_proc = torch.tensor(x_proc_indices, dtype=torch.long) if len(x_proc_indices) > 0 else torch.tensor([0], dtype=torch.long)
     X_drug = torch.tensor(x_drug_indices, dtype=torch.long) if len(x_drug_indices) > 0 else torch.tensor([0], dtype=torch.long)
 
-    y_indices = ccs_tokenizer.encode([y_codes])
-    y_multi_hot = torch.zeros(len(ccs_stoi), dtype=torch.float)
+    y_indices = diag_tokenizer.encode([y_codes])
+    y_multi_hot = torch.zeros(len(diag_stoi), dtype=torch.float)
     valid_indices = [idx - 1 for idx in y_indices if idx > 0]
     y_multi_hot[valid_indices] = 1.0
     y = y_multi_hot

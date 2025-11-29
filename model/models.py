@@ -14,14 +14,14 @@ class TransformerEncoder(nn.Module):
     def __init__(self, x_vocab_size, hidden=390, out_dim=None, *,
                  diag_size, proc_size,
                  num_heads=6, num_layers=3, 
-                 diag_itos=None, c=1.0, max_diag_len=None):
+                 diag_itos=None, c=1.0, max_diag_len=None, arch=None):
         super().__init__()
         self.diag_itos = diag_itos
         self.token_embed  = nn.Embedding(diag_size + 1, hidden, padding_idx=0)
         # self.emb_proc  = nn.Embedding(proc_size + 1, embed_dim, padding_idx=0)
         # self.emb_third = nn.Embedding(x_vocab_size - (diag_size + proc_size) + 1, embed_dim, padding_idx=0)
 
-        enc_layer = nn.TransformerEncoderLayer(d_model=hidden, nhead=num_heads, dim_feedforward=hidden * 4, dropout=p, batch_first=True)
+        enc_layer = nn.TransformerEncoderLayer(d_model=hidden, nhead=num_heads, dim_feedforward=hidden * 4, dropout=0.3, batch_first=True)
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
 
         self.cls_token = nn.Parameter(torch.randn(1, 1, hidden))
@@ -44,6 +44,54 @@ class TransformerEncoder(nn.Module):
 
         cls_state = self.dropout(token_embeddings[:, 0, :])  # (batch_size, H)
         logits = self.classifier(cls_state)  # (batch_size, out_dim)
+        return logits
+
+
+class MLP(nn.Module):
+    def __init__(self, x_vocab_size, hidden=390, out_dim=None, *,
+                 diag_size, proc_size,
+                 num_layers=3,
+                 diag_itos=None, c=1.0, max_diag_len=None, arch=None, dropout=0.3):
+        super().__init__()
+        self.diag_itos = diag_itos
+        self.token_embed = nn.Embedding(diag_size + 1, hidden, padding_idx=0)
+        # self.emb_proc  = nn.Embedding(proc_size + 1, embed_dim, padding_idx=0)
+        # self.emb_third = nn.Embedding(x_vocab_size - (diag_size + proc_size) + 1, embed_dim, padding_idx=0)
+
+        # Build MLP layers
+        mlp_layers = []
+        for i in range(num_layers):
+            mlp_layers.append(nn.Linear(hidden, hidden))
+            mlp_layers.append(nn.ReLU())
+            mlp_layers.append(nn.Dropout(dropout))
+        self.mlp = nn.Sequential(*mlp_layers)
+
+        self.classifier = nn.Linear(hidden, out_dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x_diag, x_proc, x_drug):
+        batch_size, max_len = x_diag.shape
+        device = x_diag.device
+
+        # Embed tokens
+        token_embeddings = self.token_embed(x_diag)   # (batch_size, L_diag, H)
+        
+        # Create mask for padding tokens (0 is padding)
+        padding_mask = (x_diag != 0).float()  # (batch_size, L_diag)
+        padding_mask = padding_mask.unsqueeze(-1)  # (batch_size, L_diag, 1)
+        
+        # Masked mean pooling: average over non-padding tokens
+        masked_embeddings = token_embeddings * padding_mask  # (batch_size, L_diag, H)
+        seq_lengths = padding_mask.sum(dim=1, keepdim=True)  # (batch_size, 1, 1)
+        seq_lengths = torch.clamp(seq_lengths, min=1.0)  # Avoid division by zero
+        pooled = masked_embeddings.sum(dim=1) / seq_lengths.squeeze(-1)  # (batch_size, H)
+        
+        # Apply MLP layers
+        pooled = self.mlp(pooled)  # (batch_size, H)
+        
+        # Final classification
+        pooled = self.dropout(pooled)  # (batch_size, H)
+        logits = self.classifier(pooled)  # (batch_size, out_dim)
         return logits
 
 
@@ -150,6 +198,8 @@ class LTransformerEncoder(torch.nn.Module):
 def create_model(model_type, x_vocab_size, out_dim, **kwargs):
     if model_type == 'transformer_encoder':
         return TransformerEncoder(x_vocab_size=x_vocab_size, out_dim=out_dim, **kwargs)
+    elif model_type == 'mlp':
+        return MLP(x_vocab_size=x_vocab_size, out_dim=out_dim, **kwargs)
     elif model_type == 'ltransformer_encoder':
         return LTransformerEncoder(
             vocab_size=x_vocab_size,
