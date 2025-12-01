@@ -142,7 +142,9 @@ class _LTransformerEncoderBlock(torch.nn.Module):
 class LTransformerEncoder(torch.nn.Module):
     def __init__(
         self,
-        manifold = Lorentz(1.0),
+        manifold_in = Lorentz(1.0),
+        manifold_hidden = Lorentz(1.0),
+        manifold_output = Lorentz(1.0),
         arch = "L3_W390_A6",
         vocab_size = None,
         context_length = None,
@@ -156,17 +158,17 @@ class LTransformerEncoder(torch.nn.Module):
         _attn = re.search(r"A(\d+)", arch)
         self.heads = int(_attn.group(1)) if _attn else self.width // 64
         # Token Embeddings (Lorentz)
-        self.token_embed = LorentzEmbeddings(manifold, vocab_size, self.width, padding_idx=0) 
-        self.cls_token = ManifoldParameter(manifold.random_normal((1, 1, self.width), std=0.02), manifold=manifold)
+        self.token_embed = LorentzEmbeddings(manifold_in, vocab_size,  self.width, manifold_out=manifold_hidden, padding_idx=0) 
+        self.cls_token = ManifoldParameter(manifold_hidden.random_normal((1, 1, self.width), std=0.02), manifold=manifold_hidden)
 
         self.resblocks = torch.nn.ModuleList([
-            _LTransformerEncoderBlock(manifold, self.width, self.heads)
+            _LTransformerEncoderBlock(manifold_hidden, self.width, self.heads)
             for _ in range(self.layers)
         ])
 
         # Final normalization and projection
-        self.ln_final = LorentzRMSNorm(manifold, self.width - 1)
-        self.final_proj = LorentzLinear(manifold, self.width - 1, self.width - 1)
+        self.ln_final = LorentzRMSNorm(manifold_hidden, self.width - 1)
+        self.final_proj = LorentzLinear(manifold_hidden, self.width - 1, self.width - 1, manifold_out=manifold_hidden)
         self.dropout = nn.Dropout(0.3)
         self.classifier = torch.nn.Linear(self.width, out_dim)
 

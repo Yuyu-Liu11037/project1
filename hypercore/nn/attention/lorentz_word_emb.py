@@ -4,12 +4,14 @@ from ...manifolds import Lorentz
 from geoopt import ManifoldParameter
 
 class LorentzEmbeddings(nn.Module):
-    def __init__(self, manifold: Lorentz, num_embeddings, embedding_dim, padding_idx=0):
+    def __init__(self, manifold_in, num_embeddings, embedding_dim, padding_idx=0, manifold_out=None):
         super().__init__()
+        self.manifold_in = manifold_in
+        self.manifold_out = manifold_out
         self.padding_idx = padding_idx
-        init = manifold.random_normal((num_embeddings, embedding_dim))
-        init[padding_idx] = manifold.origin(embedding_dim)
-        self.embedding = ManifoldParameter(init, manifold=manifold)
+        init = manifold_in.random_normal((num_embeddings, embedding_dim))
+        init[padding_idx] = manifold_in.origin(embedding_dim)
+        self.embedding = ManifoldParameter(init, manifold=manifold_in)
         self.embedding.requires_grad_(True)
         self.embedding.data[padding_idx].requires_grad = False
 
@@ -22,5 +24,6 @@ class LorentzEmbeddings(nn.Module):
             pad_emb = self.embedding[self.padding_idx].detach()  # (D,)
             pad_emb = pad_emb.view(1, 1, -1)
             emb = torch.where(mask, pad_emb, emb)
+            emb = emb * (self.manifold_out.c / self.manifold_in.c).sqrt()
         return emb.permute(1, 0, 2)
         

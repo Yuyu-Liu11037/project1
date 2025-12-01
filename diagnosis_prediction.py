@@ -124,7 +124,7 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Warning: Failed to save cache ({e}). Continuing without cache.")
 
-    model, vocabs, ccs_itos, test_metrics = train_model_on_samples(
+    model, vocabs, test_metrics = train_model_on_samples(
             samples,
             model_type=args.model_type,
             task=args.task,
@@ -145,4 +145,3 @@ if __name__ == "__main__":
     print(f"\n[DONE] {args.model_type.upper()} model test results:")
     for metric, value in test_metrics.items():
         print(f"  {metric}: {value:.4f}")
-        

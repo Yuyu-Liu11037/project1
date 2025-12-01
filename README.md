@@ -9,11 +9,11 @@ X (all codes in history visits of a patient):
         []
     ]
 
-Y (classes of next-visit codes):
+Y (next-visit ICD codes):
 
-    ['50', '55', '201', '199', '248', '50', '114', '50', '50', '127', '101', '114', '50', '155', '99', '158', '2617', '50', '50', '657', '81', '138', '95', '155', '53', '59', '238', '2617', '2621', '257', '101', '663', '212', '212']
+    ['650', 'V270']
 
-I concatenated all history ICD-10 codes in one sequence, then mapped them to integer tokens. Labels are originally constituted by ICD-10 codes in the next visit; they are mapped to some clinical classes through a mapping called "CCS". In my data there are 275 possible distinct labels.
+I concatenated all history ICD-10 codes in one sequence, then mapped them to integer tokens.
 
 The feed-forward step is line 185 in training/training.py:
 ```logits = model(batch_X_diag, batch_X_proc, batch_X_drug)```, but ```batch_X_proc, batch_X_drug``` are not used in the current procedure.

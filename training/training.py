@@ -2,21 +2,14 @@
 Training module
 Contains main model training functions
 """
-from itertools import combinations
-import pickle
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import random
 import numpy as np
 import geoopt
-from geoopt.manifolds import PoincareBall
-from collections import defaultdict
-from sklearn.model_selection import KFold
-from torch.utils.data import DataLoader, TensorDataset, Dataset
+from torch.utils.data import DataLoader, Dataset
 from functools import partial
-import os
-from pathlib import Path
 
 from model.models import create_model
 from util.data_processing import (
@@ -26,7 +19,8 @@ from util.data_processing import (
     prepare_XY, 
     split_by_patient
 )
-from metrics.metrics import precision_at_k_visit, accuracy_at_k_code, recall_at_k_micro
+from metrics.metrics import precision_at_k_visit, accuracy_at_k_code
+from util.code_trie import CodeTrie
 
 
 class VariableLengthDataset(Dataset):
@@ -93,14 +87,12 @@ def train_model_on_samples(samples,
     # print(f"\nSamples: {samples[0]}")
     # 每一个sample就是一个病人的一条visit记录
     # 除了 adm_time 和 cond_hist 以外，其他字段都是这个 visit 特有的记录(这两个字段包含了这个病人过往的记录)
-    # 每条 visit 里，cond_hist 包含病人过往 conditions 原代码，但是 conditions 字段是 CCS 映射后的代码
     by_pid = sort_samples_within_patient(samples)   # defaultdict(list), {"patient_id": [sample1, sample2, ...]}
     # print(f"\nBy pid: {by_pid['10001401']}")
-    # build_pairs有问题。。我们应该是要用病人的所有过往visit记录来预测下一次的诊断，而不是上一次的visit
-    # 没事了，cond_hist字段就是之前所有的visits
     pairs = build_pairs(by_pid, task=task)   # (sample_t, label_t+1)
     pairs = [(s, y_codes) for s, y_codes in pairs if len(s['cond_hist']) > 0]
-    # print(f"\nPairs: {pairs[10]}")
+    print(f"\nPairs: {pairs[10]}")
+    exit()
 
     # 2) Patient-level split
     train_pairs, val_pairs, test_pairs = split_by_patient(pairs, seed=seed)
@@ -127,8 +119,8 @@ def train_model_on_samples(samples,
     # Calculate max sequence lengths for each code type
     # max_diag_len = max(max(len(x) for x in Xtr_diag), max(len(x) for x in Xva_diag), max(len(x) for x in Xte_diag))
     max_diag_len = 512
-    max_proc_len = max(max(len(x) for x in Xtr_proc), max(len(x) for x in Xva_proc), max(len(x) for x in Xte_proc))
-    max_drug_len = max(max(len(x) for x in Xtr_drug), max(len(x) for x in Xva_drug), max(len(x) for x in Xte_drug))
+    max_proc_len = 512
+    max_drug_len = 512
     
     print(f"Max sequence lengths - Diag: {max_diag_len}, Proc: {max_proc_len}, Drug: {max_drug_len}")
 
@@ -164,6 +156,8 @@ def train_model_on_samples(samples,
     best_metric = -float('inf')
     patience_counter = 0
     best_model_state = None
+
+    code_trie = CodeTrie.from_file('cond_hist_codes.txt')
         
     print(f"Training for {epochs} epochs")
     for ep in range(1, epochs+1):

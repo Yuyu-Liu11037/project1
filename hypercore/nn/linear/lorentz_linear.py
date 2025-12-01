@@ -6,9 +6,10 @@ import math
 
 
 class LorentzLinear(nn.Module):
-    def __init__(self, manifold, in_features, out_features, bias=True, num_heads=1):
+    def __init__(self, manifold, in_features, out_features, bias=True, manifold_out=None, num_heads=1):
         super().__init__()
         self.manifold = manifold
+        self.manifold_out = manifold_out
         self.c = manifold.c
         self.linear = nn.Linear(in_features, out_features, bias=bias)
         self.reset_parameters()
