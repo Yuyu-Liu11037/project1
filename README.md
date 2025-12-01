@@ -69,4 +69,4 @@ I use an Encoder-only model for this multi-class classification task. The Euclid
 They are both optimized by ```opt = geoopt.optim.RiemannianAdam(model.parameters(), lr=lr, weight_decay=wd)```.
 
 ## Results
-My results are recorded in results.md. You can see that Transformer encoder performs slightly better than Lorentz Transformer.
+My results are recorded in results.md.
