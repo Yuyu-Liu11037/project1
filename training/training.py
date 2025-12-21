@@ -10,6 +10,8 @@ import numpy as np
 import geoopt
 from torch.utils.data import DataLoader, Dataset
 from functools import partial
+from pathlib import Path
+from datetime import datetime
 
 from model.models import create_model
 from util.data_processing import (
@@ -25,27 +27,29 @@ from util.code_trie import CodeTrie
 
 class VariableLengthDataset(Dataset):
     """Dataset for variable-length tensors with three separate code types"""
-    def __init__(self, X_list_diag, X_list_proc, X_list_drug, Y_list):
+    def __init__(self, X_list_diag, X_list_proc, X_list_drug, X_list_visit_ids, Y_list):
         self.X_list_diag = X_list_diag
         self.X_list_proc = X_list_proc
         self.X_list_drug = X_list_drug
+        self.X_list_visit_ids = X_list_visit_ids
         self.Y_list = Y_list
     
     def __len__(self):
         return len(self.Y_list)
     
     def __getitem__(self, idx):
-        return (self.X_list_diag[idx], self.X_list_proc[idx], self.X_list_drug[idx]), self.Y_list[idx]
+        return (self.X_list_diag[idx], self.X_list_proc[idx], self.X_list_drug[idx], self.X_list_visit_ids[idx]), self.Y_list[idx]
 
 
 def collate_fn(batch, max_diag_len=None, max_proc_len=None, max_drug_len=None):
     """Custom collate function to pad variable-length sequences for three code types"""
     X_batch, Y_batch = zip(*batch)
     
-    # Unpack three types of X
+    # Unpack four types of X (diag, proc, drug, visit_ids)
     X_diag_batch = [x[0] for x in X_batch]
     X_proc_batch = [x[1] for x in X_batch]
     X_drug_batch = [x[2] for x in X_batch]
+    X_visit_ids_batch = [x[3] for x in X_batch]
     
     # Pad each type separately to their respective max lengths
     if max_diag_len is None:
@@ -65,10 +69,17 @@ def collate_fn(batch, max_diag_len=None, max_proc_len=None, max_drug_len=None):
     X_drug_padded = torch.nn.utils.rnn.pad_sequence(X_drug_batch, batch_first=True, padding_value=0)
     X_drug_padded = X_drug_padded[:, :max_drug_len]
     
+    # Pad visit_ids: padding positions (where x_diag == 0) should be -1
+    X_visit_ids_padded = torch.nn.utils.rnn.pad_sequence(X_visit_ids_batch, batch_first=True, padding_value=-1)
+    X_visit_ids_padded = X_visit_ids_padded[:, :max_diag_len]  # Same length as X_diag
+    
+    # Set padding positions to -1 (where X_diag == 0)
+    X_visit_ids_padded[X_diag_padded == 0] = -1
+    
     # For Y (multi-hot vectors), stack directly since they all have the same length (len(ccs_stoi))
     Y_padded = torch.stack(Y_batch)
     
-    return (X_diag_padded, X_proc_padded, X_drug_padded), Y_padded
+    return (X_diag_padded, X_proc_padded, X_drug_padded, X_visit_ids_padded), Y_padded
 
 
 def train_model_on_samples(samples,
@@ -91,8 +102,6 @@ def train_model_on_samples(samples,
     # print(f"\nBy pid: {by_pid['10001401']}")
     pairs = build_pairs(by_pid, task=task)   # (sample_t, label_t+1)
     pairs = [(s, y_codes) for s, y_codes in pairs if len(s['cond_hist']) > 0]
-    print(f"\nPairs: {pairs[10]}")
-    exit()
 
     # 2) Patient-level split
     train_pairs, val_pairs, test_pairs = split_by_patient(pairs, seed=seed)
@@ -112,9 +121,9 @@ def train_model_on_samples(samples,
     vocabs = (diag_stoi, proc_stoi, drug_stoi)
 
     # 4) Vectorization
-    (Xtr_diag, Xtr_proc, Xtr_drug), Ytr = prepare_XY(train_pairs,  vocabs, use_current_step=use_current_step)
-    (Xva_diag, Xva_proc, Xva_drug), Yva = prepare_XY(val_pairs,    vocabs, use_current_step=use_current_step)
-    (Xte_diag, Xte_proc, Xte_drug), Yte = prepare_XY(test_pairs,   vocabs, use_current_step=use_current_step)
+    (Xtr_diag, Xtr_proc, Xtr_drug, Xtr_visit_ids), Ytr = prepare_XY(train_pairs,  vocabs, use_current_step=use_current_step)
+    (Xva_diag, Xva_proc, Xva_drug, Xva_visit_ids), Yva = prepare_XY(val_pairs,    vocabs, use_current_step=use_current_step)
+    (Xte_diag, Xte_proc, Xte_drug, Xte_visit_ids), Yte = prepare_XY(test_pairs,   vocabs, use_current_step=use_current_step)
 
     # Calculate max sequence lengths for each code type
     # max_diag_len = max(max(len(x) for x in Xtr_diag), max(len(x) for x in Xva_diag), max(len(x) for x in Xte_diag))
@@ -125,9 +134,9 @@ def train_model_on_samples(samples,
     print(f"Max sequence lengths - Diag: {max_diag_len}, Proc: {max_proc_len}, Drug: {max_drug_len}")
 
     # 5) Create DataLoaders for batch training with custom collate function
-    train_dataset = VariableLengthDataset(Xtr_diag, Xtr_proc, Xtr_drug, Ytr)
-    val_dataset = VariableLengthDataset(Xva_diag, Xva_proc, Xva_drug, Yva)
-    test_dataset = VariableLengthDataset(Xte_diag, Xte_proc, Xte_drug, Yte)
+    train_dataset = VariableLengthDataset(Xtr_diag, Xtr_proc, Xtr_drug, Xtr_visit_ids, Ytr)
+    val_dataset = VariableLengthDataset(Xva_diag, Xva_proc, Xva_drug, Xva_visit_ids, Yva)
+    test_dataset = VariableLengthDataset(Xte_diag, Xte_proc, Xte_drug, Xte_visit_ids, Yte)
     
     # Create collate function with max lengths
     collate_fn_with_max = partial(collate_fn, max_diag_len=max_diag_len, max_proc_len=max_proc_len, max_drug_len=max_drug_len)
@@ -156,6 +165,7 @@ def train_model_on_samples(samples,
     best_metric = -float('inf')
     patience_counter = 0
     best_model_state = None
+    final_val_metric = None
 
     code_trie = CodeTrie.from_file('cond_hist_codes.txt')
         
@@ -166,13 +176,14 @@ def train_model_on_samples(samples,
         num_batches = 0
 
         for batch_X, batch_Y in train_loader:
-            batch_X_diag, batch_X_proc, batch_X_drug = batch_X
+            batch_X_diag, batch_X_proc, batch_X_drug, batch_X_visit_ids = batch_X
             batch_X_diag = batch_X_diag.to(device)   # (batch_size, max_diag_len)
             batch_X_proc = batch_X_proc.to(device)
             batch_X_drug = batch_X_drug.to(device)
+            batch_X_visit_ids = batch_X_visit_ids.to(device)  # (batch_size, max_diag_len)
             batch_Y = batch_Y.to(device)
             
-            logits = model(batch_X_diag, batch_X_proc, batch_X_drug)  # (batch_size, y_vocab_size)
+            logits, _, _ = model(batch_X_diag, batch_X_proc, batch_X_drug, x_visit_ids=batch_X_visit_ids)  # (batch_size, y_vocab_size)
                 
             loss = nn.functional.binary_cross_entropy_with_logits(logits, batch_Y)
             total_loss = loss
@@ -189,6 +200,7 @@ def train_model_on_samples(samples,
         if ep % 1 == 0:
             val_metrics = evaluate_batched(model, val_loader, ks=(10, 20, 30), device=device)
             current_metric = val_metrics[monitor_metric]
+            final_val_metric = current_metric  # Keep track of final validation metric
                 
             print(f"Epoch {ep:02d} | avg_loss={avg_loss:.4f} | val P@10={val_metrics['P@10']:.4f} Acc@10={val_metrics['Acc@10']:.4f}")   
             print(f"Logits stats: min={logits.min().item():.4f}, max={logits.max().item():.4f}, mean={logits.mean().item():.4f}, std={logits.std().item():.4f}")
@@ -213,6 +225,35 @@ def train_model_on_samples(samples,
     test_metrics = evaluate_batched(model, test_loader)
     print("[TEST]", test_metrics)
     
+    # 9) Save model checkpoint
+    checkpoint_dir = Path("checkpoints")
+    checkpoint_dir.mkdir(exist_ok=True)
+    
+    # Generate checkpoint filename with timestamp and model type
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    checkpoint_filename = f"{model_type}_{task}_{timestamp}.pth"
+    checkpoint_path = checkpoint_dir / checkpoint_filename
+    
+    # Save model state dict and additional information
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'model_type': model_type,
+        'vocabs': vocabs,
+        'test_metrics': test_metrics,
+        'best_metric': best_metric if early_stopping else final_val_metric,
+        'monitor_metric': monitor_metric,
+        'arch': arch,
+        'diag_vocab_size': diag_vocab_size,
+        'max_diag_len': max_diag_len,
+        'max_proc_len': max_proc_len,
+        'max_drug_len': max_drug_len,
+        'task': task,
+        'use_current_step': use_current_step,
+    }
+    
+    torch.save(checkpoint, checkpoint_path)
+    print(f"\n[CHECKPOINT] Model saved to: {checkpoint_path}")
+    
     return model, vocabs, test_metrics
 
 
@@ -223,12 +264,13 @@ def evaluate_batched(model, data_loader, ks=(10, 20, 30), device='cuda'):
     
     with torch.no_grad():
         for batch_X, batch_Y in data_loader:
-            batch_X_diag, batch_X_proc, batch_X_drug = batch_X
+            batch_X_diag, batch_X_proc, batch_X_drug, batch_X_visit_ids = batch_X
             # For SVM, keep on CPU; for other models, move to device
             if device != 'cpu':
                 batch_X_diag = batch_X_diag.to(device)
                 batch_X_proc = batch_X_proc.to(device)
                 batch_X_drug = batch_X_drug.to(device)
+                batch_X_visit_ids = batch_X_visit_ids.to(device)
                 batch_Y = batch_Y.to(device)
             else:
                 batch_Y = batch_Y
@@ -237,7 +279,7 @@ def evaluate_batched(model, data_loader, ks=(10, 20, 30), device='cuda'):
             try:
                 # For LTransformerDecoder, only pass batch_X_diag
                 # The model will automatically handle padding mask
-                logits = model(batch_X_diag, batch_X_proc, batch_X_drug)
+                logits = model(batch_X_diag, batch_X_proc, batch_X_drug, x_visit_ids=batch_X_visit_ids)
                 if isinstance(logits, tuple):
                     logits = logits[0]
             except RuntimeError as e:

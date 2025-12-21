@@ -231,10 +231,26 @@ def vectorize_pair(s, y_codes, vocabs, use_current_step=False):
     x_proc_indices = proc_tokenizer.encode(proc_hist)
     x_drug_indices = drug_tokenizer.encode(drug_hist)
     
+    # Generate visit_ids for diag codes
+    # cond_hist is a list of lists, where each sublist represents a visit
+    x_visit_ids = []
+    for visit_idx, visit_codes in enumerate(cond_hist):
+        for c in visit_codes:
+            if c in diag_stoi:
+                x_visit_ids.append(visit_idx)
+    
     # Return three separate tensors (use 0 as padding)
+    # X_visit_ids should have the same length as X_diag (they are generated from the same cond_hist)
     X_diag = torch.tensor(x_diag_indices, dtype=torch.long) if len(x_diag_indices) > 0 else torch.tensor([0], dtype=torch.long)
     X_proc = torch.tensor(x_proc_indices, dtype=torch.long) if len(x_proc_indices) > 0 else torch.tensor([0], dtype=torch.long)
     X_drug = torch.tensor(x_drug_indices, dtype=torch.long) if len(x_drug_indices) > 0 else torch.tensor([0], dtype=torch.long)
+    # X_visit_ids should match X_diag length
+    # If both are empty, use [-1] for X_visit_ids to match [0] for X_diag (both represent padding)
+    if len(x_visit_ids) > 0:
+        X_visit_ids = torch.tensor(x_visit_ids, dtype=torch.long)
+    else:
+        # Empty sequence: X_diag will be [0], X_visit_ids should be [-1] to indicate padding
+        X_visit_ids = torch.tensor([-1], dtype=torch.long)
 
     y_indices = diag_tokenizer.encode([y_codes])
     y_multi_hot = torch.zeros(len(diag_stoi), dtype=torch.float)
@@ -242,19 +258,20 @@ def vectorize_pair(s, y_codes, vocabs, use_current_step=False):
     y_multi_hot[valid_indices] = 1.0
     y = y_multi_hot
     
-    return (X_diag, X_proc, X_drug), y
+    return (X_diag, X_proc, X_drug, X_visit_ids), y
 
 
 def prepare_XY(pairs, vocabs, use_current_step=False):
     """Prepare training data X and Y as variable-length sequences"""
-    Xs_diag, Xs_proc, Xs_drug, Ys = [], [], [], []
+    Xs_diag, Xs_proc, Xs_drug, Xs_visit_ids, Ys = [], [], [], [], []
     for s, y_codes in pairs:
-        (X_diag, X_proc, X_drug), y = vectorize_pair(s, y_codes, vocabs, use_current_step=use_current_step)
+        (X_diag, X_proc, X_drug, X_visit_ids), y = vectorize_pair(s, y_codes, vocabs, use_current_step=use_current_step)
         Xs_diag.append(X_diag)
         Xs_proc.append(X_proc)
         Xs_drug.append(X_drug)
+        Xs_visit_ids.append(X_visit_ids)
         Ys.append(y)
-    return (Xs_diag, Xs_proc, Xs_drug), Ys
+    return (Xs_diag, Xs_proc, Xs_drug, Xs_visit_ids), Ys
 
 
 def split_by_patient(pairs, test_size=0.2, val_size=0.1, seed=42):

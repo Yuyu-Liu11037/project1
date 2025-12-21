@@ -152,6 +152,7 @@ class LTransformerEncoder(torch.nn.Module):
         grad_checkpointing: bool = False,
     ):
         super().__init__()
+        self.manifold_hidden = manifold_hidden
         # Parse architecture string
         self.layers = int(re.search(r"L(\d+)", arch).group(1))
         self.width = int(re.search(r"W(\d+)", arch).group(1))
@@ -172,7 +173,7 @@ class LTransformerEncoder(torch.nn.Module):
         self.dropout = nn.Dropout(0.3)
         self.classifier = torch.nn.Linear(self.width, out_dim)
 
-    def forward(self, x_diag, x_proc, x_drug):
+    def forward(self, x_diag, x_proc, x_drug, x_visit_ids=None):
         batch_size, max_len = x_diag.shape
         device = x_diag.device
 
@@ -194,7 +195,59 @@ class LTransformerEncoder(torch.nn.Module):
 
         cls_state = self.dropout(token_embeddings[:, 0, :])
         logits = self.classifier(cls_state)
-        return logits
+
+        # token_embeddings: (B, L+1, D)
+        # 去掉第 0 个 CLS，只看 code token
+        code_states = token_embeddings[:, 1:, :]          # (B, L, D)
+        B, L, D = code_states.shape                  # (B, L)
+
+        # padding_mask 包含 CLS token，形状为 (B, L+1)
+        # 需要去掉 CLS token 部分，只保留 code tokens 的 mask，形状为 (B, L)
+        code_padding_mask = padding_mask[:, 1:]  # (B, L), True where padding
+
+        # 当前 batch 中的最大 visit index
+        # 注意：如果你用 -1 表示 padding visit，要先把无效位置 mask 掉再取 max
+        masked_visit_ids = x_visit_ids.clone()
+        # code_padding_mask 是 True where padding，所以 ~code_padding_mask 是 True where valid
+        masked_visit_ids[code_padding_mask] = -1  # 将 padding 位置设为 -1
+        # 只考虑非 padding 的位置来取 max
+        valid_visit_ids = masked_visit_ids[masked_visit_ids >= 0]
+        max_visits = valid_visit_ids.max().item() + 1 if len(valid_visit_ids) > 0 else 1   # V
+
+        V = max_visits
+
+        manifold = self.manifold_hidden
+        code_states_tan = manifold.logmap0(code_states)  # (B, L, D') —— 假设返回同维度
+        visit_states_tan = code_states_tan.new_zeros(B, V, code_states_tan.size(-1))  # (B, V, D')
+        visit_counts = code_states_tan.new_zeros(B, V, 1)                             # (B, V, 1)
+
+        for b in range(B):
+            # code_padding_mask[b] 形状为 (L,), True where padding
+            # 我们需要 valid_mask_b 是 True where valid (not padding)
+            valid_mask_b = ~code_padding_mask[b]  # (L,), True where valid
+            if not valid_mask_b.any():
+                continue
+
+            ids_b = x_visit_ids[b, valid_mask_b]             # (#codes_b,)
+            states_b = code_states_tan[b, valid_mask_b, :]   # (#codes_b, D')
+            
+            # 确保只使用有效的 visit ids (>= 0)，过滤掉 -1
+            valid_ids_mask = ids_b >= 0
+            if not valid_ids_mask.any():
+                continue
+            ids_b = ids_b[valid_ids_mask]
+            states_b = states_b[valid_ids_mask, :]
+
+            visit_states_tan[b].index_add_(0, ids_b, states_b)
+
+            ones = torch.ones_like(ids_b, dtype=visit_counts.dtype, device=device).unsqueeze(-1)  # (#codes_b, 1)
+            visit_counts[b].index_add_(0, ids_b, ones)
+
+        visit_counts_clamped = visit_counts.clamp(min=1.0)
+        visit_states_tan = visit_states_tan / visit_counts_clamped   # (B, V, D')
+        visit_states = manifold.expmap0(visit_states_tan)            # (B, V, D)
+        visit_padding_mask = (visit_counts.squeeze(-1) == 0)         # (B, V), True 表示这个 visit 其实是“空”的
+        return logits, visit_states, visit_padding_mask
 
 
 def create_model(model_type, x_vocab_size, out_dim, **kwargs):
