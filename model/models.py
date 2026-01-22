@@ -17,6 +17,17 @@ class TransformerEncoder(nn.Module):
                  diag_itos=None, c=1.0, max_diag_len=None, arch=None):
         super().__init__()
         self.diag_itos = diag_itos
+        # Keep Euclidean Transformer configurable via the same `arch` string as LTransformerEncoder.
+        # Expected format: "L{layers}_W{width}_A{heads}" (e.g. "L3_W390_A6")
+        if arch:
+            try:
+                num_layers = int(re.search(r"L(\d+)", arch).group(1))
+                hidden = int(re.search(r"W(\d+)", arch).group(1))
+                _attn = re.search(r"A(\d+)", arch)
+                num_heads = int(_attn.group(1)) if _attn else num_heads
+            except Exception:
+                # Fall back to provided args if arch parsing fails
+                pass
         self.token_embed  = nn.Embedding(diag_size + 1, hidden, padding_idx=0)
         # self.emb_proc  = nn.Embedding(proc_size + 1, embed_dim, padding_idx=0)
         # self.emb_third = nn.Embedding(x_vocab_size - (diag_size + proc_size) + 1, embed_dim, padding_idx=0)
@@ -28,7 +39,7 @@ class TransformerEncoder(nn.Module):
         self.classifier = nn.Linear(hidden, out_dim, bias=False)
         self.dropout = nn.Dropout(0.3)
 
-    def forward(self, x_diag, x_proc, x_drug):
+    def forward(self, x_diag, x_proc, x_drug, x_visit_ids=None):
         batch_size, max_len = x_diag.shape
         device = x_diag.device
 
@@ -36,15 +47,50 @@ class TransformerEncoder(nn.Module):
         token_embeddings = self.token_embed(x_diag)   # (batch_size, L_diag, E)
         token_embeddings = torch.cat([cls_token, token_embeddings], dim=1) # (batch_size, L_total+1, H)
 
-        cls_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
-        padding_mask = (x_diag != 0)   # (batch_size, L_diag)
-        padding_mask = torch.cat([cls_mask, padding_mask], dim=1)
+        # PyTorch transformer expects src_key_padding_mask=True where positions should be masked (i.e. padding).
+        cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=device)  # CLS is never padding
+        padding_mask = (x_diag == 0)   # (batch_size, L_diag) - True where padding
+        padding_mask = torch.cat([cls_mask, padding_mask], dim=1)  # (batch_size, L_diag+1)
 
-        token_embeddings = self.transformer(token_embeddings, src_key_padding_mask=~padding_mask)
+        token_embeddings = self.transformer(token_embeddings, src_key_padding_mask=padding_mask)
 
         cls_state = self.dropout(token_embeddings[:, 0, :])  # (batch_size, H)
         logits = self.classifier(cls_state)  # (batch_size, out_dim)
-        return logits
+
+        # Match LTransformerEncoder outputs: (logits, visit_states, visit_padding_mask)
+        code_states = token_embeddings[:, 1:, :]  # (B, L, H)
+        code_padding_mask = (x_diag == 0)         # (B, L), True where padding
+
+        if x_visit_ids is None:
+            # Default: treat all (non-padding) codes as belonging to a single visit (visit_id=0).
+            x_visit_ids = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
+        else:
+            # Ensure padding positions are marked as invalid
+            x_visit_ids = x_visit_ids.to(device)
+            if x_visit_ids.shape != (batch_size, max_len):
+                raise ValueError(f"x_visit_ids must have shape {(batch_size, max_len)}, got {tuple(x_visit_ids.shape)}")
+            x_visit_ids = x_visit_ids.clone()
+        x_visit_ids[code_padding_mask] = -1
+
+        valid_visit_ids = x_visit_ids[x_visit_ids >= 0]
+        V = int(valid_visit_ids.max().item() + 1) if valid_visit_ids.numel() > 0 else 1
+
+        visit_states = code_states.new_zeros(batch_size, V, code_states.size(-1))  # (B, V, H)
+        visit_counts = code_states.new_zeros(batch_size, V, 1)                    # (B, V, 1)
+
+        for b in range(batch_size):
+            valid_mask_b = x_visit_ids[b] >= 0
+            if not valid_mask_b.any():
+                continue
+            ids_b = x_visit_ids[b, valid_mask_b]          # (#codes_b,)
+            states_b = code_states[b, valid_mask_b, :]    # (#codes_b, H)
+            visit_states[b].index_add_(0, ids_b, states_b)
+            ones = torch.ones((ids_b.size(0), 1), dtype=visit_counts.dtype, device=device)
+            visit_counts[b].index_add_(0, ids_b, ones)
+
+        visit_states = visit_states / visit_counts.clamp(min=1.0)
+        visit_padding_mask = (visit_counts.squeeze(-1) == 0)  # (B, V), True where empty visit
+        return logits, visit_states, visit_padding_mask
 
 
 class MLP(nn.Module):

@@ -8,6 +8,7 @@ import torch.optim as optim
 import random
 import numpy as np
 import geoopt
+from typing import Optional, Dict
 from torch.utils.data import DataLoader, Dataset
 from functools import partial
 from pathlib import Path
@@ -23,6 +24,54 @@ from util.data_processing import (
 )
 from metrics.metrics import precision_at_k_visit, accuracy_at_k_code
 from util.code_trie import CodeTrie
+
+
+def _tensor_stats_1d(x: torch.Tensor) -> Dict[str, float]:
+    """Compute basic stats for a 1D tensor. Assumes x is non-empty and on any device."""
+    x = x.float()
+    return {
+        "min": float(x.min().item()),
+        "max": float(x.max().item()),
+        "mean": float(x.mean().item()),
+        "std": float(x.std(unbiased=False).item()),
+        "p50": float(x.median().item()),
+    }
+
+
+def _code_distance_to_origin(
+    model: nn.Module,
+    code_emb: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Distance to origin for code embeddings.
+    - Euclidean models: L2 norm.
+    - Lorentz (hyperbolic) models: geodesic distance on the Lorentz manifold to its origin.
+    Returns a tensor of shape (...,) matching code_emb.shape[:-1].
+    """
+    manifold = getattr(model, "manifold_hidden", None)
+    if manifold is not None:
+        # Prefer manifold-provided dist0 if available (geoopt-style API).
+        if hasattr(manifold, "dist0") and callable(getattr(manifold, "dist0")):
+            return manifold.dist0(code_emb)
+
+        # Fallback for Lorentz/hyperboloid parameterization:
+        # for x on the hyperboloid (-x0^2 + ||x_space||^2 = -c, x0>0),
+        # distance to origin is: d(0, x) = sqrt(c) * arcosh(x0 / sqrt(c)).
+        if hasattr(manifold, "c"):
+            c = manifold.c
+            sqrt_c = torch.sqrt(c) if torch.is_tensor(c) else torch.tensor(c, device=code_emb.device, dtype=code_emb.dtype).sqrt()
+            x0 = code_emb[..., 0]
+            eps = 1e-6
+            arg = (x0 / sqrt_c).clamp_min(1.0 + eps)
+            return sqrt_c * torch.acosh(arg)
+
+        # Generic fallback: if a logmap0 exists, its (Euclidean) norm matches geodesic distance for many manifolds.
+        if hasattr(manifold, "logmap0") and callable(getattr(manifold, "logmap0")):
+            u = manifold.logmap0(code_emb)
+            return torch.linalg.norm(u, dim=-1)
+
+    # Default: Euclidean norm in ambient space
+    return torch.linalg.norm(code_emb, dim=-1)
 
 
 class VariableLengthDataset(Dataset):
@@ -170,12 +219,16 @@ def train_model_on_samples(samples,
     code_trie = CodeTrie.from_file('cond_hist_codes.txt')
         
     print(f"Training for {epochs} epochs")
+    global_step = 0
+    # Print embedding distance stats every N optimizer steps (set small if debugging).
+    embed_stats_every = 200
     for ep in range(1, epochs+1):
         model.train()
         epoch_loss = 0.0
         num_batches = 0
 
         for batch_X, batch_Y in train_loader:
+            global_step += 1
             batch_X_diag, batch_X_proc, batch_X_drug, batch_X_visit_ids = batch_X
             batch_X_diag = batch_X_diag.to(device)   # (batch_size, max_diag_len)
             batch_X_proc = batch_X_proc.to(device)
@@ -184,6 +237,23 @@ def train_model_on_samples(samples,
             batch_Y = batch_Y.to(device)
             
             logits, _, _ = model(batch_X_diag, batch_X_proc, batch_X_drug, x_visit_ids=batch_X_visit_ids)  # (batch_size, y_vocab_size)
+
+            # ---- Code embedding norm / distance-to-origin stats ----
+            # NOTE: current models embed only `x_diag` via `token_embed` (proc/drug embeddings are not wired in).
+            if embed_stats_every and (global_step % embed_stats_every == 0) and hasattr(model, "token_embed"):
+                with torch.no_grad():
+                    code_emb = model.token_embed(batch_X_diag)  # (B, L, D)
+                    d0 = _code_distance_to_origin(model, code_emb)  # (B, L)
+                    valid = (batch_X_diag != 0)
+                    if valid.any():
+                        d0_valid = d0[valid].detach()
+                        stats = _tensor_stats_1d(d0_valid)
+                        print(
+                            f"[embed] step={global_step} epoch={ep} "
+                            f"dist_to_origin(diag) n={int(d0_valid.numel())} "
+                            f"min={stats['min']:.4f} p50={stats['p50']:.4f} mean={stats['mean']:.4f} "
+                            f"std={stats['std']:.4f} max={stats['max']:.4f}"
+                        )
                 
             loss = nn.functional.binary_cross_entropy_with_logits(logits, batch_Y)
             total_loss = loss

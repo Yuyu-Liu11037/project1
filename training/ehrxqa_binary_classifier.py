@@ -1,7 +1,10 @@
 """
-EHRXQA Binary Classification Training
-Trains a binary classifier (yes/no) using patient vectors and question embeddings
+EHRXQA Binary Classification (End-to-End)
+
+Trains PyHealth RETAIN as the patient encoder end-to-end on EHRXQA yes/no QA.
+Question encoder (Bio_ClinicalBERT) is frozen; RETAIN + QA head are trainable.
 """
+
 import sys
 from pathlib import Path
 
@@ -9,497 +12,472 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+import argparse
+import json
+from datetime import datetime
+from typing import Dict, List, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import json
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from collections import defaultdict
-from typing import List, Tuple, Dict
 from sklearn.metrics import accuracy_score, f1_score
-import argparse
-from datetime import datetime
 
-from extract_patient_vectors import (
-    CLSExtractorWrapper,
-    load_checkpoint,
-    convert_json_entry_to_sample,
-    prepare_input_from_sample
-)
-from extract_question_embeddings import (
-    load_model_and_tokenizer,
-    generate_sentence_embeddings
-)
+from pyhealth.datasets import SampleEHRDataset, get_dataloader
+from pyhealth.models import RETAIN
+
+from extract_patient_vectors import convert_json_entry_to_sample
+from extract_question_embeddings import load_model_and_tokenizer
 
 
-class EHRXQADataset(Dataset):
-    """Dataset for EHRXQA binary classification"""
-    
-    def __init__(
-        self,
-        json_files: List[Path],
-        patient_model,
-        patient_vocabs,
-        patient_config,
-        question_model,
-        question_tokenizer,
-        device: str = 'cuda',
-        cache_vectors: bool = True
-    ):
-        """
-        Initialize dataset
-        
-        Args:
-            json_files: List of paths to _processed.json files
-            patient_model: Loaded patient vector extraction model
-            patient_vocabs: Vocabularies for patient model
-            patient_config: Configuration for patient model
-            question_model: Bio_ClinicalBERT model
-            question_tokenizer: Bio_ClinicalBERT tokenizer
-            device: Device to run inference on
-            cache_vectors: Whether to cache extracted vectors
-        """
-        self.device = device
-        self.patient_model = patient_model
-        self.patient_vocabs = patient_vocabs
-        self.patient_config = patient_config
-        self.question_model = question_model
-        self.question_tokenizer = question_tokenizer
-        
-        # Load all entries from JSON files
-        self.entries = []
-        for json_file in json_files:
-            with open(json_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    self.entries.extend(data)
-                else:
-                    print(f"Warning: {json_file} is not a list, skipping")
-        
-        print(f"Loaded {len(self.entries)} total entries")
-        
-        # Extract patient vectors and question embeddings
-        self.patient_vectors_euclidean = []
-        self.question_embeddings = []
-        self.labels = []
-        
-        # Wrap patient model for CLS extraction
-        self.patient_extractor = CLSExtractorWrapper(patient_model).to(device)
-        self.patient_extractor.eval()
-        
-        # Freeze patient model parameters
-        for param in self.patient_extractor.parameters():
-            param.requires_grad = False
-        
-        # Freeze question model parameters
-        for param in question_model.parameters():
-            param.requires_grad = False
-        
-        # Get manifold from model
-        # Try to access manifold_hidden from the wrapped model or directly
-        if hasattr(patient_model, 'manifold_hidden'):
-            self.manifold = patient_model.manifold_hidden
-        elif hasattr(self.patient_extractor.model, 'manifold_hidden'):
-            self.manifold = self.patient_extractor.model.manifold_hidden
+def _set_seed(seed: int) -> None:
+    import random
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _load_entries(json_files: List[Path]) -> List[dict]:
+    entries: List[dict] = []
+    for json_file in json_files:
+        with open(json_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            entries.extend(data)
         else:
-            # Fallback to default Lorentz manifold
-            from hypercore.manifolds import Lorentz
-            self.manifold = Lorentz(1.0)
-            print("Warning: Could not find manifold_hidden, using default Lorentz(1.0)")
-        
-        # Extract vectors
-        self._extract_vectors(cache_vectors)
-    
-    def _extract_vectors(self, cache: bool):
-        """Extract patient vectors and question embeddings for all entries"""
-        print("Extracting patient vectors and question embeddings...")
-        
-        batch_size = 32
-        questions = []
-        
-        for i, entry in enumerate(self.entries):
-            # Collect question
-            question = entry.get('question', '')
-            if not question or not isinstance(question, str):
-                question = ''
-            questions.append(question)
-            
-            # Collect label
-            answer = entry.get('answer', [0])
-            label = int(answer[0]) if isinstance(answer, list) and len(answer) > 0 else 0
-            self.labels.append(label)
-        
-        # Extract question embeddings in batches
-        print("Extracting question embeddings...")
-        question_embeddings_tensor = generate_sentence_embeddings(
-            questions, self.question_model, self.question_tokenizer, self.device, batch_size
-        )
-        self.question_embeddings = question_embeddings_tensor.cpu().numpy()
-        
-        # Extract patient vectors in batches
-        print("Extracting patient vectors...")
-        patient_vectors_hyperbolic = []
-        
-        for i in range(0, len(self.entries), batch_size):
-            batch_entries = self.entries[i:i+batch_size]
-            batch_samples = [convert_json_entry_to_sample(entry) for entry in batch_entries]
-            
-            # Prepare batch inputs
-            batch_x_diag = []
-            batch_x_proc = []
-            batch_x_drug = []
-            batch_x_visit_ids = []
-            
-            for sample in batch_samples:
-                x_diag, x_proc, x_drug, x_visit_ids = prepare_input_from_sample(
-                    sample, self.patient_vocabs,
-                    self.patient_config['max_diag_len'],
-                    self.patient_config['max_proc_len'],
-                    self.patient_config['max_drug_len']
-                )
-                batch_x_diag.append(x_diag)
-                batch_x_proc.append(x_proc)
-                batch_x_drug.append(x_drug)
-                batch_x_visit_ids.append(x_visit_ids)
-            
-            # Stack into batch tensors
-            batch_x_diag = torch.cat(batch_x_diag, dim=0).to(self.device)
-            batch_x_proc = torch.cat(batch_x_proc, dim=0).to(self.device)
-            batch_x_drug = torch.cat(batch_x_drug, dim=0).to(self.device)
-            batch_x_visit_ids = torch.cat(batch_x_visit_ids, dim=0).to(self.device)
-            
-            # Extract CLS representations (in hyperbolic space)
-            with torch.no_grad():
-                patient_vectors_hyp = self.patient_extractor.extract_cls(
-                    batch_x_diag, batch_x_proc, batch_x_drug, batch_x_visit_ids
-                )
-                # Map to Euclidean space using logmap0
-                patient_vectors_euc = self.manifold.logmap0(patient_vectors_hyp)
-                patient_vectors_hyperbolic.append(patient_vectors_euc.cpu())
-            
-            if (i + batch_size) % 100 == 0 or (i + batch_size) >= len(self.entries):
-                print(f"  Processed {min(i + batch_size, len(self.entries))}/{len(self.entries)} entries")
-        
-        # Concatenate all patient vectors
-        patient_vectors_tensor = torch.cat(patient_vectors_hyperbolic, dim=0)
-        self.patient_vectors_euclidean = patient_vectors_tensor.numpy()
-        
-        print(f"Patient vector dimension: {self.patient_vectors_euclidean.shape[1]}")
-        print(f"Question embedding dimension: {self.question_embeddings.shape[1]}")
-        print(f"Labels distribution: {np.bincount(self.labels)}")
-    
-    def __len__(self):
-        return len(self.entries)
-    
-    def __getitem__(self, idx):
-        return (
-            torch.FloatTensor(self.patient_vectors_euclidean[idx]),
-            torch.FloatTensor(self.question_embeddings[idx]),
-            torch.LongTensor([self.labels[idx]])[0]  # Return scalar, not tensor
-        )
+            print(f"Warning: {json_file} is not a list, skipping")
+    return entries
 
 
-class BinaryClassifier(nn.Module):
-    """Binary classifier for yes/no question answering"""
-    
-    def __init__(
-        self,
-        patient_vector_dim: int,
-        question_embed_dim: int,
-        hidden_dim: int = None
-    ):
-        """
-        Initialize binary classifier
-        
-        Args:
-            patient_vector_dim: Dimension of patient vector (after logmap0)
-            question_embed_dim: Dimension of question embedding (Bio_ClinicalBERT)
-            hidden_dim: Hidden dimension for MLP (default: 2 * patient_vector_dim)
-        """
+def _extract_label(entry: dict) -> int:
+    # EHRXQA processed format uses answer=[0] or answer=[1]
+    ans = entry.get("answer", [0])
+    if isinstance(ans, list) and len(ans) > 0:
+        try:
+            return int(ans[0])
+        except Exception:
+            return 0
+    try:
+        return int(ans)
+    except Exception:
+        return 0
+
+
+def build_pyhealth_samples(entries: List[dict], max_visits: int = 0) -> List[dict]:
+    """Build PyHealth SampleEHRDataset samples for RETAIN + QA."""
+    empty_code = "__EMPTY__"
+    samples: List[dict] = []
+    for entry in entries:
+        base = convert_json_entry_to_sample(entry)
+        cond_hist = base.get("cond_hist", [])
+
+        # Normalize to consistent nested list depth for PyHealth validation:
+        # expected: List[List[str]] (visits -> codes). Empty histories must still be 2-level, e.g. `[[]]`.
+        if not isinstance(cond_hist, list):
+            cond_hist = [[]]
+        elif len(cond_hist) == 0:
+            cond_hist = [[]]
+        else:
+            # If a flat list of codes sneaks in (List[str]), wrap as a single visit.
+            if isinstance(cond_hist[0], str):
+                cond_hist = [cond_hist]
+
+            fixed_visits: List[List[str]] = []
+            for v in cond_hist:
+                if isinstance(v, list):
+                    fixed_visits.append([c for c in v if isinstance(c, str)])
+                else:
+                    fixed_visits.append([])
+            cond_hist = fixed_visits
+            if len(cond_hist) == 0:
+                cond_hist = [[]]
+
+        if max_visits and len(cond_hist) > max_visits:
+            cond_hist = cond_hist[-max_visits:]
+
+        # RETAIN (pyhealth 1.1.6) uses pack_padded_sequence; lengths must be > 0.
+        # If the whole history is empty (e.g., missing visit_ids), inject a single placeholder code.
+        if not any(len(v) > 0 for v in cond_hist):
+            cond_hist = [[empty_code]]
+
+        q = entry.get("question", "")
+        if not q or not isinstance(q, str):
+            q = ""
+
+        label = _extract_label(entry)
+
+        samples.append(
+            {
+                "patient_id": str(base.get("patient_id", entry.get("patient_id", "unknown"))),
+                "visit_id": str(base.get("visit_id", entry.get("visit_id", "unknown_visit"))),
+                # RETAIN expects (dim=3,type=str): visits -> codes
+                "list_list_codes": cond_hist,
+                "question": q,
+                "label": int(label),
+            }
+        )
+    return samples
+
+
+def split_samples(
+    samples: List[dict], train_ratio: float, val_ratio: float, seed: int
+) -> Tuple[List[dict], List[dict], List[dict]]:
+    n = len(samples)
+    idx = np.arange(n)
+    rng = np.random.RandomState(seed)
+    rng.shuffle(idx)
+
+    n_train = int(train_ratio * n)
+    n_val = int(val_ratio * n)
+
+    train_idx = idx[:n_train]
+    val_idx = idx[n_train : n_train + n_val]
+    test_idx = idx[n_train + n_val :]
+
+    def _take(idxs: np.ndarray) -> List[dict]:
+        return [samples[i] for i in idxs.tolist()]
+
+    return _take(train_idx), _take(val_idx), _take(test_idx)
+
+
+@torch.no_grad()
+def encode_questions_mean_pool(
+    questions: List[str],
+    tokenizer,
+    question_model,
+    device: torch.device,
+) -> torch.Tensor:
+    """Encode questions into (B, hidden) tensor on `device` (BERT is frozen)."""
+    questions = [q.strip() if isinstance(q, str) else "" for q in questions]
+    encoded = tokenizer(
+        questions,
+        padding=True,
+        truncation=True,
+        max_length=512,
+        return_tensors="pt",
+    )
+    input_ids = encoded["input_ids"].to(device)
+    attention_mask = encoded["attention_mask"].to(device)
+
+    outputs = question_model(input_ids=input_ids, attention_mask=attention_mask)
+    hidden_states = outputs.last_hidden_state  # (B, T, H)
+
+    mask_exp = attention_mask.unsqueeze(-1).expand_as(hidden_states).float()
+    sum_emb = torch.sum(hidden_states * mask_exp, dim=1)  # (B, H)
+    sum_mask = torch.clamp(mask_exp.sum(dim=1), min=1e-9)  # (B, H)
+    return sum_emb / sum_mask
+
+
+class RetainQAHead(nn.Module):
+    """QA head: project question embedding, concat with patient embedding, then classify yes/no."""
+
+    def __init__(self, patient_dim: int, question_dim: int, hidden_dim: int = 0):
         super().__init__()
-        
-        if hidden_dim is None:
-            hidden_dim = 2 * patient_vector_dim
-        
-        # Trainable Linear layer to project question embedding to patient vector dimension
-        self.question_proj = nn.Linear(question_embed_dim, patient_vector_dim)
-        
-        # Two-layer MLP
-        # Input: concatenated vectors (patient_vector_dim + patient_vector_dim)
-        # Hidden: hidden_dim
-        # Output: 2 (yes/no logits)
+        if hidden_dim <= 0:
+            hidden_dim = 2 * patient_dim
+
+        self.question_proj = nn.Linear(question_dim, patient_dim)
         self.mlp = nn.Sequential(
-            nn.Linear(2 * patient_vector_dim, hidden_dim),
+            nn.Linear(2 * patient_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(hidden_dim, 2)
+            nn.Linear(hidden_dim, 2),
         )
-    
-    def forward(self, patient_vector, question_embedding):
-        """
-        Forward pass
-        
-        Args:
-            patient_vector: (batch_size, patient_vector_dim)
-            question_embedding: (batch_size, question_embed_dim)
-        
-        Returns:
-            logits: (batch_size, 2) - yes/no logits
-        """
-        # Project question embedding to patient vector dimension
-        question_proj = self.question_proj(question_embedding)  # (batch_size, patient_vector_dim)
-        
-        # Concatenate vectors
-        combined = torch.cat([patient_vector, question_proj], dim=1)  # (batch_size, 2 * patient_vector_dim)
-        
-        # Pass through MLP
-        logits = self.mlp(combined)  # (batch_size, 2)
-        
-        return logits
+
+    def forward(self, patient_emb: torch.Tensor, question_emb: torch.Tensor) -> torch.Tensor:
+        q_proj = self.question_proj(question_emb)  # (B, patient_dim)
+        x = torch.cat([patient_emb, q_proj], dim=1)
+        return self.mlp(x)  # (B, 2)
 
 
-def evaluate(model, data_loader, device='cuda'):
-    """Evaluate model and return Accuracy and F1 score"""
-    model.eval()
-    all_predictions = []
-    all_labels = []
-    
-    with torch.no_grad():
-        for patient_vec, question_emb, labels in data_loader:
-            patient_vec = patient_vec.to(device)
-            question_emb = question_emb.to(device)
-            labels = labels.to(device)
-            
-            logits = model(patient_vec, question_emb)
-            predictions = torch.argmax(logits, dim=1)
-            
-            all_predictions.extend(predictions.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-    
-    # Calculate metrics
-    accuracy = accuracy_score(all_labels, all_predictions)
-    f1 = f1_score(all_labels, all_predictions, average='binary')
-    
+def _labels_to_tensor(labels, device: torch.device) -> torch.Tensor:
+    # pyhealth dataloader yields `label` as a python list (e.g., [0,1,0,...])
+    if isinstance(labels, list):
+        return torch.tensor(labels, dtype=torch.long, device=device)
+    if torch.is_tensor(labels):
+        return labels.to(device=device, dtype=torch.long)
+    return torch.tensor(list(labels), dtype=torch.long, device=device)
+
+
+@torch.no_grad()
+def evaluate_e2e(
+    retain_model: RETAIN,
+    head: RetainQAHead,
+    data_loader,
+    tokenizer,
+    question_model,
+    device: torch.device,
+) -> Dict[str, float]:
+    retain_model.eval()
+    head.eval()
+    all_preds: List[int] = []
+    all_labels: List[int] = []
+
+    for batch in data_loader:
+        # patient embedding from RETAIN (pyhealth 1.1.6 supports embed=True)
+        out = retain_model(
+            list_list_codes=batch["list_list_codes"],
+            label=batch["label"],
+            embed=True,
+        )
+        patient_emb = out["embed"]  # (B, D)
+
+        # question embedding from frozen BERT
+        q_emb = encode_questions_mean_pool(batch["question"], tokenizer, question_model, device)
+
+        logits = head(patient_emb, q_emb)
+        preds = torch.argmax(logits, dim=1).detach().cpu().numpy().tolist()
+        labels = _labels_to_tensor(batch["label"], device).detach().cpu().numpy().tolist()
+
+        all_preds.extend(preds)
+        all_labels.extend(labels)
+
     return {
-        'accuracy': accuracy,
-        'f1': f1
+        "accuracy": float(accuracy_score(all_labels, all_preds)),
+        "f1": float(f1_score(all_labels, all_preds, average="binary")),
     }
 
 
-def train(
-    train_dataset,
-    val_dataset,
-    test_dataset = None,
-    batch_size: int = 32,
-    learning_rate: float = 1e-3,
-    epochs: int = 20,
-    device: str = 'cuda',
-    patience: int = 5,
-    min_delta: float = 0.001
-):
-    """Train binary classifier"""
-    
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False) if test_dataset else None
-    
-    # Get dimensions from underlying dataset (in case of Subset)
-    underlying_dataset = train_dataset.dataset if hasattr(train_dataset, 'dataset') else train_dataset
-    patient_dim = underlying_dataset.patient_vectors_euclidean.shape[1]
-    question_dim = underlying_dataset.question_embeddings.shape[1]
-    
-    # Create model
-    model = BinaryClassifier(patient_dim, question_dim).to(device)
-    
-    # Loss and optimizer
+def train_e2e(
+    retain_model: RETAIN,
+    head: RetainQAHead,
+    train_loader,
+    val_loader,
+    test_loader,
+    tokenizer,
+    question_model,
+    device: torch.device,
+    lr: float,
+    weight_decay: float,
+    epochs: int,
+    patience: int,
+    min_delta: float,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, float]]:
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    
-    print(f"\nModel architecture:")
-    print(f"  Patient vector dim: {patient_dim}")
-    print(f"  Question embedding dim: {question_dim}")
-    print(f"  MLP hidden dim: {2 * patient_dim}")
-    print(f"  Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-    
-    # Training loop
-    best_val_f1 = -float('inf')
+    optimizer = optim.AdamW(
+        list(retain_model.parameters()) + list(head.parameters()),
+        lr=lr,
+        weight_decay=weight_decay,
+    )
+
+    best_val_f1 = -float("inf")
     patience_counter = 0
-    best_model_state = None
-    
-    print(f"\nTraining for {epochs} epochs...")
+    best_state: Dict[str, Dict[str, torch.Tensor]] = {}
+
+    print("\nTrainable params:")
+    trainable = sum(
+        p.numel()
+        for p in list(retain_model.parameters()) + list(head.parameters())
+        if p.requires_grad
+    )
+    print(f"  RETAIN+head trainable parameters: {trainable}")
+
+    last_val_metrics: Dict[str, float] = {"accuracy": 0.0, "f1": 0.0}
+
     for epoch in range(1, epochs + 1):
-        model.train()
+        retain_model.train()
+        head.train()
         epoch_loss = 0.0
         num_batches = 0
-        
-        for patient_vec, question_emb, labels in train_loader:
-            patient_vec = patient_vec.to(device)
-            question_emb = question_emb.to(device)
-            labels = labels.to(device)
-            
-            # Forward pass
-            logits = model(patient_vec, question_emb)
+
+        for batch in train_loader:
+            out = retain_model(
+                list_list_codes=batch["list_list_codes"],
+                label=batch["label"],
+                embed=True,
+            )
+            patient_emb = out["embed"]
+
+            q_emb = encode_questions_mean_pool(batch["question"], tokenizer, question_model, device)
+            logits = head(patient_emb, q_emb)
+            labels = _labels_to_tensor(batch["label"], device)
             loss = criterion(logits, labels)
-            
-            # Backward pass
-            optimizer.zero_grad()
+
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-            
-            epoch_loss += loss.item()
+
+            epoch_loss += float(loss.item())
             num_batches += 1
-        
-        avg_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
-        
-        # Validation
-        val_metrics = evaluate(model, val_loader, device)
-        current_f1 = val_metrics['f1']
-        
-        print(f"Epoch {epoch:02d} | Loss: {avg_loss:.4f} | "
-              f"Val Acc: {val_metrics['accuracy']:.4f} | Val F1: {val_metrics['f1']:.4f}")
-        
-        # Early stopping
-        if current_f1 > best_val_f1 + min_delta:
-            best_val_f1 = current_f1
+
+        avg_loss = epoch_loss / max(num_batches, 1)
+        val_metrics = evaluate_e2e(retain_model, head, val_loader, tokenizer, question_model, device)
+        last_val_metrics = val_metrics
+        val_f1 = val_metrics["f1"]
+
+        print(
+            f"Epoch {epoch:02d} | loss={avg_loss:.4f} | "
+            f"val_acc={val_metrics['accuracy']:.4f} | val_f1={val_metrics['f1']:.4f}"
+        )
+
+        if val_f1 > best_val_f1 + min_delta:
+            best_val_f1 = val_f1
             patience_counter = 0
-            best_model_state = model.state_dict().copy()
-            print(f"  → New best F1: {best_val_f1:.4f}")
+            best_state = {
+                "retain": {k: v.detach().cpu().clone() for k, v in retain_model.state_dict().items()},
+                "head": {k: v.detach().cpu().clone() for k, v in head.state_dict().items()},
+            }
+            print(f"  → New best val_f1: {best_val_f1:.4f}")
         else:
             patience_counter += 1
-        
+
         if patience_counter >= patience:
-            print(f"\nEarly stopping triggered! No improvement for {patience} epochs.")
-            print(f"Restoring best model from epoch {epoch - patience_counter}")
-            model.load_state_dict(best_model_state)
+            print(f"\nEarly stopping: no improvement for {patience} epochs. Restoring best weights.")
             break
-    
-    # Test evaluation
-    if test_loader:
-        test_metrics = evaluate(model, test_loader, device)
-        print(f"\n[TEST] Accuracy: {test_metrics['accuracy']:.4f} | F1: {test_metrics['f1']:.4f}")
-        return model, test_metrics
+
+    if best_state:
+        retain_model.load_state_dict(best_state["retain"])
+        head.load_state_dict(best_state["head"])
+
+    if test_loader is not None:
+        test_metrics = evaluate_e2e(retain_model, head, test_loader, tokenizer, question_model, device)
+        print(f"\n[TEST] acc={test_metrics['accuracy']:.4f} f1={test_metrics['f1']:.4f}")
+        final_metrics = test_metrics
     else:
-        return model, val_metrics
+        final_metrics = last_val_metrics
+
+    ckpt_state = {
+        "retain_state_dict": retain_model.state_dict(),
+        "head_state_dict": head.state_dict(),
+    }
+    return ckpt_state, final_metrics
 
 
-def split_dataset(dataset: EHRXQADataset, train_ratio: float = 0.7, val_ratio: float = 0.15, seed: int = 42):
-    """Split dataset into train/val/test"""
-    total_size = len(dataset)
-    train_size = int(train_ratio * total_size)
-    val_size = int(val_ratio * total_size)
-    
-    # Set random seed
-    np.random.seed(seed)
-    indices = np.random.permutation(total_size)
-    
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:train_size + val_size]
-    test_indices = indices[train_size + val_size:]
-    
-    # Create subsets
-    train_subset = torch.utils.data.Subset(dataset, train_indices)
-    val_subset = torch.utils.data.Subset(dataset, val_indices)
-    test_subset = torch.utils.data.Subset(dataset, test_indices)
-    
-    return train_subset, val_subset, test_subset
-
-
-def main():
-    parser = argparse.ArgumentParser(description='Train EHRXQA binary classifier')
-    parser.add_argument('--checkpoint', type=str,
-                        default='checkpoints/ltransformer_encoder_next_20251220_103843.pth',
-                        help='Path to patient vector model checkpoint')
-    parser.add_argument('--dataset_dir', type=str,
-                        default='/data/yuyu/data/EHRXQA/ehrxqa/dataset',
-                        help='Directory containing _processed.json files')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
-    parser.add_argument('--epochs', type=int, default=20, help='Number of epochs')
-    parser.add_argument('--patience', type=int, default=5, help='Early stopping patience')
-    parser.add_argument('--device', type=str, default='cuda', help='Device to use')
-    parser.add_argument('--train_ratio', type=float, default=0.7, help='Training set ratio')
-    parser.add_argument('--val_ratio', type=float, default=0.15, help='Validation set ratio')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    
-    args = parser.parse_args()
-    
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    # Load patient vector model
-    print("\nLoading patient vector model...")
-    patient_model, patient_vocabs, patient_config = load_checkpoint(Path(args.checkpoint))
-    patient_model = patient_model.to(device)
-    patient_model.eval()
-    
-    # Load question embedding model
-    print("\nLoading question embedding model...")
-    question_tokenizer, question_model, _ = load_model_and_tokenizer(
-        "emilyalsentzer/Bio_ClinicalBERT", device
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train end-to-end RETAIN for EHRXQA yes/no QA")
+    parser.add_argument(
+        "--dataset_dir",
+        type=str,
+        default="/data/yuyu/data/EHRXQA/ehrxqa/dataset",
+        help="Directory containing *_processed.json files",
     )
-    question_model.eval()
-    
-    # Find all _processed.json files
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--min_delta", type=float, default=0.001)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--train_ratio", type=float, default=0.7)
+    parser.add_argument("--val_ratio", type=float, default=0.15)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--retain_embed_dim", type=int, default=128)
+    parser.add_argument(
+        "--max_visits",
+        type=int,
+        default=0,
+        help="If >0, keep only the most recent N visits in cond_hist for RETAIN",
+    )
+    parser.add_argument(
+        "--question_model_name",
+        type=str,
+        default="emilyalsentzer/Bio_ClinicalBERT",
+    )
+
+    args = parser.parse_args()
+    _set_seed(args.seed)
+
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
     dataset_dir = Path(args.dataset_dir)
     json_files = list(dataset_dir.glob("*_processed.json"))
-    
     if not json_files:
-        print(f"Error: No _processed.json files found in {dataset_dir}")
-        return
-    
-    print(f"\nFound {len(json_files)} JSON files:")
+        raise RuntimeError(f"No *_processed.json files found in {dataset_dir}")
+
+    print(f"Found {len(json_files)} JSON files:")
     for f in json_files:
         print(f"  - {f.name}")
-    
-    # Create dataset
-    print("\nCreating dataset...")
-    full_dataset = EHRXQADataset(
-        json_files,
-        patient_model,
-        patient_vocabs,
-        patient_config,
-        question_model,
-        question_tokenizer,
-        device=device
+
+    print("\nLoading entries...")
+    entries = _load_entries(json_files)
+    print(f"Loaded {len(entries)} total entries")
+
+    print("\nBuilding PyHealth samples...")
+    samples = build_pyhealth_samples(entries, max_visits=args.max_visits)
+    train_samples, val_samples, test_samples = split_samples(
+        samples, train_ratio=args.train_ratio, val_ratio=args.val_ratio, seed=args.seed
     )
-    
-    # Split dataset
-    print("\nSplitting dataset...")
-    train_dataset, val_dataset, test_dataset = split_dataset(
-        full_dataset, args.train_ratio, args.val_ratio, args.seed
+    print(f"Split: train={len(train_samples)} val={len(val_samples)} test={len(test_samples)}")
+
+    # Build a vocab dataset for RETAIN tokenizers (use all samples for stability)
+    vocab_dataset = SampleEHRDataset(samples=samples, dataset_name="ehrxqa_vocab")
+    train_dataset = SampleEHRDataset(samples=train_samples, dataset_name="ehrxqa_train")
+    val_dataset = SampleEHRDataset(samples=val_samples, dataset_name="ehrxqa_val")
+    test_dataset = SampleEHRDataset(samples=test_samples, dataset_name="ehrxqa_test")
+
+    train_loader = get_dataloader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    val_loader = get_dataloader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    test_loader = get_dataloader(test_dataset, batch_size=args.batch_size, shuffle=False)
+
+    # RETAIN patient encoder
+    retain_model = RETAIN(
+        dataset=vocab_dataset,
+        feature_keys=["list_list_codes"],
+        label_key="label",
+        mode="binary",
+        embedding_dim=args.retain_embed_dim,
+    ).to(device)
+
+    # Frozen question encoder
+    print("\nLoading question encoder (frozen)...")
+    question_tokenizer, question_model, _ = load_model_and_tokenizer(args.question_model_name, str(device))
+    question_model = question_model.to(device)
+    question_model.eval()
+    for p in question_model.parameters():
+        p.requires_grad = False
+
+    # QA head (patient_dim equals embedding_dim for single feature)
+    question_dim = int(question_model.config.hidden_size)
+    patient_dim = int(args.retain_embed_dim)
+    head = RetainQAHead(patient_dim=patient_dim, question_dim=question_dim).to(device)
+
+    # One-time debug: ensure we can fetch embedding from RETAIN
+    debug_batch = next(iter(val_loader))
+    debug_out = retain_model(
+        list_list_codes=debug_batch["list_list_codes"],
+        label=debug_batch["label"],
+        embed=True,
     )
-    print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
-    
-    # Train
-    model, test_metrics = train(
-        train_dataset,
-        val_dataset,
-        test_dataset,
-        batch_size=args.batch_size,
-        learning_rate=args.lr,
-        epochs=args.epochs,
+    print(f"RETAIN output keys: {list(debug_out.keys())} | embed shape: {tuple(debug_out['embed'].shape)}")
+
+    ckpt_state, final_metrics = train_e2e(
+        retain_model=retain_model,
+        head=head,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        tokenizer=question_tokenizer,
+        question_model=question_model,
         device=device,
-        patience=args.patience
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        epochs=args.epochs,
+        patience=args.patience,
+        min_delta=args.min_delta,
     )
-    
-    # Save model
+
     checkpoint_dir = Path("checkpoints")
     checkpoint_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    checkpoint_path = checkpoint_dir / f"ehrxqa_binary_classifier_{timestamp}.pth"
-    
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'patient_vector_dim': full_dataset.patient_vectors_euclidean.shape[1],
-        'question_embed_dim': full_dataset.question_embeddings.shape[1],
-        'test_metrics': test_metrics,
-        'args': vars(args)
-    }, checkpoint_path)
-    
-    print(f"\nModel saved to: {checkpoint_path}")
-    print(f"Final test metrics: {test_metrics}")
+    checkpoint_path = checkpoint_dir / f"ehrxqa_retain_e2e_{timestamp}.pth"
+
+    torch.save(
+        {
+            **ckpt_state,
+            "pyhealth_version": "1.1.6",
+            "retain_embed_dim": args.retain_embed_dim,
+            "question_model_name": args.question_model_name,
+            "final_metrics": final_metrics,
+            "args": vars(args),
+        },
+        checkpoint_path,
+    )
+    print(f"\nSaved checkpoint to: {checkpoint_path}")
+    print(f"Final metrics: {final_metrics}")
 
 
 if __name__ == "__main__":

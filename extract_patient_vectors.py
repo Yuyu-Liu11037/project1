@@ -15,16 +15,28 @@ from util.data_processing import create_tokenizers
 
 
 class CLSExtractorWrapper(nn.Module):
-    """Wrapper to extract CLS representation from LTransformerEncoder"""
+    """Wrapper to extract CLS representation from LTransformerEncoder or TransformerEncoder"""
     def __init__(self, model):
         super().__init__()
         self.model = model
+        # Detect model type
+        self.is_lorentz = hasattr(model, 'resblocks') and hasattr(model, 'manifold_hidden')
+        self.is_euclidean = hasattr(model, 'transformer') and not self.is_lorentz
     
     def extract_cls(self, x_diag, x_proc, x_drug, x_visit_ids=None):
         """
         Extract CLS token representation (patient vector)
         Returns: (batch_size, hidden_dim) tensor
         """
+        if self.is_lorentz:
+            return self._extract_cls_lorentz(x_diag, x_proc, x_drug, x_visit_ids)
+        elif self.is_euclidean:
+            return self._extract_cls_euclidean(x_diag, x_proc, x_drug, x_visit_ids)
+        else:
+            raise ValueError(f"Unknown model type. Model should be LTransformerEncoder or TransformerEncoder")
+    
+    def _extract_cls_lorentz(self, x_diag, x_proc, x_drug, x_visit_ids=None):
+        """Extract CLS from LTransformerEncoder (hyperbolic space)"""
         batch_size, max_len = x_diag.shape
         device = x_diag.device
 
@@ -44,6 +56,28 @@ class CLSExtractorWrapper(nn.Module):
         
         token_embeddings = self.model.final_proj(token_embeddings)
         token_embeddings = self.model.ln_final(token_embeddings)
+
+        # Extract CLS representation (before dropout for consistency)
+        cls_state = token_embeddings[:, 0, :]  # (batch_size, hidden_dim)
+        
+        return cls_state
+    
+    def _extract_cls_euclidean(self, x_diag, x_proc, x_drug, x_visit_ids=None):
+        """Extract CLS from TransformerEncoder (Euclidean space)"""
+        batch_size, max_len = x_diag.shape
+        device = x_diag.device
+
+        cls_token = self.model.cls_token.expand(batch_size, 1, -1)  # (batch_size, 1, H)
+        token_embeddings = self.model.token_embed(x_diag)   # (batch_size, L_diag, E)
+        token_embeddings = torch.cat([cls_token, token_embeddings], dim=1)  # (batch_size, L_total+1, H)
+
+        # PyTorch transformer expects src_key_padding_mask=True where positions should be masked (i.e. padding).
+        cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=device)  # CLS is never padding
+        padding_mask = (x_diag == 0)   # (batch_size, L_diag) - True where padding
+        padding_mask = torch.cat([cls_mask, padding_mask], dim=1)  # (batch_size, L_diag+1)
+
+        # Apply transformer (without dropout for consistency with Lorentz version)
+        token_embeddings = self.model.transformer(token_embeddings, src_key_padding_mask=padding_mask)
 
         # Extract CLS representation (before dropout for consistency)
         cls_state = token_embeddings[:, 0, :]  # (batch_size, hidden_dim)
